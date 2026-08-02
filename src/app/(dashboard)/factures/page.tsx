@@ -1,11 +1,55 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, type ReactNode } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { formatCurrency, formatDate, CATEGORY_LABELS, downloadCSV } from '@/lib/utils';
-import { Upload, FileText, Filter, Download, Search, AlertCircle, Paperclip, ExternalLink, Banknote, CreditCard, Link2, X, Info, ChevronDown, ChevronUp, ArrowRight, Trash2, CheckCircle, Check, Loader2, Clock } from 'lucide-react';
+import { formatCurrency, formatDate, toISODate, CATEGORY_LABELS, downloadCSV } from '@/lib/utils';
+import { Upload, FileText, Filter, Download, Search, Paperclip, Banknote, CreditCard, Link2, X, Info, ArrowRight, Trash2, CheckCircle, Check, Loader2, Clock } from 'lucide-react';
 import type { Invoice, Supplier, InvoiceLine } from '@/lib/types';
 import ClaudeStatusIndicator from '@/components/ClaudeStatusIndicator';
+
+// Formatage de date tolérant : renvoie '' si la date est nulle ou invalide
+function safeDate(d: string | Date | null | undefined): string {
+  if (!d) return '';
+  const parsed = typeof d === 'string' ? new Date(d) : d;
+  if (isNaN(parsed.getTime())) return '';
+  return formatDate(parsed);
+}
+
+const ACCOUNTING_LABELS: Record<string, string> = {
+  '601': 'Matières Premières',
+  '607': 'Marchandises Boissons',
+  '606': 'Fournitures Emballages',
+  '6061':'Énergie Électricité Eau',
+  '61':  'Services extérieurs',
+  '62':  'Autres services',
+  '63':  'Impôts Taxes',
+  '64':  'Personnel Salaires',
+  'autre':'Autre',
+};
+
+// Panneau secondaire de choix de règlement (Espèces / CB Perso)
+// tint : composantes RGB « r, g, b » utilisées pour le fond et la bordure
+function PaymentSubPanel({ title, tint, titleColor, children }: { title: string; tint: string; titleColor: string; children: ReactNode }) {
+  return (
+    <div style={{
+      marginTop: 10,
+      padding: 12,
+      background: `rgba(${tint}, 0.05)`,
+      border: `1.5px dashed rgba(${tint}, 0.3)`,
+      borderRadius: 10,
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 8
+    }}>
+      <div style={{ fontSize: 11, fontWeight: 800, color: titleColor, display: 'flex', alignItems: 'center', gap: 4 }}>
+        <Info size={12} /> {title}
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        {children}
+      </div>
+    </div>
+  );
+}
 
 // Heuristic scoring helper to match invoices with bank transactions
 function getSuggestionsForInvoice(invoice: any, txList: any[]) {
@@ -251,7 +295,6 @@ export default function FacturesPage() {
 
       // 4. Create CCA movement if payment method is CB Perso or Cash Perso, and associate is specified
       if ((pm === 'card_perso' || (pm === 'cash' && associe)) && associe && selectedInvObj) {
-        const toISODate = (d: Date) => d.toISOString().split('T')[0];
         const { error: ccaErr } = await supabase
           .from('mouvements_cca')
           .insert({
@@ -296,13 +339,6 @@ export default function FacturesPage() {
 
   const handleDeleteInvoice = async () => {
     if (!selectedInvoice) return;
-
-    const currentRef = selectedInvObj?.accounting_ref || 'cette facture';
-    const firstConfirm = window.confirm(`Êtes-vous sûr de vouloir supprimer définitivement ${currentRef} ?`);
-    if (!firstConfirm) return;
-
-    const secondConfirm = window.confirm(`CONFIRMATION FINALE : Cette action est irréversible et supprimera toutes les lignes associées. Êtes-vous certain ?`);
-    if (!secondConfirm) return;
 
     try {
       // 1. Release any linked transaction first
@@ -377,12 +413,16 @@ export default function FacturesPage() {
           } else {
             alert(`Facture importée avec succès ! Réf: ${data.accounting_ref || 'Créée'}.`);
           }
-          loadData();
+          await loadData();
           if (data.invoice_id) loadLines(data.invoice_id);
         } else {
           alert('Erreur extraction : ' + (data.error || 'Inconnu'));
         }
         setUploading(false);
+      };
+      reader.onerror = () => {
+        setUploading(false);
+        alert('Erreur lors de la lecture du fichier.');
       };
       reader.readAsDataURL(file);
     } catch {
@@ -402,18 +442,6 @@ export default function FacturesPage() {
     setLines(prev => prev.map(l => l.id === lineId ? { ...l, category: category as InvoiceLine['category'] } : l));
   };
 
-  const ACCOUNTING_LABELS: Record<string, string> = {
-    '601': 'Matières Premières',
-    '607': 'Marchandises Boissons',
-    '606': 'Fournitures Emballages',
-    '6061':'Énergie Électricité Eau',
-    '61':  'Services extérieurs',
-    '62':  'Autres services',
-    '63':  'Impôts Taxes',
-    '64':  'Personnel Salaires',
-    'autre':'Autre',
-  };
-
   const filteredInvoices = invoices.filter(inv => {
     if (filterSupplier && inv.supplier_id !== filterSupplier) return false;
     if (filterDateStart && inv.date < filterDateStart) return false;
@@ -421,7 +449,6 @@ export default function FacturesPage() {
 
     if (searchQuery.trim()) {
       const query = searchQuery.toLowerCase().trim();
-      const queryAsNum = parseFloat(query.replace(',', '.'));
 
       // 1. Match Fournisseur
       const matchSupplier = inv.supplier?.name?.toLowerCase().includes(query);
@@ -436,17 +463,17 @@ export default function FacturesPage() {
       const matchCategory = classCode.includes(query) ||
                             classLabel.toLowerCase().includes(query);
 
-      // 4. Match Montant (Approximation et Contenance)
+      // 4. Match Montant : uniquement si la requête est entièrement numérique
       let matchAmount = false;
-      const ttcStr = String(inv.total_ttc || '');
-      const htStr = String(inv.total_ht || '');
-      
-      // Contient le texte du montant (ex: taper "81" trouve "812.84")
-      if (ttcStr.includes(query) || htStr.includes(query)) {
-        matchAmount = true;
-      }
-      // Ecart proche pour les montants saisis précisément (ex: taper "812.84")
-      if (!isNaN(queryAsNum)) {
+      if (/^\d+([.,]\d+)?$/.test(query)) {
+        const queryAsNum = parseFloat(query.replace(',', '.'));
+        const normalizedQuery = query.replace(',', '.');
+
+        // Correspondance sur la chaîne formatée complète (évite que « 1 » matche tout)
+        if (String(inv.total_ttc ?? '') === normalizedQuery || String(inv.total_ht ?? '') === normalizedQuery) {
+          matchAmount = true;
+        }
+        // Ecart proche (±2 €) pour les montants saisis précisément (ex: taper "812.84")
         const diffTtc = Math.abs((inv.total_ttc || 0) - queryAsNum);
         const diffHt = Math.abs((inv.total_ht || 0) - queryAsNum);
         if (diffTtc <= 2.00 || diffHt <= 2.00) {
@@ -455,7 +482,7 @@ export default function FacturesPage() {
       }
 
       // 5. Match Date
-      const matchDate = inv.date?.includes(query) || formatDate(inv.date).includes(query);
+      const matchDate = inv.date?.includes(query) || safeDate(inv.date).includes(query);
 
       return matchSupplier || matchRef || matchCategory || matchAmount || matchDate;
     }
@@ -466,9 +493,63 @@ export default function FacturesPage() {
   const selectedInvObj = invoices.find(inv => inv.id === selectedInvoice);
   const invoiceSuggestions = selectedInvObj ? getSuggestionsForInvoice(selectedInvObj, bankTxList) : [];
 
+  // Liste des transactions bancaires filtrées par la recherche du sélecteur manuel
+  const filteredBankTx = bankTxList.filter(tx => {
+    if (!txSearch) return true;
+    const s = txSearch.toLowerCase();
+    return tx.description?.toLowerCase().includes(s) || String(Math.abs(tx.amount)).includes(s);
+  });
+
+  // Configuration des 4 boutons de mode de règlement
+  const isBankOrUnset = selectedInvObj ? (selectedInvObj.payment_method === 'bank' || !selectedInvObj.payment_method) : false;
+  const paymentModeButtons = [
+    {
+      key: 'a_pointer',
+      label: 'À pointer',
+      icon: <Clock size={13} />,
+      activeColor: '#E89B3E',
+      isActive: isBankOrUnset && !linkedTx,
+      onClick: () => { handleReconcile('bank', null); setShowManualSelector(false); },
+    },
+    {
+      key: 'banque',
+      label: 'Banque',
+      icon: <Link2 size={13} />,
+      activeColor: 'var(--teal)',
+      isActive: isBankOrUnset && !!linkedTx,
+      onClick: () => {
+        if (!linkedTx) {
+          setShowManualSelector(true);
+        }
+      },
+    },
+    {
+      key: 'especes',
+      label: 'Espèces',
+      icon: <Banknote size={13} />,
+      activeColor: 'var(--green)',
+      isActive: selectedInvObj?.payment_method === 'cash',
+      onClick: () => {
+        setShowCashSelector(!showCashSelector);
+        setShowCcaSelector(false);
+      },
+    },
+    {
+      key: 'cb_perso',
+      label: 'CB Perso',
+      icon: <CreditCard size={13} />,
+      activeColor: '#7C3AED',
+      isActive: selectedInvObj?.payment_method === 'card_perso',
+      onClick: () => {
+        setShowCcaSelector(!showCcaSelector);
+        setShowCashSelector(false);
+      },
+    },
+  ];
+
   const exportCSV = () => {
     const data = filteredInvoices.map(inv => ({
-      Date: formatDate(inv.date),
+      Date: safeDate(inv.date),
       Fournisseur: inv.supplier?.name || '',
       'N° Facture': inv.invoice_number || '',
       'Réf. Interne': inv.accounting_ref || '',
@@ -525,7 +606,7 @@ export default function FacturesPage() {
           <Filter size={18} style={{ color: 'var(--text-muted)' }} />
           
           {/* Moteur de recherche intelligent */}
-          <div style={{ position: 'relative', display: 'flex', alignItems: 'center', minWidth: 280, flexGrow: 1 }}>
+          <div style={{ position: 'relative', display: 'flex', alignItems: 'center', minWidth: 'min(280px, 80vw)', flexGrow: 1 }}>
             <Search size={16} style={{ position: 'absolute', left: 12, color: 'var(--text-muted)', pointerEvents: 'none' }} />
             <input
               type="text"
@@ -619,7 +700,7 @@ export default function FacturesPage() {
               <tbody>
                 {filteredInvoices.map(inv => (
                   <tr key={inv.id} onClick={() => loadLines(inv.id)} style={{ cursor: 'pointer', background: selectedInvoice === inv.id ? 'var(--teal-bg)' : undefined }}>
-                    <td>{formatDate(inv.date)}</td>
+                    <td>{safeDate(inv.date)}</td>
                     <td style={{ fontWeight: 600 }}>{inv.supplier?.name || '—'}</td>
                     <td>{inv.invoice_number || '—'}</td>
                     <td style={{ fontFamily: 'monospace', fontWeight: 700, fontSize: 12, color: 'var(--text-secondary)' }}>
@@ -643,7 +724,7 @@ export default function FacturesPage() {
         {selectedInvoice && selectedInvObj && (
           <div className="card" style={{ marginTop: 24, padding: 0, overflow: 'hidden' }}>
             {/* Header */}
-            <div className="card-header" style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-light)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div className="card-header" style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-light)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                 <div style={{
                   width: 36, height: 36, borderRadius: 8,
@@ -657,15 +738,15 @@ export default function FacturesPage() {
                     Facture : {selectedInvObj.accounting_ref || 'Sans référence'}
                   </div>
                   <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                    {selectedInvObj.supplier?.name || 'Inconnu'} · {formatDate(selectedInvObj.date)}
+                    {selectedInvObj.supplier?.name || 'Inconnu'} · {safeDate(selectedInvObj.date)}
                   </span>
                 </div>
               </div>
               
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                 {/* Delete button with confirmation */}
                 {confirmDelete ? (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(220, 38, 38, 0.08)', padding: '5px 10px', borderRadius: 8, border: '1px solid rgba(220, 38, 38, 0.2)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(220, 38, 38, 0.08)', padding: '5px 10px', borderRadius: 8, border: '1px solid rgba(220, 38, 38, 0.2)', flexWrap: 'wrap' }}>
                     <span style={{ fontSize: 11, color: '#DC2626', fontWeight: 600 }}>Supprimer définitivement ?</span>
                     <button className="btn btn-danger btn-sm" onClick={handleDeleteInvoice} style={{ padding: '4px 8px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4, background: '#DC2626', color: 'white', border: 'none', borderRadius: 4, cursor: 'pointer' }}>
                       Oui, supprimer
@@ -687,7 +768,7 @@ export default function FacturesPage() {
             </div>
 
             {/* Content Body */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 20, padding: 20 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 300px), 1fr))', gap: 20, padding: 20 }}>
               
               {/* Left Column: Settlement & Reconciliation */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -698,93 +779,28 @@ export default function FacturesPage() {
 
                   {/* Payment Method Selector Buttons */}
                   <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
-                    <button
-                      className="btn"
-                      disabled={reconciling}
-                      onClick={() => { handleReconcile('bank', null); setShowManualSelector(false); }}
-                      style={{
-                        flex: '1 1 90px', fontSize: 11, padding: '8px 10px', borderRadius: 8, cursor: 'pointer',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-                        background: ((selectedInvObj.payment_method === 'bank' || !selectedInvObj.payment_method) && !linkedTx) ? '#E89B3E' : 'white',
-                        color: ((selectedInvObj.payment_method === 'bank' || !selectedInvObj.payment_method) && !linkedTx) ? 'white' : 'var(--text-secondary)',
-                        border: '1px solid var(--border)',
-                        fontWeight: 600,
-                      }}
-                    >
-                      <Clock size={13} /> À pointer
-                    </button>
-                    <button
-                      className="btn"
-                      disabled={reconciling}
-                      onClick={() => {
-                        if (!linkedTx) {
-                          setShowManualSelector(true);
-                        }
-                      }}
-                      style={{
-                        flex: '1 1 90px', fontSize: 11, padding: '8px 10px', borderRadius: 8, cursor: 'pointer',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-                        background: ((selectedInvObj.payment_method === 'bank' || !selectedInvObj.payment_method) && linkedTx) ? 'var(--teal)' : 'white',
-                        color: ((selectedInvObj.payment_method === 'bank' || !selectedInvObj.payment_method) && linkedTx) ? 'white' : 'var(--text-secondary)',
-                        border: '1px solid var(--border)',
-                        fontWeight: 600,
-                      }}
-                    >
-                      <Link2 size={13} /> Banque
-                    </button>
-                    <button
-                      className="btn"
-                      disabled={reconciling}
-                      onClick={() => {
-                        setShowCashSelector(!showCashSelector);
-                        setShowCcaSelector(false);
-                      }}
-                      style={{
-                        flex: '1 1 90px', fontSize: 11, padding: '8px 10px', borderRadius: 8, cursor: 'pointer',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-                        background: selectedInvObj.payment_method === 'cash' ? 'var(--green)' : 'white',
-                        color: selectedInvObj.payment_method === 'cash' ? 'white' : 'var(--text-secondary)',
-                        border: '1px solid var(--border)',
-                        fontWeight: 600,
-                      }}
-                    >
-                      <Banknote size={13} /> Espèces
-                    </button>
-                    <button
-                      className="btn"
-                      disabled={reconciling}
-                      onClick={() => {
-                        setShowCcaSelector(!showCcaSelector);
-                        setShowCashSelector(false);
-                      }}
-                      style={{
-                        flex: '1 1 90px', fontSize: 11, padding: '8px 10px', borderRadius: 8, cursor: 'pointer',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-                        background: selectedInvObj.payment_method === 'card_perso' ? '#7C3AED' : 'white',
-                        color: selectedInvObj.payment_method === 'card_perso' ? 'white' : 'var(--text-secondary)',
-                        border: '1px solid var(--border)',
-                        fontWeight: 600,
-                      }}
-                    >
-                      <CreditCard size={13} /> CB Perso
-                    </button>
+                    {paymentModeButtons.map(btn => (
+                      <button
+                        key={btn.key}
+                        className="btn"
+                        disabled={reconciling}
+                        onClick={btn.onClick}
+                        style={{
+                          flex: '1 1 90px', fontSize: 11, padding: '8px 10px', borderRadius: 8, cursor: 'pointer',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                          background: btn.isActive ? btn.activeColor : 'white',
+                          color: btn.isActive ? 'white' : 'var(--text-secondary)',
+                          border: '1px solid var(--border)',
+                          fontWeight: 600,
+                        }}
+                      >
+                        {btn.icon} {btn.label}
+                      </button>
+                    ))}
                   </div>
 
                   {showCashSelector && (
-                    <div style={{
-                      marginTop: 10,
-                      padding: 12,
-                      background: 'rgba(45, 143, 94, 0.05)',
-                      border: '1.5px dashed rgba(45, 143, 94, 0.3)',
-                      borderRadius: 10,
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: 8
-                    }}>
-                      <div style={{ fontSize: 11, fontWeight: 800, color: 'var(--green)', display: 'flex', alignItems: 'center', gap: 4 }}>
-                        <Info size={12} /> Quel type de règlement en espèces ?
-                      </div>
-                      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <PaymentSubPanel title="Quel type de règlement en espèces ?" tint="45, 143, 94" titleColor="var(--green)">
                         <button
                           type="button"
                           className="btn btn-secondary btn-sm"
@@ -826,25 +842,11 @@ export default function FacturesPage() {
                         >
                           Annuler
                         </button>
-                      </div>
-                    </div>
+                    </PaymentSubPanel>
                   )}
 
                   {showCcaSelector && (
-                    <div style={{
-                      marginTop: 10,
-                      padding: 12,
-                      background: 'rgba(124, 58, 237, 0.05)',
-                      border: '1.5px dashed rgba(124, 58, 237, 0.3)',
-                      borderRadius: 10,
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: 8
-                    }}>
-                      <div style={{ fontSize: 11, fontWeight: 800, color: '#7C3AED', display: 'flex', alignItems: 'center', gap: 4 }}>
-                        <Info size={12} /> Qui a réglé cette facture ?
-                      </div>
-                      <div style={{ display: 'flex', gap: 8 }}>
+                    <PaymentSubPanel title="Qui a réglé cette facture ?" tint="124, 58, 237" titleColor="#7C3AED">
                         <button
                           type="button"
                           className="btn btn-secondary btn-sm"
@@ -875,8 +877,7 @@ export default function FacturesPage() {
                         >
                           Annuler
                         </button>
-                      </div>
-                    </div>
+                    </PaymentSubPanel>
                   )}
 
                   {/* Dynamic Status / Actions based on selection */}
@@ -893,7 +894,7 @@ export default function FacturesPage() {
                           </div>
                           <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-primary)' }}>{linkedTx.description}</div>
                           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
-                            {formatDate(linkedTx.date)} · <strong style={{ color: 'var(--red)' }}>{formatCurrency(linkedTx.amount)}</strong>
+                            {safeDate(linkedTx.date)} · <strong style={{ color: 'var(--red)' }}>{formatCurrency(linkedTx.amount)}</strong>
                           </div>
                           
                           <button
@@ -936,7 +937,7 @@ export default function FacturesPage() {
                                         {tx.description}
                                       </div>
                                       <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
-                                        {formatDate(tx.date)} · <strong style={{ color: 'var(--red)' }}>{formatCurrency(tx.amount)}</strong>
+                                        {safeDate(tx.date)} · <strong style={{ color: 'var(--red)' }}>{formatCurrency(tx.amount)}</strong>
                                       </div>
                                     </div>
                                     <button
@@ -989,20 +990,12 @@ export default function FacturesPage() {
                                 </div>
                               </div>
                               <div style={{ maxHeight: 150, overflowY: 'auto' }}>
-                                {bankTxList.filter(tx => {
-                                  if (!txSearch) return true;
-                                  const s = txSearch.toLowerCase();
-                                  return tx.description?.toLowerCase().includes(s) || String(Math.abs(tx.amount)).includes(s);
-                                }).length === 0 ? (
+                                {filteredBankTx.length === 0 ? (
                                   <div style={{ padding: 12, textAlign: 'center', color: 'var(--text-muted)', fontSize: 11 }}>
                                     Aucune transaction en attente
                                   </div>
                                 ) : (
-                                  bankTxList.filter(tx => {
-                                    if (!txSearch) return true;
-                                    const s = txSearch.toLowerCase();
-                                    return tx.description?.toLowerCase().includes(s) || String(Math.abs(tx.amount)).includes(s);
-                                  }).map(tx => (
+                                  filteredBankTx.map(tx => (
                                     <div
                                       key={tx.id}
                                       onClick={() => handleReconcile('bank', tx.id)}
@@ -1016,7 +1009,7 @@ export default function FacturesPage() {
                                     >
                                       <div style={{ flex: 1, minWidth: 0 }}>
                                         <div style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{tx.description}</div>
-                                        <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{formatDate(tx.date)}</span>
+                                        <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{safeDate(tx.date)}</span>
                                       </div>
                                       <span style={{ fontWeight: 700, color: 'var(--red)', flexShrink: 0 }}>{formatCurrency(tx.amount)}</span>
                                       <ArrowRight size={11} style={{ color: 'var(--teal)' }} />
@@ -1066,7 +1059,7 @@ export default function FacturesPage() {
                 </div>
                 
                 {/* Financial Summary */}
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10 }}>
                   <div style={{ background: 'var(--cream-light)', padding: 12, borderRadius: 10, border: '1px solid var(--border-light)' }}>
                     <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Total HT</div>
                     <div style={{ fontSize: 16, fontWeight: 700, marginTop: 4, color: 'var(--text-primary)' }}>{formatCurrency(selectedInvObj.total_ht)}</div>
