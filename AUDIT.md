@@ -211,9 +211,24 @@ format PDF » produit un vrai fichier PDF. Aucune bibliothèque supplémentaire 
 document est mis en page en CSS (`@media print`), avec en-tête, détail des déplacements, barème
 appliqué et emplacements de signature. Les en-têtes de tableau se répètent sur chaque page.
 
-**Tout est paramétrable** (bouton « Réglages » de la page) : distances, péages, puissance fiscale,
-motorisation, termes reconnus par fournisseur, et les taux du barème — ce dernier étant révisé
-chaque année par l'administration, le figer dans le code aurait créé un piège de maintenance.
+**Tout est paramétrable** (bouton « Réglages » de la page) : identification du véhicule, distances,
+péages, puissance fiscale, motorisation, termes reconnus par fournisseur, et les taux du barème — ce
+dernier étant révisé chaque année par l'administration, le figer dans le code aurait créé un piège de
+maintenance.
+
+**Le véhicule.** Les réglages sont pré-remplis d'après la carte grise du **Pössl Summit 600
+(GA-175-LB, 1ʳᵉ immatriculation le 30/06/2021)** :
+
+| Case | Valeur | Conséquence |
+|---|---|---|
+| **P.6** | 7 | Barème « 7 CV et plus » — la tranche la plus élevée, le barème plafonne là |
+| **P.3** | GO (gazole) | Thermique : pas de majoration de 20 % |
+| **J** | M1 | Véhicule de tourisme — **ce n'est pas un utilitaire N1/CTTE** |
+| **J.1 / J.3** | VASP / CARAVANE | Van aménagé sur base Citroën Jumper |
+| **C.1** | DE FARIA Yohan | Titulaire de la carte grise |
+
+Le véhicule est imprimé sur la note de frais (modèle, immatriculation, puissance fiscale) : un
+document qui ne désigne pas le véhicule est faible en cas de contrôle.
 
 **Lien avec les Comptes Courants d'Associés.** Tant que le virement n'est pas fait, la société doit
 cet argent à l'associé : un bandeau affiche le montant dû et le bouton « Porter au compte courant »
@@ -227,11 +242,17 @@ mouvement.
 ⚠️ **Deux points à valider une fois :**
 - Les **distances sont pré-remplies avec des estimations** (56 km et 60 km aller-retour). Vérifie-les
   sur un calculateur d'itinéraire avec tes adresses exactes : en cas de contrôle, la distance doit
-  être justifiable.
-- Ton **Citroën Jumper est peut-être immatriculé « CTTE »** (camionnette) et non « VP ». Le barème
-  kilométrique vise les voitures particulières ; pour un utilitaire, ton comptable préférera
-  peut-être les frais réels. À trancher avec lui — l'outil fonctionne dans les deux cas, seul le
-  mode de déduction change.
+  être justifiable. Le péage Metro est à 0 € tant que tu ne l'as pas saisi.
+- **La carte grise est au nom de Yohan, or le conducteur configuré est Justine.** L'indemnité
+  kilométrique se rembourse au propriétaire du véhicule, ou à une personne du même foyer fiscal. Si
+  vous êtes le même foyer, rien à faire ; sinon, il faut porter les trajets — et donc le compte
+  courant — au nom de Yohan. La page affiche l'alerte tant que les deux ne coïncident pas, et le
+  conducteur se change en un clic.
+
+✅ **Le doute sur le type de véhicule est levé.** La carte grise indique J = M1 et J.1 = VASP : c'est
+un véhicule de tourisme, pas une camionnette « CTTE ». Le cas qui aurait imposé les frais réels au
+lieu du barème ne s'applique donc pas. La puissance fiscale (P.6 = 7) est celle qui était déjà
+retenue : aucun montant n'est à recalculer.
 
 ## 7. ⚠️ ACTION REQUISE DE TA PART
 

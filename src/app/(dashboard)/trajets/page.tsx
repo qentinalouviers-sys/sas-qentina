@@ -10,6 +10,7 @@ import {
 import { KpiCard, SectionHeader, Modal, EmptyState, LoadingPage } from '@/components/ui';
 import {
   DEFAULT_CONFIG, mergeConfig, computeTotals, allocateShares, matchDestination,
+  cvLabel, driverLabel,
   type MileageConfig, type CvBracket,
 } from '@/lib/mileage';
 
@@ -293,7 +294,7 @@ export default function TrajetsPage() {
       await loadData();
       setMessage({
         type: 'success',
-        text: `${formatCurrency(remaining)} porté au compte courant de ${driver === 'justine' ? 'Justine' : 'Yohan'}. `
+        text: `${formatCurrency(remaining)} porté au compte courant de ${driverLabel(driver)}. `
             + `Quand tu feras le virement, enregistre-le comme remboursement depuis la page Comptes Associés.`,
       });
     } catch (e: any) {
@@ -315,7 +316,10 @@ export default function TrajetsPage() {
     return [...set].sort((a, b) => b - a);
   }, [trips]);
 
-  const driverName = driver === 'justine' ? 'Justine' : 'Yohan';
+  const driverName = driverLabel(driver);
+  const ownerName = driverLabel(config.vehicle.owner);
+  /** Le conducteur des trajets n'est pas le titulaire de la carte grise. */
+  const ownerMismatch = config.vehicle.owner !== driver;
 
   if (loading) return <LoadingPage text="Chargement des trajets…" />;
 
@@ -384,7 +388,7 @@ export default function TrajetsPage() {
           <KpiCard
             label="Barème appliqué"
             value={`${totals.ratePerKm.toFixed(3).replace('.', ',')} €/km`}
-            subValue={`${config.cv === '7+' ? '7 CV et plus' : `${config.cv} CV`} · tranche ${totals.bracket}`}
+            subValue={`${cvLabel(config.cv)} · tranche ${totals.bracket}`}
             icon={<Receipt size={20} />}
             accentColor="#7C3AED"
           />
@@ -440,7 +444,15 @@ export default function TrajetsPage() {
             <div className="expense-meta">
               <div><strong>Bénéficiaire :</strong> {driverName}</div>
               <div><strong>Période :</strong> année {year}</div>
-              <div><strong>Véhicule :</strong> personnel, {config.cv === '7+' ? '7 CV et plus' : `${config.cv} CV`}{config.electric ? ' — électrique (majoration 20 %)' : ''}</div>
+              <div>
+                <strong>Véhicule :</strong>{' '}
+                {[config.vehicle.model, config.vehicle.plate].filter(Boolean).join(' — ') || 'véhicule personnel'}
+                {config.vehicle.owner !== driver && ` (titulaire : ${ownerName})`}
+              </div>
+              <div>
+                <strong>Puissance fiscale :</strong> {cvLabel(config.cv)}
+                {config.electric && ' — 100 % électrique, majoration 20 %'}
+              </div>
               <div><strong>Barème :</strong> kilométrique {config.baremeYear}, tranche {totals.bracket}</div>
               <div><strong>Éditée le :</strong> {formatDate(new Date())}</div>
             </div>
@@ -524,13 +536,25 @@ export default function TrajetsPage() {
           </div>
         </div>
 
-        {yearTrips.length > 0 && (
+        {ownerMismatch && (
           <div className="alert alert-warning no-print" style={{ marginTop: 20 }}>
             <AlertTriangle size={16} />
             <span>
-              Vérifie une fois les distances dans les réglages (elles sont pré-remplies avec des
-              estimations) et fais confirmer par ton comptable que le barème kilométrique s&apos;applique
-              bien à ton véhicule — un utilitaire immatriculé « CTTE » relève parfois des frais réels.
+              La carte grise est au nom de <strong>{ownerName}</strong>, mais ces trajets sont
+              enregistrés au nom de <strong>{driverName}</strong>. L&apos;indemnité kilométrique se
+              rembourse au propriétaire du véhicule, ou à une personne du même foyer fiscal. Si c&apos;est
+              votre cas, tout va bien — sinon, bascule le conducteur sur {ownerName} pour que le compte
+              courant soit crédité au bon associé.
+            </span>
+          </div>
+        )}
+
+        {yearTrips.length > 0 && (
+          <div className="alert alert-warning no-print" style={{ marginTop: 12 }}>
+            <AlertTriangle size={16} />
+            <span>
+              Vérifie une fois les distances dans les réglages : elles sont pré-remplies avec des
+              estimations et doivent être justifiables en cas de contrôle.
             </span>
           </div>
         )}
@@ -607,6 +631,37 @@ export default function TrajetsPage() {
             </span>
           </div>
 
+          <SectionHeader title="Véhicule" subtitle="Repris de la carte grise — imprimé sur la note de frais" />
+          <div className="grid-2">
+            <div className="form-group">
+              <label className="form-label">Marque et modèle (cases D.1 / D.3)</label>
+              <input type="text" className="form-input" value={config.vehicle.model}
+                onChange={e => saveConfig({ ...config, vehicle: { ...config.vehicle, model: e.target.value } })} />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Immatriculation (case A)</label>
+              <input type="text" className="form-input" value={config.vehicle.plate}
+                onChange={e => saveConfig({ ...config, vehicle: { ...config.vehicle, plate: e.target.value } })} />
+            </div>
+            <div className="form-group">
+              <label className="form-label">Titulaire de la carte grise (case C.1)</label>
+              <select className="form-select" value={config.vehicle.owner}
+                onChange={e => saveConfig({ ...config, vehicle: { ...config.vehicle, owner: e.target.value as 'justine' | 'yohan' } })}>
+                <option value="justine">Justine</option>
+                <option value="yohan">Yohan</option>
+              </select>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Genre national (case J.1)</label>
+              <input type="text" className="form-input" value={config.vehicle.registrationType}
+                onChange={e => saveConfig({ ...config, vehicle: { ...config.vehicle, registrationType: e.target.value } })} />
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+                VP, VASP… Un utilitaire « CTTE » relève des frais réels, pas du barème.
+              </div>
+            </div>
+          </div>
+
+          <SectionHeader title="Barème applicable" subtitle="Détermine le taux au kilomètre" />
           <div className="grid-2">
             <div className="form-group">
               <label className="form-label">Puissance fiscale (carte grise, case P.6)</label>
@@ -616,7 +671,7 @@ export default function TrajetsPage() {
               </select>
             </div>
             <div className="form-group">
-              <label className="form-label">Motorisation</label>
+              <label className="form-label">Motorisation (case P.3)</label>
               <select className="form-select" value={config.electric ? 'e' : 't'}
                 onChange={e => saveConfig({ ...config, electric: e.target.value === 'e' })}>
                 <option value="t">Thermique</option>
@@ -670,7 +725,7 @@ export default function TrajetsPage() {
             </div>
           ))}
 
-          <SectionHeader title="Taux du barème" subtitle={`Puissance sélectionnée : ${config.cv === '7+' ? '7 CV et plus' : `${config.cv} CV`}`} />
+          <SectionHeader title="Taux du barème" subtitle={`Puissance sélectionnée : ${cvLabel(config.cv)}`} />
           <div className="grid-3">
             {([
               ['low', 'Jusqu\'à 5 000 km (€/km)'],
