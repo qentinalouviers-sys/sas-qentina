@@ -318,8 +318,10 @@ export default function TrajetsPage() {
 
   const driverName = driverLabel(driver);
   const ownerName = driverLabel(config.vehicle.owner);
-  /** Le conducteur des trajets n'est pas le titulaire de la carte grise. */
+  /** Le conducteur n'est pas le titulaire de la carte grise. */
   const ownerMismatch = config.vehicle.owner !== driver;
+  /** …et pas davantage de son foyer fiscal : là, le bénéficiaire est à revoir. */
+  const ownerProblem = ownerMismatch && !config.vehicle.sameHousehold;
 
   if (loading) return <LoadingPage text="Chargement des trajets…" />;
 
@@ -447,7 +449,9 @@ export default function TrajetsPage() {
               <div>
                 <strong>Véhicule :</strong>{' '}
                 {[config.vehicle.model, config.vehicle.plate].filter(Boolean).join(' — ') || 'véhicule personnel'}
-                {config.vehicle.owner !== driver && ` (titulaire : ${ownerName})`}
+                {/* Titulaire différent du bénéficiaire : autant l'écrire sur le document
+                    et dire pourquoi c'est admis, plutôt que de laisser la question ouverte. */}
+                {ownerMismatch && ` — titulaire : ${ownerName}${config.vehicle.sameHousehold ? ' (même foyer fiscal)' : ''}`}
               </div>
               <div>
                 <strong>Puissance fiscale :</strong> {cvLabel(config.cv)}
@@ -536,14 +540,14 @@ export default function TrajetsPage() {
           </div>
         </div>
 
-        {ownerMismatch && (
+        {ownerProblem && (
           <div className="alert alert-warning no-print" style={{ marginTop: 20 }}>
             <AlertTriangle size={16} />
             <span>
               La carte grise est au nom de <strong>{ownerName}</strong>, mais ces trajets sont
-              enregistrés au nom de <strong>{driverName}</strong>. L&apos;indemnité kilométrique se
-              rembourse au propriétaire du véhicule, ou à une personne du même foyer fiscal. Si c&apos;est
-              votre cas, tout va bien — sinon, bascule le conducteur sur {ownerName} pour que le compte
+              enregistrés au nom de <strong>{driverName}</strong>, qui n&apos;est pas indiqué comme étant
+              du même foyer fiscal. L&apos;indemnité kilométrique se rembourse au propriétaire du véhicule
+              ou à une personne de son foyer : bascule le conducteur sur {ownerName} pour que le compte
               courant soit crédité au bon associé.
             </span>
           </div>
@@ -650,6 +654,18 @@ export default function TrajetsPage() {
                 <option value="justine">Justine</option>
                 <option value="yohan">Yohan</option>
               </select>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Justine et Yohan : même foyer fiscal ?</label>
+              <select className="form-select" value={config.vehicle.sameHousehold ? 'oui' : 'non'}
+                onChange={e => saveConfig({ ...config, vehicle: { ...config.vehicle, sameHousehold: e.target.value === 'oui' } })}>
+                <option value="oui">Oui — même foyer</option>
+                <option value="non">Non — foyers séparés</option>
+              </select>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+                Si les foyers sont séparés, seul le titulaire de la carte grise peut se faire
+                rembourser les indemnités.
+              </div>
             </div>
             <div className="form-group">
               <label className="form-label">Genre national (case J.1)</label>
