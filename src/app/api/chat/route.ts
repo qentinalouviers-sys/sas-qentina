@@ -3,8 +3,12 @@ import Anthropic from '@anthropic-ai/sdk';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { createClaudeMessage } from '@/lib/anthropic';
 import { startOfMonth, endOfMonth, format } from 'date-fns';
+import { requireUser } from '@/lib/supabase/api-auth';
 
 export async function POST(request: NextRequest) {
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   try {
     const { messages } = await request.json();
     if (!messages || !Array.isArray(messages)) {
