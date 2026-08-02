@@ -55,6 +55,13 @@ export interface VehicleConfig {
   plate: string;
   /** Titulaire de la carte grise — case C.1. */
   owner: 'justine' | 'yohan';
+  /**
+   * Le conducteur et le titulaire de la carte grise appartiennent au même
+   * foyer fiscal. L'indemnité kilométrique se rembourse au propriétaire du
+   * véhicule ou à une personne de son foyer : quand c'est le cas, un
+   * conducteur différent du titulaire est normal et ne mérite pas d'alerte.
+   */
+  sameHousehold: boolean;
   /** Genre national — case J.1 (VP, CTTE, VASP…). Purement informatif. */
   registrationType: string;
 }
@@ -93,6 +100,7 @@ export const DEFAULT_CONFIG: MileageConfig = {
     model: 'Pössl Summit 600',
     plate: 'GA-175-LB',
     owner: 'yohan',
+    sameHousehold: true,
     // J = M1 (véhicule de tourisme), J.1 = VASP, J.3 = CARAVANE.
     // Ce n'est PAS un utilitaire « CTTE » : le cas qui aurait exclu le barème
     // au profit des frais réels ne s'applique donc pas ici.

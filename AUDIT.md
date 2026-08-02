@@ -225,7 +225,7 @@ maintenance.
 | **P.3** | GO (gazole) | Thermique : pas de majoration de 20 % |
 | **J** | M1 | Véhicule de tourisme — **ce n'est pas un utilitaire N1/CTTE** |
 | **J.1 / J.3** | VASP / CARAVANE | Van aménagé sur base Citroën Jumper |
-| **C.1** | DE FARIA Yohan | Titulaire de la carte grise |
+| **C.1** | DE FARIA Yohan | Titulaire — Justine conduit, même foyer fiscal, donc admis |
 
 Le véhicule est imprimé sur la note de frais (modèle, immatriculation, puissance fiscale) : un
 document qui ne désigne pas le véhicule est faible en cas de contrôle.
@@ -239,15 +239,17 @@ est rattrapé au prochain enregistrement au lieu d'être perdu. Le jour où le v
 se saisit comme un remboursement depuis la page Comptes Associés, comme n'importe quel autre
 mouvement.
 
-⚠️ **Deux points à valider une fois :**
-- Les **distances sont pré-remplies avec des estimations** (56 km et 60 km aller-retour). Vérifie-les
-  sur un calculateur d'itinéraire avec tes adresses exactes : en cas de contrôle, la distance doit
-  être justifiable. Le péage Metro est à 0 € tant que tu ne l'as pas saisi.
-- **La carte grise est au nom de Yohan, or le conducteur configuré est Justine.** L'indemnité
-  kilométrique se rembourse au propriétaire du véhicule, ou à une personne du même foyer fiscal. Si
-  vous êtes le même foyer, rien à faire ; sinon, il faut porter les trajets — et donc le compte
-  courant — au nom de Yohan. La page affiche l'alerte tant que les deux ne coïncident pas, et le
-  conducteur se change en un clic.
+⚠️ **Un seul point reste à valider :** les **distances sont pré-remplies avec des estimations**
+(56 km et 60 km aller-retour). Vérifie-les sur un calculateur d'itinéraire avec tes adresses exactes :
+en cas de contrôle, la distance doit être justifiable. Le péage Metro reste à 0 € tant que tu ne l'as
+pas saisi.
+
+✅ **Titulaire et conducteur.** La carte grise est au nom de Yohan alors que Justine conduit. C'est
+admis, Justine et Yohan étant du même foyer fiscal : l'indemnité se rembourse au propriétaire du
+véhicule ou à une personne de son foyer. La note de frais le mentionne explicitement (« titulaire :
+Yohan — même foyer fiscal ») plutôt que de laisser la question ouverte à un lecteur extérieur. Le
+réglage « même foyer fiscal » reste modifiable : basculé sur *non*, la page alerte dès que le
+conducteur sélectionné n'est pas le titulaire, pour éviter de créditer le mauvais compte courant.
 
 ✅ **Le doute sur le type de véhicule est levé.** La carte grise indique J = M1 et J.1 = VASP : c'est
 un véhicule de tourisme, pas une camionnette « CTTE ». Le cas qui aurait imposé les frais réels au
