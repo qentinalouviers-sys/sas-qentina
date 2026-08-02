@@ -44,6 +44,29 @@ const EMPTY_FORM = {
   note: '',
 };
 
+/**
+ * Traduit une erreur Supabase en consigne actionnable.
+ *
+ * L'ancien message générique (« Vérifie ta connexion ») a fait chercher la
+ * panne du mauvais côté alors que la base répondait très bien : on nomme
+ * désormais la cause, et à défaut on affiche l'erreur brute plutôt que de
+ * la masquer.
+ */
+function detectionErrorMessage(e: any): string {
+  const code = e?.code as string | undefined;
+  const msg = String(e?.message || '');
+
+  // 42P01 undefined_table — la migration n'a pas été passée.
+  if (code === '42P01' || msg.includes('mileage_trips')) {
+    return "La table des trajets n'existe pas encore : exécute db/migration_trajets.sql dans Supabase.";
+  }
+  // 42P10 invalid_column_reference — l'index anti-doublon est absent ou partiel.
+  if (code === '42P10' || msg.includes('ON CONFLICT')) {
+    return "L'index anti-doublon est absent ou partiel : ré-exécute db/migration_trajets.sql dans Supabase (il corrige l'index).";
+  }
+  return `Détection impossible : ${msg || 'erreur inconnue'}`;
+}
+
 export default function TrajetsPage() {
   const [loading, setLoading] = useState(true);
   const [trips, setTrips] = useState<Trip[]>([]);
@@ -172,12 +195,7 @@ export default function TrajetsPage() {
       });
     } catch (e: any) {
       console.error('Détection trajets:', e);
-      setMessage({
-        type: 'warning',
-        text: e?.message?.includes('mileage_trips')
-          ? "La table des trajets n'existe pas encore : exécute db/migration_trajets.sql dans Supabase."
-          : 'Détection impossible. Vérifie ta connexion.',
-      });
+      setMessage({ type: 'warning', text: detectionErrorMessage(e) });
     } finally {
       setDetecting(false);
     }
