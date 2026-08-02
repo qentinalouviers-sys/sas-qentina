@@ -41,10 +41,29 @@ export const BAREME_DEFAULT: Record<CvBracket, BaremeRow> = {
 /** Majoration pour les véhicules 100 % électriques. */
 export const ELECTRIC_BONUS = 0.20;
 
+/**
+ * Identification du véhicule, telle qu'elle figure sur la carte grise.
+ *
+ * Une note de frais qui ne désigne pas le véhicule est faible en cas de
+ * contrôle : on reprend donc la marque/modèle, l'immatriculation et le
+ * propriétaire, et on les imprime sur le document.
+ */
+export interface VehicleConfig {
+  /** Marque et modèle — cases D.1 et D.3. */
+  model: string;
+  /** Numéro d'immatriculation — case A. */
+  plate: string;
+  /** Titulaire de la carte grise — case C.1. */
+  owner: 'justine' | 'yohan';
+  /** Genre national — case J.1 (VP, CTTE, VASP…). Purement informatif. */
+  registrationType: string;
+}
+
 export interface MileageConfig {
   cv: CvBracket;
   electric: boolean;
   defaultDriver: 'justine' | 'yohan';
+  vehicle: VehicleConfig;
   bareme: Record<CvBracket, BaremeRow>;
   /** Année de référence du barème, affichée sur la note de frais. */
   baremeYear: number;
@@ -66,9 +85,19 @@ export interface DestinationConfig {
 }
 
 export const DEFAULT_CONFIG: MileageConfig = {
+  // Carte grise du 30/06/2021 : P.6 = 7 → « 7 CV et plus », P.3 = GO → thermique.
   cv: '7+',
   electric: false,
   defaultDriver: 'justine',
+  vehicle: {
+    model: 'Pössl Summit 600',
+    plate: 'GA-175-LB',
+    owner: 'yohan',
+    // J = M1 (véhicule de tourisme), J.1 = VASP, J.3 = CARAVANE.
+    // Ce n'est PAS un utilitaire « CTTE » : le cas qui aurait exclu le barème
+    // au profit des frais réels ne s'applique donc pas ici.
+    registrationType: 'VASP',
+  },
   bareme: BAREME_DEFAULT,
   baremeYear: 2025,
   destinations: [
@@ -90,6 +119,16 @@ export const DEFAULT_CONFIG: MileageConfig = {
     },
   ],
 };
+
+/** Libellé lisible d'une puissance fiscale (« 7 CV et plus », « 5 CV »…). */
+export function cvLabel(cv: CvBracket): string {
+  return cv === '7+' ? '7 CV et plus' : `${cv} CV`;
+}
+
+/** Prénom affichable d'un associé. */
+export function driverLabel(driver: string): string {
+  return driver === 'justine' ? 'Justine' : 'Yohan';
+}
 
 /** Retire les accents et met en minuscules, pour comparer des noms de fournisseurs. */
 export function normalize(s: string): string {
@@ -247,6 +286,7 @@ export function mergeConfig(stored: unknown): MileageConfig {
   return {
     ...DEFAULT_CONFIG,
     ...s,
+    vehicle: { ...DEFAULT_CONFIG.vehicle, ...(s.vehicle || {}) },
     bareme: { ...BAREME_DEFAULT, ...(s.bareme || {}) },
     destinations: Array.isArray(s.destinations) && s.destinations.length > 0
       ? s.destinations
