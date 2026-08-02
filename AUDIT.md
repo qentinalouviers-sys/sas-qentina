@@ -68,6 +68,7 @@ Le problème n'était pas la vision, mais l'accumulation de code généré au fi
 ### Bugs d'interface
 | Bug | Impact | Correction |
 |---|---|---|
+| Photo iPhone (HEIC) envoyée telle quelle à l'IA | L'API refuse le format → « Erreur scanner » sans explication | Formats validés + message expliquant le réglage iPhone à changer |
 | Banque : une **photo** de relevé était envoyée comme PDF | L'import échouait systématiquement | Formats réels acceptés (PDF + CSV) |
 | CCA : champ fichier `required` mais masqué | **Impossible d'ajouter un apport manuel** dans Chrome (le formulaire bloquait sans message) | Corrigé |
 | Avis Google : « Génération en cours... » restait dans le champ de réponse | Un clic pouvait **publier ce texte sur Google** publiquement | État de génération séparé, boutons désactivés |
@@ -120,6 +121,15 @@ Le problème n'était pas la vision, mais l'accumulation de code généré au fi
   (debounce 2 s).
 - **Indicateur « Claude IA »** : ping toutes les 45 s par navigateur ouvert, sur le modèle Sonnet →
   toutes les 5 min, sur Haiku (≈ 25× moins d'appels, modèle ~10× moins cher).
+
+### Modèles d'IA
+Le scanner passe de **Sonnet 4.6 à Sonnet 5**, à tarif identique. L'intérêt est concret : Sonnet 5
+lit les images en **2576 px** contre 1568 px auparavant, ce qui change tout pour déchiffrer les
+petits caractères d'un ticket photographié au téléphone. Le « raisonnement étendu » est
+explicitement désactivé (l'extraction de facture n'en a pas besoin) pour éviter toute hausse de
+coût. Chaîne de secours si le modèle est saturé : Sonnet 5 → Opus 4.8 → Haiku 4.5.
+
+Pour revenir en arrière, une seule ligne à changer dans `src/lib/anthropic.ts` (`PRIMARY_MODEL`).
 
 ## 6. Ce qui a été simplifié
 

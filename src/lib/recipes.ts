@@ -7,8 +7,7 @@
 /** Unités proposées dans toute l'application (une seule liste). */
 export const UNITS = ['kg', 'g', 'L', 'cL', 'mL', 'unité', 'pièce', 'portion'] as const;
 
-const MASS = new Set(['g', 'gr', 'kg']);
-const VOLUME = new Set(['ml', 'cl', 'l']);
+/** Unités de comptage : équivalentes entre elles (1 pièce = 1 unité = 1 portion). */
 const COUNT = new Set(['unité', 'unite', 'pièce', 'piece', 'portion', 'barquette', 'sachet', 'boîte', 'boite']);
 
 /**

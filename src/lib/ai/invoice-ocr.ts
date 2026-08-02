@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
+import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages';
 import { createClaudeMessage } from '@/lib/anthropic';
 import { extractJson } from '@/lib/ai/json';
 
@@ -80,10 +81,37 @@ export interface ExtractedInvoiceData {
   }[];
 }
 
-function toContentBlock(f: OcrFile) {
-  return f.mimeType.includes('pdf')
-    ? { type: 'document' as const, source: { type: 'base64' as const, media_type: 'application/pdf' as const, data: f.fileBase64 } }
-    : { type: 'image' as const, source: { type: 'base64' as const, media_type: f.mimeType, data: f.fileBase64 } };
+/** Formats d'image acceptés par l'API Claude. */
+const SUPPORTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'] as const;
+type SupportedImageType = typeof SUPPORTED_IMAGE_TYPES[number];
+
+function isSupportedImage(mime: string): mime is SupportedImageType {
+  return (SUPPORTED_IMAGE_TYPES as readonly string[]).includes(mime);
+}
+
+function toContentBlock(f: OcrFile): ContentBlockParam {
+  if (f.mimeType.includes('pdf')) {
+    return {
+      type: 'document',
+      source: { type: 'base64', media_type: 'application/pdf', data: f.fileBase64 },
+    };
+  }
+
+  // Normalisation : les photos iPhone arrivent parfois en HEIC/HEIF, que
+  // l'API refuse. On le signale clairement plutôt que d'échouer côté Claude.
+  const mime = f.mimeType === 'image/jpg' ? 'image/jpeg' : f.mimeType;
+  if (!isSupportedImage(mime)) {
+    throw new Error(
+      `Format d'image non pris en charge (${f.mimeType}). ` +
+      `Utilisez un PDF, JPG, PNG, GIF ou WEBP. ` +
+      `Sur iPhone : Réglages → Appareil photo → Formats → « Le plus compatible ».`
+    );
+  }
+
+  return {
+    type: 'image',
+    source: { type: 'base64', media_type: mime, data: f.fileBase64 },
+  };
 }
 
 /**

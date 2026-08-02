@@ -712,7 +712,13 @@ export default function MenuEngineeringPage() {
                   <span style={{ color: '#3b82f6' }}>💰</span>
                   <span>
                     Pour atteindre la marge moyenne ({formatPercent(avgMarge)}), le prix idéal serait{' '}
-                    <strong>{formatCurrency(selectedItem.cost_per_portion / (avgMarge / 100))}</strong>.
+                    {/* prix = coût / (1 − taux de marge). Diviser par le taux lui-même
+                        traiterait la marge comme un food cost et sous-estimerait le prix. */}
+                    <strong>
+                      {avgMarge > 0 && avgMarge < 100
+                        ? formatCurrency(selectedItem.cost_per_portion / (1 - avgMarge / 100))
+                        : '—'}
+                    </strong>.
                   </span>
                 </div>
               )}
