@@ -1,8 +1,8 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { formatCurrency, formatDate, downloadCSV } from '@/lib/utils';
+import { formatCurrency, formatDate, downloadCSV, toISODate, getParisHour } from '@/lib/utils';
 import { 
   ShoppingCart, 
   RefreshCw, 
@@ -26,21 +26,76 @@ import {
   Line, 
   CartesianGrid 
 } from 'recharts';
-import { 
-  startOfDay, 
-  endOfDay, 
-  startOfWeek, 
-  endOfWeek, 
-  startOfMonth, 
-  endOfMonth, 
-  subDays, 
-  subWeeks, 
-  subMonths, 
+import {
+  startOfDay,
+  endOfDay,
+  startOfWeek,
+  endOfWeek,
+  startOfMonth,
+  endOfMonth,
+  subDays,
+  subWeeks,
+  subMonths,
   parseISO,
   differenceInDays,
-  addDays,
-  format
+  addDays
 } from 'date-fns';
+
+// ─── Bornes de périodes (pilotage + comparaison LFL) ─────────────────────────
+// Fonction pure, utilisée par loadData ET par le rendu : une seule source de
+// vérité pour l'arithmétique de périodes.
+function computePeriods(period: 'day' | 'week' | 'month', anchorDate: string) {
+  const parsedAnchor = anchorDate ? parseISO(anchorDate) : new Date();
+
+  let currentStart: Date;
+  let currentEnd: Date;       // borne LFL : jusqu'à la date pivot
+  let currentPeriodEnd: Date; // fin de période complète (graphiques)
+  let prevStart: Date;
+  let prevEnd: Date;          // borne LFL de la période précédente
+  let prevPeriodEnd: Date;    // fin de période précédente complète
+
+  if (period === 'day') {
+    currentStart = startOfDay(parsedAnchor);
+    currentEnd = endOfDay(parsedAnchor);
+    currentPeriodEnd = currentEnd;
+    prevStart = startOfDay(subDays(parsedAnchor, 1));
+    prevEnd = endOfDay(subDays(parsedAnchor, 1));
+    prevPeriodEnd = prevEnd;
+  } else if (period === 'week') {
+    currentStart = startOfWeek(parsedAnchor, { weekStartsOn: 1 });
+    currentEnd = parsedAnchor; // up to anchorDate for LFL comparison
+    currentPeriodEnd = endOfWeek(parsedAnchor, { weekStartsOn: 1 });
+
+    prevStart = startOfWeek(subWeeks(parsedAnchor, 1), { weekStartsOn: 1 });
+    prevPeriodEnd = endOfWeek(subWeeks(parsedAnchor, 1), { weekStartsOn: 1 });
+
+    // Calculate like-for-like elapsed days in week
+    const daysElapsed = differenceInDays(parsedAnchor, currentStart);
+    prevEnd = addDays(prevStart, daysElapsed);
+  } else { // month
+    currentStart = startOfMonth(parsedAnchor);
+    currentEnd = parsedAnchor; // up to anchorDate for LFL comparison
+    currentPeriodEnd = endOfMonth(parsedAnchor);
+
+    prevStart = startOfMonth(subMonths(parsedAnchor, 1));
+    prevPeriodEnd = endOfMonth(subMonths(parsedAnchor, 1));
+
+    // Calculate like-for-like elapsed days in month, clampé sur la fin du mois
+    // précédent (ex. pivot au 30/03 : février n'a pas 30 jours)
+    const daysElapsed = parsedAnchor.getDate() - 1;
+    const rawPrevEnd = addDays(prevStart, daysElapsed);
+    prevEnd = rawPrevEnd > prevPeriodEnd ? prevPeriodEnd : rawPrevEnd;
+  }
+
+  return {
+    currentStartISO: toISODate(currentStart),
+    currentEndISO: toISODate(currentEnd),
+    currentPeriodEndISO: toISODate(currentPeriodEnd),
+    prevStartISO: toISODate(prevStart),
+    prevEndISO: toISODate(prevEnd),
+    prevPeriodEndISO: toISODate(prevPeriodEnd),
+  };
+}
 
 export default function VentesPage() {
   const [orders, setOrders] = useState<SquareOrder[]>([]);
@@ -55,67 +110,15 @@ export default function VentesPage() {
   
   // Pilotage filter states
   const [period, setPeriod] = useState<'day' | 'week' | 'month'>('week');
-  const [anchorDate, setAnchorDate] = useState<string>(() => {
-    const d = new Date();
-    return d.toISOString().substring(0, 10);
-  });
+  const [anchorDate, setAnchorDate] = useState<string>(() => toISODate(new Date()));
   const [isTableExpanded, setIsTableExpanded] = useState(false);
-
-  // Timezone-safe date string formatter (local)
-  const toISODate = (date: Date) => format(date, 'yyyy-MM-dd');
 
   const supabase = createClient();
 
   const loadData = useCallback(async () => {
     setLoading(true);
-    const parsedAnchor = anchorDate ? parseISO(anchorDate) : new Date();
-    
-    let currentStart: Date;
-    let currentEnd: Date;
-    let prevStart: Date;
-    let prevEnd: Date;
-    
-    let prevPeriodEnd: Date;
-    let currentPeriodEnd: Date;
-    
-    if (period === 'day') {
-      currentStart = startOfDay(parsedAnchor);
-      currentEnd = endOfDay(parsedAnchor);
-      currentPeriodEnd = currentEnd;
-      prevStart = startOfDay(subDays(parsedAnchor, 1));
-      prevEnd = endOfDay(subDays(parsedAnchor, 1));
-      prevPeriodEnd = prevEnd;
-    } else if (period === 'week') {
-      currentStart = startOfWeek(parsedAnchor, { weekStartsOn: 1 });
-      currentEnd = parsedAnchor; // up to anchorDate for LFL comparison
-      currentPeriodEnd = endOfWeek(parsedAnchor, { weekStartsOn: 1 });
-      
-      prevStart = startOfWeek(subWeeks(parsedAnchor, 1), { weekStartsOn: 1 });
-      prevPeriodEnd = endOfWeek(subWeeks(parsedAnchor, 1), { weekStartsOn: 1 });
-      
-      // Calculate like-for-like elapsed days in week
-      const daysElapsed = differenceInDays(parsedAnchor, currentStart);
-      prevEnd = addDays(prevStart, daysElapsed);
-    } else { // month
-      currentStart = startOfMonth(parsedAnchor);
-      currentEnd = parsedAnchor; // up to anchorDate for LFL comparison
-      currentPeriodEnd = endOfMonth(parsedAnchor);
-      
-      prevStart = startOfMonth(subMonths(parsedAnchor, 1));
-      prevPeriodEnd = endOfMonth(subMonths(parsedAnchor, 1));
-      
-      // Calculate like-for-like elapsed days in month
-      const daysElapsed = parsedAnchor.getDate() - 1;
-      prevEnd = addDays(prevStart, daysElapsed);
-    }
-
-    const currentStartISO = toISODate(currentStart);
-    const currentEndISO = toISODate(currentEnd);
-    const currentPeriodEndISO = toISODate(currentPeriodEnd);
-    
-    const prevStartISO = toISODate(prevStart);
-    const prevEndISO = toISODate(prevEnd);
-    const prevPeriodEndISO = toISODate(prevPeriodEnd);
+    const { currentStartISO, currentPeriodEndISO, prevStartISO, prevPeriodEndISO } =
+      computePeriods(period, anchorDate);
 
     // Fetch orders covering both full periods (for complete charts)
     const { data: rawOrders, error } = await supabase
@@ -147,7 +150,7 @@ export default function VentesPage() {
 
     // Calculate Top Products for active period
     if (activeOrders.length > 0) {
-      const orderIds = activeOrders.map((o: any) => o.id).slice(0, 300);
+      const orderIds = activeOrders.map((o: any) => o.id);
       const { data: itemsData } = await supabase
         .from('square_items')
         .select('*')
@@ -181,9 +184,14 @@ export default function VentesPage() {
     loadData();
   }, [loadData]);
 
+  // Garde l'id de la dernière commande demandée pour ignorer les réponses obsolètes
+  const itemsRequestRef = useRef<string | null>(null);
+
   const loadItems = async (orderId: string) => {
     setSelectedOrder(orderId);
+    itemsRequestRef.current = orderId;
     const { data } = await supabase.from('square_items').select('*').eq('order_id', orderId);
+    if (itemsRequestRef.current !== orderId) return; // réponse obsolète : une autre commande a été demandée depuis
     setItems(data || []);
   };
 
@@ -212,25 +220,10 @@ export default function VentesPage() {
   };
 
   // LFL calculations (only up to anchorDate for current period and matching days elapsed in previous period)
-  const parsedAnchor = anchorDate ? parseISO(anchorDate) : new Date();
-  const currentStart = period === 'day' ? startOfDay(parsedAnchor)
-                     : period === 'week' ? startOfWeek(parsedAnchor, { weekStartsOn: 1 })
-                     : startOfMonth(parsedAnchor);
-                     
-  const prevStart = period === 'day' ? startOfDay(subDays(parsedAnchor, 1))
-                  : period === 'week' ? startOfWeek(subWeeks(parsedAnchor, 1), { weekStartsOn: 1 })
-                  : startOfMonth(subMonths(parsedAnchor, 1));
-                  
-  const daysElapsed = period === 'day' ? 0
-                    : period === 'week' ? differenceInDays(parsedAnchor, currentStart)
-                    : parsedAnchor.getDate() - 1;
-                    
-  const prevEnd = addDays(prevStart, daysElapsed);
-
-  const currentStartISO = toISODate(currentStart);
-  const currentEndISO = anchorDate;
-  const prevStartISO = toISODate(prevStart);
-  const prevEndISO = toISODate(prevEnd);
+  const { currentStartISO, currentEndISO, prevStartISO, prevEndISO } = useMemo(
+    () => computePeriods(period, anchorDate),
+    [period, anchorDate]
+  );
 
   // Filter active and comparison orders strictly for LFL calculations
   const activePaidOrdersLFL = orders.filter(
@@ -239,6 +232,11 @@ export default function VentesPage() {
   const prevPaidOrdersLFL = prevOrders.filter(
     (o: any) => o.service >= prevStartISO && o.service <= prevEndISO && (o.net_amount || 0) > 0
   );
+
+  // Commandes à 0 € sur la période LFL (affichées sous la liste des commandes)
+  const zeroOrdersLFL = orders.filter(
+    (o: any) => o.service >= currentStartISO && o.service <= currentEndISO && (o.net_amount || 0) <= 0
+  ).length;
 
   // KPIs LFL calculations
   const totalCATTC = activePaidOrdersLFL.reduce((s: number, o: any) => s + (o.net_amount || 0), 0);
@@ -257,6 +255,7 @@ export default function VentesPage() {
       'ID Square': o.square_order_id,
       'Total brut': o.total_money,
       'Net': o.net_amount,
+      'Net HT': getHtAmount(o),
       'Remises': o.discount_amount,
     })), 'ventes-qentina');
   };
@@ -268,17 +267,11 @@ export default function VentesPage() {
       return hours.map(h => {
         const hourStr = `${h}h`;
         const currentSum = orders
-          .filter(o => {
-            const date = new Date(o.created_at);
-            return date.getHours() === h;
-          })
+          .filter(o => getParisHour(new Date(o.created_at)) === h)
           .reduce((sum, o) => sum + (o.net_amount || 0), 0);
 
         const prevSum = prevOrders
-          .filter(o => {
-            const date = new Date(o.created_at);
-            return date.getHours() === h;
-          })
+          .filter(o => getParisHour(new Date(o.created_at)) === h)
           .reduce((sum, o) => sum + (o.net_amount || 0), 0);
 
         return {
@@ -294,11 +287,11 @@ export default function VentesPage() {
       return days.map((dayLabel, idx) => {
         const engDayIdx = daysEnglishIndex[idx];
         const currentSum = orders
-          .filter(o => new Date(o.service).getDay() === engDayIdx)
+          .filter(o => parseISO(o.service).getDay() === engDayIdx)
           .reduce((sum, o) => sum + (o.net_amount || 0), 0);
 
         const prevSum = prevOrders
-          .filter(o => new Date(o.service).getDay() === engDayIdx)
+          .filter(o => parseISO(o.service).getDay() === engDayIdx)
           .reduce((sum, o) => sum + (o.net_amount || 0), 0);
 
         return {
@@ -311,11 +304,11 @@ export default function VentesPage() {
       const daysInMonth = Array.from({ length: 31 }, (_, i) => i + 1);
       return daysInMonth.map(d => {
         const currentSum = orders
-          .filter(o => new Date(o.service).getDate() === d)
+          .filter(o => parseISO(o.service).getDate() === d)
           .reduce((sum, o) => sum + (o.net_amount || 0), 0);
 
         const prevSum = prevOrders
-          .filter(o => new Date(o.service).getDate() === d)
+          .filter(o => parseISO(o.service).getDate() === d)
           .reduce((sum, o) => sum + (o.net_amount || 0), 0);
 
         return {
@@ -422,19 +415,18 @@ export default function VentesPage() {
       
       <div className="page-body">
         <div className="filter-bar" style={{ marginBottom: 20 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <Calendar size={18} style={{ color: 'var(--text-secondary)' }} />
             <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-secondary)' }}>Date pivot :</span>
           </div>
-          <input 
-            type="date" 
-            className="form-input" 
-            value={anchorDate} 
-            onChange={e => { setAnchorDate(e.target.value); setIsTableExpanded(false); }} 
-            style={{ width: '160px', height: '36px', minHeight: '36px', padding: '6px 12px' }}
+          <input
+            type="date"
+            className="form-input"
+            value={anchorDate}
+            onChange={e => { setAnchorDate(e.target.value); setIsTableExpanded(false); }}
           />
-          {anchorDate !== new Date().toISOString().substring(0, 10) && (
-            <button className="btn btn-ghost btn-sm" onClick={() => { setAnchorDate(new Date().toISOString().substring(0, 10)); setIsTableExpanded(false); }}>
+          {anchorDate !== toISODate(new Date()) && (
+            <button className="btn btn-ghost btn-sm" onClick={() => { setAnchorDate(toISODate(new Date())); setIsTableExpanded(false); }}>
               Aujourd&apos;hui
             </button>
           )}
@@ -495,7 +487,7 @@ export default function VentesPage() {
                   {period === 'week' && 'Comparaison entre Cette Semaine et la Semaine Dernière'}
                   {period === 'month' && 'Comparaison entre Ce Mois et le Mois Dernier'}
                 </span>
-                <div style={{ height: 260, width: '100%' }}>
+                <div className="chart-container">
                   <ResponsiveContainer width="100%" height="100%">
                     {period === 'month' ? (
                       <LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
@@ -554,18 +546,18 @@ export default function VentesPage() {
             </div>
 
             <div className="card" style={{ paddingBottom: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16, flexWrap: 'wrap' }}>
                 <div>
                   <h3 style={{ fontSize: 15, fontWeight: 700 }}>Liste des Commandes de la période</h3>
                   <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                    Total : {orders.length} commande(s) (incluant {orders.length - totalOrders} commande(s) à 0 €)
+                    Total : {orders.length} commande(s) (incluant {zeroOrdersLFL} commande(s) à 0 €)
                   </span>
                 </div>
                 {orders.length > 5 && (
-                  <button 
-                    className="btn btn-secondary btn-sm" 
+                  <button
+                    className="btn btn-secondary btn-sm"
                     onClick={() => setIsTableExpanded(!isTableExpanded)}
-                    style={{ fontSize: 12, height: 32, minHeight: 32 }}
+                    style={{ fontSize: 12 }}
                   >
                     {isTableExpanded ? (
                       <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><ChevronUp size={14} /> Réduire le tableau</span>
@@ -629,34 +621,40 @@ export default function VentesPage() {
               )}
             </div>
 
-            {selectedOrder && items.length > 0 && (
+            {selectedOrder && (
               <div className="card" style={{ marginTop: 24 }}>
                 <div className="card-header">
                   <div className="card-title">Détail commande</div>
-                  <button className="btn btn-ghost btn-sm" onClick={() => { setSelectedOrder(null); setItems([]); }}>Fermer</button>
+                  <button className="btn btn-ghost btn-sm" onClick={() => { itemsRequestRef.current = null; setSelectedOrder(null); setItems([]); }}>Fermer</button>
                 </div>
-                <div className="table-container">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Article</th>
-                        <th>Qté</th>
-                        <th>Prix unit.</th>
-                        <th>Total</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {items.map(item => (
-                        <tr key={item.id}>
-                          <td style={{ fontWeight: 500 }}>{item.name}</td>
-                          <td>{item.quantity}</td>
-                          <td>{formatCurrency(item.base_price)}</td>
-                          <td style={{ fontWeight: 600 }}>{formatCurrency(item.total_price)}</td>
+                {items.length === 0 ? (
+                  <div style={{ padding: '20px 0', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+                    Aucun article
+                  </div>
+                ) : (
+                  <div className="table-container">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Article</th>
+                          <th>Qté</th>
+                          <th>Prix unit.</th>
+                          <th>Total</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                      </thead>
+                      <tbody>
+                        {items.map(item => (
+                          <tr key={item.id}>
+                            <td style={{ fontWeight: 500 }}>{item.name}</td>
+                            <td>{item.quantity}</td>
+                            <td>{formatCurrency(item.base_price)}</td>
+                            <td style={{ fontWeight: 600 }}>{formatCurrency(item.total_price)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             )}
           </>

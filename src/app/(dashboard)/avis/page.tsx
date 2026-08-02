@@ -4,26 +4,36 @@ import { useState, useEffect, useCallback } from 'react';
 import { Star, MessageCircle, Send, Flame, Copy } from 'lucide-react';
 import { formatDate } from '@/lib/utils';
 
+// Note Google : 'ONE'…'FIVE' → nombre d'étoiles pleines ; valeur inconnue → 0
+const STAR_RATING: Record<string, number> = { ONE: 1, TWO: 2, THREE: 3, FOUR: 4, FIVE: 5 };
+
 export default function AvisPage() {
   const [reviews, setReviews] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [needsAuth, setNeedsAuth] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [replyingTo, setReplyingTo] = useState<string | null>(null);
   const [replyText, setReplyText] = useState('');
   const [sendingReply, setSendingReply] = useState(false);
+  const [generating, setGenerating] = useState(false);
 
   const fetchReviews = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
       const res = await fetch('/api/google/reviews');
       const data = await res.json();
       if (data.code === 'AUTH_REQUIRED') {
         setNeedsAuth(true);
-      } else if (data.reviews) {
-        setReviews(data.reviews);
+      } else if (data.error) {
+        setError('Impossible de charger les avis : ' + data.error);
+      } else {
+        setNeedsAuth(false);
+        setReviews(data.reviews || []);
       }
-    } catch (error) {
-      console.error(error);
+    } catch (e) {
+      console.error(e);
+      setError('Erreur réseau lors du chargement des avis.');
     }
     setLoading(false);
   }, []);
@@ -31,7 +41,7 @@ export default function AvisPage() {
   useEffect(() => { fetchReviews(); }, [fetchReviews]);
 
   const handleReply = async (reviewName: string) => {
-    if (!replyText.trim()) return;
+    if (!replyText.trim() || sendingReply) return;
     setSendingReply(true);
     try {
       const res = await fetch('/api/google/reviews/reply', {
@@ -54,27 +64,31 @@ export default function AvisPage() {
   };
 
   const generateAIReply = async (review: any) => {
-    setReplyText('Génération en cours...');
+    if (generating) return;
+    // Ne jamais écrire de texte provisoire dans replyText : il pourrait être publié tel quel.
+    if (replyText.trim() && !confirm('Remplacer votre texte actuel par une réponse générée par IA ?')) return;
+    setGenerating(true);
     try {
       const res = await fetch('/api/ai/reply', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          reviewComment: review.comment || '', 
-          rating: review.starRating, 
-          reviewerName: review.reviewer?.displayName 
+        body: JSON.stringify({
+          reviewComment: review.comment || '',
+          rating: review.starRating,
+          reviewerName: review.reviewer?.displayName
         })
       });
       const data = await res.json();
       if (data.reply) {
         setReplyText(data.reply);
       } else {
-        setReplyText("Erreur lors de la génération. Veuillez écrire votre réponse.");
+        alert('Erreur lors de la génération. Veuillez écrire votre réponse.');
       }
     } catch (e) {
-      setReplyText('');
+      console.error(e);
       alert("Erreur de connexion à l'IA");
     }
+    setGenerating(false);
   };
 
   if (loading) return <div className="loading-page"><div className="spinner" style={{ width: 40, height: 40 }} /></div>;

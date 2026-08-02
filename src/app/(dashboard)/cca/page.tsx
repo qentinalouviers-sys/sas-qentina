@@ -1,28 +1,26 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { 
-  formatCurrency, 
-  formatDate, 
-  getDateRange, 
-  toISODate, 
-  downloadCSV 
+import {
+  formatCurrency,
+  formatDate,
+  getDateRange,
+  toISODate,
+  downloadCSV
 } from '@/lib/utils';
-import { 
-  Coins, 
-  Upload, 
-  Plus, 
-  Trash2, 
-  Calendar, 
-  ArrowUpRight, 
-  ArrowDownRight, 
-  FileText, 
-  AlertCircle, 
-  Filter, 
+import { Modal } from '@/components/ui';
+import {
+  Coins,
+  Upload,
+  Plus,
+  Trash2,
+  ArrowUpRight,
+  ArrowDownRight,
+  FileText,
+  AlertCircle,
   CheckCircle,
   Download,
-  X,
   ExternalLink
 } from 'lucide-react';
 import type { CcaAssocie, CcaSousType, MouvementCca, PeriodFilter } from '@/lib/types';
@@ -88,7 +86,8 @@ export default function CcaPage() {
         .from('mouvements_cca')
         .select('*')
         .order('date', { ascending: true })
-        .order('created_at', { ascending: true });
+        .order('created_at', { ascending: true })
+        .order('id', { ascending: true });
 
       if (error) throw error;
       setMovements(data || []);
@@ -113,24 +112,28 @@ export default function CcaPage() {
   }, [loadData, supabase]);
 
   // Calculate Running Balances chronologically
-  let justineBal = 0;
-  let yohanBal = 0;
-  
-  const movementsWithBalance = movements.map(m => {
-    const amt = Number(m.montant);
-    const isApport = m.sens === 'apport';
-    if (m.associe === 'justine') {
-      const prevBal = justineBal;
-      justineBal += isApport ? amt : -amt;
-      const bascule = prevBal >= 0 && justineBal < 0;
-      return { ...m, running_balance: justineBal, bascule_negatif: bascule };
-    } else {
-      const prevBal = yohanBal;
-      yohanBal += isApport ? amt : -amt;
-      const bascule = prevBal >= 0 && yohanBal < 0;
-      return { ...m, running_balance: yohanBal, bascule_negatif: bascule };
-    }
-  });
+  const { movements: movementsWithBalance, justineBal, yohanBal } = useMemo(() => {
+    let jBal = 0;
+    let yBal = 0;
+
+    const withBalance = movements.map(m => {
+      const amt = Number(m.montant);
+      const isApport = m.sens === 'apport';
+      if (m.associe === 'justine') {
+        const prevBal = jBal;
+        jBal += isApport ? amt : -amt;
+        const bascule = prevBal >= 0 && jBal < 0;
+        return { ...m, running_balance: jBal, bascule_negatif: bascule };
+      } else {
+        const prevBal = yBal;
+        yBal += isApport ? amt : -amt;
+        const bascule = prevBal >= 0 && yBal < 0;
+        return { ...m, running_balance: yBal, bascule_negatif: bascule };
+      }
+    });
+
+    return { movements: withBalance, justineBal: jBal, yohanBal: yBal };
+  }, [movements]);
 
   // Latest Balances
   const currentJustineBalance = justineBal;
@@ -172,7 +175,7 @@ export default function CcaPage() {
       // 1. Upload file to Supabase storage
       const fileExt = formFile.name.split('.').pop();
       const fileName = `cca/${Date.now()}_${Math.random().toString(36).substring(2, 15)}.${fileExt}`;
-      const { data: uploadData, error: uploadErr } = await supabase.storage
+      const { error: uploadErr } = await supabase.storage
         .from('invoice-files')
         .upload(fileName, formFile);
 
@@ -198,7 +201,15 @@ export default function CcaPage() {
           rapproche_banque: false
         });
 
-      if (insertErr) throw insertErr;
+      if (insertErr) {
+        // L'insert a échoué : on supprime le fichier uploadé pour ne pas laisser d'orphelin
+        try {
+          await supabase.storage.from('invoice-files').remove([fileName]);
+        } catch (cleanupErr) {
+          console.error('Impossible de supprimer le fichier orphelin:', cleanupErr);
+        }
+        throw insertErr;
+      }
 
       alert("Apport manuel enregistré avec succès.");
       setShowModal(false);
@@ -232,17 +243,8 @@ export default function CcaPage() {
       // Guard: Deleting an apport reduces the associate's balance. Check if balance - amount < 0.
       if (mouvement.sens === 'apport') {
         const partner = mouvement.associe;
-        const { data: movementsList, error: fetchErr } = await supabase
-          .from('mouvements_cca')
-          .select('sens, montant')
-          .eq('associe', partner);
-          
-        if (fetchErr) throw fetchErr;
-
-        const currentBal = (movementsList || []).reduce(
-          (sum: number, m: any) => sum + (m.sens === 'apport' ? Number(m.montant) : -Number(m.montant)),
-          0
-        );
+        // Soldes déjà calculés en mémoire (useMemo) — inutile de refaire un fetch
+        const currentBal = partner === 'justine' ? justineBal : yohanBal;
 
         if (currentBal - Number(mouvement.montant) < 0) {
           const confirmDebit = confirm(
@@ -286,17 +288,22 @@ export default function CcaPage() {
     }
   };
 
+  const getSubtypeLabel = (st: CcaSousType) => {
+    switch (st) {
+      case 'facture_payee_perso': return 'Facture payée perso';
+      case 'avance_tresorerie': return 'Avance trésorerie';
+      case 'frais_perso_reverse': return 'Frais perso reversé';
+      default: return st;
+    }
+  };
+
   // Export formats
   const handleExportCSV = () => {
     const dataToExport = displayMovements.map(m => ({
       Date: m.date,
       Associe: m.associe === 'justine' ? 'Justine' : 'Yohan',
       Sens: m.sens === 'apport' ? 'Apport (Crédit)' : 'Remboursement (Débit)',
-      Type: m.sous_type === 'facture_payee_perso' 
-        ? 'Facture payée perso' 
-        : m.sous_type === 'avance_tresorerie' 
-          ? 'Avance trésorerie' 
-          : 'Frais perso reversé',
+      Type: getSubtypeLabel(m.sous_type),
       Montant: m.montant,
       Solde_Courant: m.running_balance,
       Note: m.note || '',
@@ -316,21 +323,12 @@ export default function CcaPage() {
     downloadAnchor.remove();
   };
 
-  const getSubtypeLabel = (st: CcaSousType) => {
-    switch (st) {
-      case 'facture_payee_perso': return 'Facture payée perso';
-      case 'avance_tresorerie': return 'Avance trésorerie';
-      case 'frais_perso_reverse': return 'Frais perso reversé';
-      default: return st;
-    }
-  };
-
   return (
     <>
       <style dangerouslySetInnerHTML={{ __html: `
         .cca-kpi-grid {
           display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+          grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
           gap: 20px;
           margin-bottom: 24px;
         }
@@ -409,60 +407,6 @@ export default function CcaPage() {
         .cca-avatar.yohan {
           background: linear-gradient(135deg, #3B82F6 0%, #2563EB 100%);
         }
-        /* Modal Styles */
-        .cca-modal-overlay {
-          position: fixed;
-          top: 0;
-          left: 0;
-          right: 0;
-          bottom: 0;
-          background: rgba(0, 0, 0, 0.4);
-          backdrop-filter: blur(4px);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          z-index: 1000;
-          padding: 16px;
-        }
-        .cca-modal {
-          background: white;
-          border-radius: 20px;
-          width: 100%;
-          max-width: 520px;
-          box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
-          animation: modalSlideUp 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-          overflow: hidden;
-        }
-        @keyframes modalSlideUp {
-          from {
-            transform: translateY(20px);
-            opacity: 0;
-          }
-          to {
-            transform: translateY(0);
-            opacity: 1;
-          }
-        }
-        .cca-modal-header {
-          padding: 20px 24px;
-          border-bottom: 1px solid var(--border-light);
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-        }
-        .cca-modal-body {
-          padding: 24px;
-          max-height: 75vh;
-          overflow-y: auto;
-        }
-        .cca-modal-footer {
-          padding: 16px 24px;
-          border-top: 1px solid var(--border-light);
-          background: var(--surface);
-          display: flex;
-          justify-content: flex-end;
-          gap: 12px;
-        }
         .file-upload-zone {
           border: 2px dashed var(--border);
           border-radius: 12px;
@@ -495,10 +439,10 @@ export default function CcaPage() {
           </span>
         </div>
         
-        <button 
-          className="btn" 
+        <button
+          className="btn btn-primary"
           onClick={() => setShowModal(true)}
-          style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 18px', background: 'var(--teal)', border: 'none', color: 'white', fontWeight: 750 }}
+          style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 18px', fontWeight: 750 }}
         >
           <Plus size={18} />
           Ajouter un apport manuel
@@ -533,7 +477,7 @@ export default function CcaPage() {
         <div className="cca-kpi-grid">
           {/* Total CCA */}
           <div className="cca-kpi-card" style={{ borderLeft: currentTotalBalance < 0 ? '4px solid var(--red)' : '4px solid var(--teal)' }}>
-            <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+            <span style={{ display: 'block', paddingRight: 56, fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
               Dette Globale Société (Total CCA)
             </span>
             <div style={{ fontSize: 24, fontWeight: 800, color: currentTotalBalance < 0 ? 'var(--red)' : 'var(--text-primary)', marginTop: 8 }}>
@@ -549,7 +493,7 @@ export default function CcaPage() {
 
           {/* Justine's CCA */}
           <div className="cca-kpi-card" style={{ borderLeft: currentJustineBalance < 0 ? '4px solid var(--red)' : '4px solid #EC4899' }}>
-            <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+            <span style={{ display: 'block', paddingRight: 56, fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
               Compte Courant Justine
             </span>
             <div style={{ fontSize: 24, fontWeight: 800, color: currentJustineBalance < 0 ? 'var(--red)' : '#EC4899', marginTop: 8 }}>
@@ -571,7 +515,7 @@ export default function CcaPage() {
 
           {/* Yohan's CCA */}
           <div className="cca-kpi-card" style={{ borderLeft: currentYohanBalance < 0 ? '4px solid var(--red)' : '4px solid #3B82F6' }}>
-            <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+            <span style={{ display: 'block', paddingRight: 56, fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
               Compte Courant Yohan
             </span>
             <div style={{ fontSize: 24, fontWeight: 800, color: currentYohanBalance < 0 ? 'var(--red)' : '#3B82F6', marginTop: 8 }}>
@@ -598,7 +542,7 @@ export default function CcaPage() {
             {/* Filter Associate */}
             <div className="cca-filter-group">
               <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-muted)' }}>Associé :</span>
-              <div style={{ display: 'flex', gap: 6 }}>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                 {(['tous', 'justine', 'yohan'] as const).map(opt => (
                   <button
                     key={opt}
@@ -614,7 +558,7 @@ export default function CcaPage() {
             {/* Filter Period */}
             <div className="cca-filter-group">
               <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-muted)' }}>Période :</span>
-              <div style={{ display: 'flex', gap: 6 }}>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                 {(['all', 'month', 'year'] as const).map(p => (
                   <button
                     key={p}
@@ -629,7 +573,7 @@ export default function CcaPage() {
           </div>
 
           {/* Export Actions */}
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button 
               className="btn btn-secondary btn-sm"
               onClick={handleExportCSV}
@@ -796,159 +740,151 @@ export default function CcaPage() {
 
       {/* Manual Apport Modal */}
       {showModal && (
-        <div className="cca-modal-overlay" onClick={() => setShowModal(false)}>
-          <div className="cca-modal" onClick={e => e.stopPropagation()}>
-            <div className="cca-modal-header">
-              <h3 style={{ fontSize: 16, fontWeight: 800, display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Coins size={20} style={{ color: 'var(--teal)' }} />
-                Enregistrer un apport manuel (Crédit)
-              </h3>
-              <button className="btn btn-ghost btn-sm" onClick={() => setShowModal(false)} style={{ padding: 4 }}>
-                <X size={20} />
+        <Modal
+          title="Ajouter un apport manuel"
+          onClose={() => setShowModal(false)}
+          footer={
+            <>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => setShowModal(false)}
+                disabled={saving}
+                style={{ fontWeight: 650 }}
+              >
+                Annuler
               </button>
+              <button
+                type="submit"
+                form="cca-apport-form"
+                className="btn btn-primary"
+                disabled={saving}
+                style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700 }}
+              >
+                {saving ? (
+                  <>
+                    <div className="spinner" style={{ width: 14, height: 14 }} /> Enregistrement...
+                  </>
+                ) : (
+                  <>Enregistrer l&apos;apport</>
+                )}
+              </button>
+            </>
+          }
+        >
+          <form id="cca-apport-form" onSubmit={handleAddApport} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* Date */}
+            <div>
+              <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
+                Date de l&apos;opération
+              </label>
+              <input
+                type="date"
+                required
+                className="form-input"
+                value={formDate}
+                onChange={e => setFormDate(e.target.value)}
+              />
             </div>
-            
-            <form onSubmit={handleAddApport}>
-              <div className="cca-modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                {/* Date */}
-                <div>
-                  <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
-                    Date de l&apos;opération
-                  </label>
-                  <input
-                    type="date"
-                    required
-                    className="form-input"
-                    value={formDate}
-                    onChange={e => setFormDate(e.target.value)}
-                  />
-                </div>
 
-                {/* Associate */}
-                <div>
-                  <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
-                    Associé
-                  </label>
-                  <select
-                    className="form-select"
-                    value={formAssocie}
-                    onChange={e => setFormAssocie(e.target.value as CcaAssocie)}
-                  >
-                    <option value="justine">Justine (Présidente)</option>
-                    <option value="yohan">Yohan</option>
-                  </select>
-                </div>
+            {/* Associate */}
+            <div>
+              <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
+                Associé
+              </label>
+              <select
+                className="form-select"
+                value={formAssocie}
+                onChange={e => setFormAssocie(e.target.value as CcaAssocie)}
+              >
+                <option value="justine">Justine (Présidente)</option>
+                <option value="yohan">Yohan</option>
+              </select>
+            </div>
 
-                {/* Sub-type */}
-                <div>
-                  <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
-                    Nature de l&apos;apport
-                  </label>
-                  <select
-                    className="form-select"
-                    value={formSousType}
-                    onChange={e => setFormSousType(e.target.value as CcaSousType)}
-                  >
-                    <option value="facture_payee_perso">Facture payée personnellement (Frais avancés)</option>
-                    <option value="avance_tresorerie">Avance de trésorerie (Virement perso vers pro)</option>
-                    <option value="frais_perso_reverse">Frais perso reversés à la société</option>
-                  </select>
-                </div>
+            {/* Sub-type */}
+            <div>
+              <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
+                Nature de l&apos;apport
+              </label>
+              <select
+                className="form-select"
+                value={formSousType}
+                onChange={e => setFormSousType(e.target.value as CcaSousType)}
+              >
+                <option value="facture_payee_perso">Facture payée personnellement (Frais avancés)</option>
+                <option value="avance_tresorerie">Avance de trésorerie (Virement perso vers pro)</option>
+                <option value="frais_perso_reverse">Frais perso reversés à la société</option>
+              </select>
+            </div>
 
-                {/* Montant */}
-                <div>
-                  <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
-                    Montant de l&apos;apport (€)
-                  </label>
-                  <div style={{ position: 'relative' }}>
-                    <input
-                      type="number"
-                      step="0.01"
-                      min="0.01"
-                      required
-                      placeholder="0.00"
-                      className="form-input"
-                      value={formMontant}
-                      onChange={e => setFormMontant(e.target.value)}
-                      style={{ paddingLeft: 20 }}
-                    />
-                    <span style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', fontSize: 13, color: 'var(--text-muted)' }}>€</span>
-                  </div>
-                </div>
-
-                {/* File Attachment (Mandatory) */}
-                <div>
-                  <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
-                    Pièce justificative (Requis)
-                  </label>
-                  <div 
-                    className="file-upload-zone"
-                    onClick={() => {
-                      const inp = document.getElementById('piece-justif-input');
-                      if (inp) inp.click();
-                    }}
-                  >
-                    <input
-                      id="piece-justif-input"
-                      type="file"
-                      required
-                      accept="image/*,.pdf"
-                      onChange={e => setFormFile(e.target.files?.[0] || null)}
-                      style={{ display: 'none' }}
-                    />
-                    <Upload size={24} style={{ color: 'var(--teal)', margin: '0 auto 8px' }} />
-                    <span style={{ fontSize: 12.5, fontWeight: 650, color: 'var(--text-primary)', display: 'block' }}>
-                      {formFile ? formFile.name : "Cliquez pour sélectionner la pièce jointe (facture, reçu...)"}
-                    </span>
-                    <span style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4, display: 'block' }}>
-                      PDF, JPG ou PNG
-                    </span>
-                  </div>
-                </div>
-
-                {/* Note */}
-                <div>
-                  <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
-                    Note descriptive (Optionnelle)
-                  </label>
-                  <textarea
-                    className="form-input"
-                    placeholder="Détails sur l'opération, nom du fournisseur..."
-                    value={formNote}
-                    onChange={e => setFormNote(e.target.value)}
-                    style={{ height: 80, resize: 'none', padding: '10px' }}
-                  />
-                </div>
+            {/* Montant */}
+            <div>
+              <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
+                Montant de l&apos;apport (€)
+              </label>
+              <div style={{ position: 'relative' }}>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  required
+                  placeholder="0.00"
+                  className="form-input"
+                  value={formMontant}
+                  onChange={e => setFormMontant(e.target.value)}
+                  style={{ paddingLeft: 20 }}
+                />
+                <span style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', fontSize: 13, color: 'var(--text-muted)' }}>€</span>
               </div>
+            </div>
 
-              <div className="cca-modal-footer">
-                <button 
-                  type="button" 
-                  className="btn btn-secondary" 
-                  onClick={() => setShowModal(false)}
-                  disabled={saving}
-                  style={{ fontWeight: 650 }}
-                >
-                  Annuler
-                </button>
-                <button 
-                  type="submit" 
-                  className="btn" 
-                  disabled={saving}
-                  style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'var(--teal)', border: 'none', color: 'white', fontWeight: 700 }}
-                >
-                  {saving ? (
-                    <>
-                      <div className="spinner" style={{ width: 14, height: 14 }} /> Enregistrement...
-                    </>
-                  ) : (
-                    <>Enregistrer l&apos;apport</>
-                  )}
-                </button>
+            {/* File Attachment (Mandatory — validé côté JS dans handleAddApport,
+                pas d'attribut required : l'input est masqué et Chrome bloquerait
+                la soumission avec une erreur « not focusable ») */}
+            <div>
+              <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
+                Pièce justificative (Requis)
+              </label>
+              <div
+                className="file-upload-zone"
+                onClick={() => {
+                  const inp = document.getElementById('piece-justif-input');
+                  if (inp) inp.click();
+                }}
+              >
+                <input
+                  id="piece-justif-input"
+                  type="file"
+                  accept="image/*,.pdf"
+                  onChange={e => setFormFile(e.target.files?.[0] || null)}
+                  style={{ display: 'none' }}
+                />
+                <Upload size={24} style={{ color: 'var(--teal)', margin: '0 auto 8px' }} />
+                <span style={{ fontSize: 12.5, fontWeight: 650, color: 'var(--text-primary)', display: 'block' }}>
+                  {formFile ? formFile.name : "Cliquez pour sélectionner la pièce jointe (facture, reçu...)"}
+                </span>
+                <span style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4, display: 'block' }}>
+                  PDF, JPG ou PNG
+                </span>
               </div>
-            </form>
-          </div>
-        </div>
+            </div>
+
+            {/* Note */}
+            <div>
+              <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
+                Note descriptive (Optionnelle)
+              </label>
+              <textarea
+                className="form-input"
+                placeholder="Détails sur l'opération, nom du fournisseur..."
+                value={formNote}
+                onChange={e => setFormNote(e.target.value)}
+                style={{ height: 80, resize: 'none', padding: '10px' }}
+              />
+            </div>
+          </form>
+        </Modal>
       )}
     </>
   );

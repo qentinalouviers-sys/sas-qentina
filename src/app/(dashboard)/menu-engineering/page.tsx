@@ -8,6 +8,7 @@ import {
   BarChart2, Grid, RefreshCw
 } from 'lucide-react';
 import type { Recipe, RecipeIngredient, Ingredient, RecipeCategory } from '@/lib/types';
+import { calcRecipeCost } from '@/lib/recipes';
 import {
   ScatterChart, Scatter, XAxis, YAxis, ZAxis, Tooltip,
   ResponsiveContainer, ReferenceLine, Cell
@@ -24,13 +25,10 @@ interface MenuItemAnalysis {
   selling_price: number;
   food_cost_pct: number;
   marge_pct: number;
-  marge_euro: number;
   cost_per_portion: number;
   qty_sold: number;
   revenue: number;
   quadrant: BCGQuadrant;
-  popularity_index: number; // % vs average
-  profitability_index: number; // marge vs average
 }
 
 // ─── BCG quadrant config ─────────────────────────────────────────────────────
@@ -82,43 +80,9 @@ const QUADRANT_CONFIG: Record<BCGQuadrant, {
   },
 };
 
-// ─── Helper: unit conversion ─────────────────────────────────────────────────
-
-function convertQuantity(quantity: number, fromUnit: string, toUnit: string): number {
-  const from = (fromUnit || '').toLowerCase().trim();
-  const to = (toUnit || '').toLowerCase().trim();
-  if (from === to) return quantity;
-  let valInBase = quantity;
-  if (from === 'g' || from === 'gr' || from === 'ml') valInBase = quantity / 1000;
-  else if (from === 'cl') valInBase = quantity / 100;
-  else if (from === 'kg' || from === 'l') valInBase = quantity;
-  else return quantity;
-  if (to === 'kg' || to === 'l') return valInBase;
-  if (to === 'g' || to === 'gr' || to === 'ml') return valInBase * 1000;
-  if (to === 'cl') return valInBase * 100;
-  return quantity;
-}
-
 type RecipeWithIngredients = Recipe & {
   recipe_ingredients: (RecipeIngredient & { ingredient: Ingredient })[];
 };
-
-function calcRecipeCost(ri: any[], allRecipes: any[]): number {
-  return ri?.reduce((s: number, r: any) => {
-    if (r.ingredient_id && r.ingredient) {
-      const qty = convertQuantity(r.quantity || 0, r.unit || '', r.ingredient?.unit || '');
-      return s + qty * (r.ingredient?.last_unit_price || 0);
-    } else if (r.sub_recipe_id) {
-      const sub = allRecipes.find((rec: any) => rec.id === r.sub_recipe_id);
-      if (sub) {
-        const subCost = calcRecipeCost(sub.recipe_ingredients, allRecipes);
-        const cpp = sub.portions > 0 ? subCost / sub.portions : subCost;
-        return s + (r.quantity || 0) * cpp;
-      }
-    }
-    return s;
-  }, 0) || 0;
-}
 
 // ─── Custom Tooltip for ScatterChart ────────────────────────────────────────
 
@@ -260,26 +224,25 @@ export default function MenuEngineeringPage() {
         cost_per_portion: cpp,
         food_cost_pct,
         marge_pct,
-        marge_euro,
         qty_sold: salesData.qty,
         revenue: salesData.revenue,
         quadrant: 'dog' as BCGQuadrant, // placeholder
-        popularity_index: 0,
-        profitability_index: 0,
       };
     });
 
     if (items.length === 0) return [];
 
-    // Compute averages for BCG classification
-    const totalQty = items.reduce((s, i) => s + i.qty_sold, 0);
-    const avgQtyPerItem = totalQty / items.length;
+    // Kasavana-Smith : moyenne des quantités calculée sur les seuls plats vendus,
+    // seuil de popularité = 70 % de cette moyenne (standard de la méthode)
+    const soldItems = items.filter(i => i.qty_sold > 0);
+    const avgQtySold = soldItems.length > 0
+      ? soldItems.reduce((s, i) => s + i.qty_sold, 0) / soldItems.length
+      : 0;
+    const popularityThreshold = avgQtySold * 0.7;
     const avgMarge = items.reduce((s, i) => s + i.marge_pct, 0) / items.length;
 
     return items.map(item => {
-      const popularity_index = avgQtyPerItem > 0 ? (item.qty_sold / avgQtyPerItem) * 100 : 0;
-      const profitability_index = item.marge_pct - avgMarge; // deviation from average
-      const isPopular = item.qty_sold >= avgQtyPerItem;
+      const isPopular = popularityThreshold > 0 && item.qty_sold >= popularityThreshold;
       const isProfitable = item.marge_pct >= avgMarge;
       let quadrant: BCGQuadrant;
       if (isPopular && isProfitable) quadrant = 'star';
@@ -287,7 +250,7 @@ export default function MenuEngineeringPage() {
       else if (!isPopular && isProfitable) quadrant = 'puzzle';
       else quadrant = 'dog';
 
-      return { ...item, quadrant, popularity_index, profitability_index };
+      return { ...item, quadrant };
     });
   }, [recipes, salesMap]);
 
@@ -320,18 +283,25 @@ export default function MenuEngineeringPage() {
     return stats;
   }, [analysis]);
 
-  // ─── Scatter data ──────────────────────────────────────────────────────────
+  // ─── Scatter data (déjà filtrée : mêmes critères que la vue tableau) ──────
   const scatterData = useMemo(() => {
-    return analysis.map(item => ({
+    return filtered.map(item => ({
       ...item,
       x: item.qty_sold,      // popularity
       y: item.marge_pct,     // profitability
       z: Math.max(item.revenue, 10),  // bubble size
     }));
-  }, [analysis]);
+  }, [filtered]);
 
-  const avgQty = analysis.length > 0 ? analysis.reduce((s, i) => s + i.qty_sold, 0) / analysis.length : 0;
+  // Seuil de popularité affiché sur la matrice (identique à celui de la classification)
+  const soldAnalysis = analysis.filter(i => i.qty_sold > 0);
+  const popularityThreshold = soldAnalysis.length > 0
+    ? (soldAnalysis.reduce((s, i) => s + i.qty_sold, 0) / soldAnalysis.length) * 0.7
+    : 0;
   const avgMarge = analysis.length > 0 ? analysis.reduce((s, i) => s + i.marge_pct, 0) / analysis.length : 0;
+
+  // Config du quadrant de l'élément sélectionné (une seule lecture pour toute la modale)
+  const selectedConf = selectedItem ? QUADRANT_CONFIG[selectedItem.quadrant] : null;
 
   // ─── Render ────────────────────────────────────────────────────────────────
   return (
@@ -467,10 +437,10 @@ export default function MenuEngineeringPage() {
                       </p>
                     </div>
 
-                    {/* Quadrant labels overlay */}
+                    {/* Quadrant labels overlay (masqué en mobile via <style jsx>) */}
                     <div style={{ position: 'relative' }}>
-                      <div style={{
-                        position: 'absolute', top: 8, right: 16,
+                      <div className="quadrant-overlay" style={{
+                        position: 'absolute', top: 8,
                         display: 'grid', gridTemplateColumns: '1fr 1fr',
                         gap: 4, fontSize: 11, zIndex: 10, pointerEvents: 'none',
                         width: 'calc(100% - 80px)', left: 60,
@@ -481,7 +451,8 @@ export default function MenuEngineeringPage() {
                         <div style={{ color: '#3b82f6', fontWeight: 700, textAlign: 'center', opacity: 0.7 }}>🐂 VACHES À LAIT</div>
                       </div>
 
-                      <ResponsiveContainer width="100%" height={420}>
+                      <div className="me-chart">
+                      <ResponsiveContainer width="100%" height="100%">
                         <ScatterChart margin={{ top: 40, right: 30, bottom: 20, left: 20 }}>
                           <XAxis
                             dataKey="x"
@@ -504,36 +475,27 @@ export default function MenuEngineeringPage() {
                           />
                           <ZAxis dataKey="z" range={[40, 600]} />
                           <Tooltip content={<CustomScatterTooltip />} />
-                          {/* Reference lines at averages */}
-                          <ReferenceLine x={avgQty} stroke="var(--text-muted)" strokeDasharray="4 4" strokeOpacity={0.5} />
+                          {/* Reference lines : seuil de popularité & marge moyenne */}
+                          <ReferenceLine x={popularityThreshold} stroke="var(--text-muted)" strokeDasharray="4 4" strokeOpacity={0.5} />
                           <ReferenceLine y={avgMarge} stroke="var(--text-muted)" strokeDasharray="4 4" strokeOpacity={0.5} />
                           <Scatter
-                            data={scatterData.filter(d =>
-                              (filterQuadrant === 'all' || d.quadrant === filterQuadrant) &&
-                              (!filterCategory || d.category === filterCategory) &&
-                              (!search || d.name.toLowerCase().includes(search.toLowerCase()))
-                            )}
+                            data={scatterData}
                             onClick={(d: any) => setSelectedItem(d)}
                             style={{ cursor: 'pointer' }}
                           >
-                            {scatterData
-                              .filter(d =>
-                                (filterQuadrant === 'all' || d.quadrant === filterQuadrant) &&
-                                (!filterCategory || d.category === filterCategory) &&
-                                (!search || d.name.toLowerCase().includes(search.toLowerCase()))
-                              )
-                              .map((entry, index) => (
-                                <Cell
-                                  key={`cell-${index}`}
-                                  fill={QUADRANT_CONFIG[entry.quadrant].color}
-                                  fillOpacity={0.8}
-                                  stroke={QUADRANT_CONFIG[entry.quadrant].borderColor}
-                                  strokeWidth={2}
-                                />
-                              ))}
+                            {scatterData.map((entry, index) => (
+                              <Cell
+                                key={`cell-${index}`}
+                                fill={QUADRANT_CONFIG[entry.quadrant].color}
+                                fillOpacity={0.8}
+                                stroke={QUADRANT_CONFIG[entry.quadrant].borderColor}
+                                strokeWidth={2}
+                              />
+                            ))}
                           </Scatter>
                         </ScatterChart>
                       </ResponsiveContainer>
+                      </div>
                     </div>
                   </div>
                 )}
