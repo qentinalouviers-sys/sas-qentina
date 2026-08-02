@@ -6,7 +6,7 @@ import {
   LayoutDashboard, FileText, ChefHat, Package, ShoppingCart,
   Settings, LogOut, X, Landmark, Flame, Star, TrendingUp,
   Utensils, ShoppingBasket, MoreHorizontal, Percent,
-  ChevronDown, ChevronUp, ScanLine, Coins, Calculator
+  ChevronDown, ChevronUp, ScanLine, Coins, Calculator, Car
 } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
 import { useRouter } from 'next/navigation';
@@ -27,6 +27,7 @@ const secondaryNav = [
   { href: '/tva',               label: 'TVA',                icon: Percent },
   { href: '/factures',          label: 'Factures',           icon: FileText },
   { href: '/cca',               label: 'Comptes Associés',   icon: Coins },
+  { href: '/trajets',           label: 'Frais kilométriques', icon: Car },
   { href: '/stock',             label: 'Stock',              icon: Package },
   { href: '/liste-courses',     label: 'Courses',            icon: ShoppingBasket },
   { href: '/fiches-techniques', label: 'Fiches techniques',  icon: ChefHat },
@@ -76,6 +77,7 @@ const navCategories = [
       { href: '/factures', label: 'Factures',      icon: FileText },
       { href: '/banque',   label: 'Banque',        icon: Landmark },
       { href: '/cca',      label: 'Comptes Associés', icon: Coins },
+      { href: '/trajets',  label: 'Frais kilométriques', icon: Car },
       { href: '/tva',      label: 'TVA',           icon: Percent },
     ]
   },
@@ -100,6 +102,7 @@ const financeCategory = [
       { href: '/factures', label: 'Factures',           icon: FileText },
       { href: '/banque',   label: 'Banque',             icon: Landmark },
       { href: '/cca',      label: 'Comptes Associés',   icon: Coins },
+      { href: '/trajets',  label: 'Frais kilométriques', icon: Car },
       { href: '/tva',      label: 'TVA',                icon: Percent },
     ]
   },

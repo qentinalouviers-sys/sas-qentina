@@ -20,6 +20,7 @@ const COMPTABLE_PATHS = [
   '/banque',
   '/cca',
   '/pnl',
+  '/trajets',
   '/api/invoices',
   '/api/scanner',
   '/api/bank',

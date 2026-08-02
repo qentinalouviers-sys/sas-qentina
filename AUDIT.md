@@ -182,6 +182,57 @@ révéler la moindre valeur secrète.
 { "config": { "ok": true, "app_url": "https://…", "missing_required": [], "missing_optional": [] } }
 ```
 
+## 6 ter. Frais kilométriques (nouveau module)
+
+Page **Frais kilométriques** (`/trajets`) : calcule ce que la société te doit pour l'usage de ton
+véhicule personnel lors des courses, et produit une note de frais imprimable.
+
+**Détection automatique.** Le bouton « Détecter » parcourt tes factures de l'année et crée un
+aller-retour par déplacement :
+
+| Fournisseur sur la facture | Trajet généré |
+|---|---|
+| Metro (ou « Métro ») | Louviers ↔ Sotteville-lès-Rouen |
+| Mozzalat (ou « Eurocibus », ancienne raison sociale) | Louviers ↔ Évreux |
+
+Règle appliquée : **un trajet par jour et par fournisseur**. Deux factures Metro le même jour ne
+comptent donc qu'un seul aller-retour. Un index unique en base garantit qu'une relance de la
+détection ne crée jamais de doublon.
+
+**Deux pièges de calcul évités.** Le barème kilométrique est progressif *par tranche annuelle* : le
+taux dépend du total de kilomètres de l'année, pas de chaque trajet isolément — ajouter un trajet
+peut donc changer le taux de tous les autres. Le calcul porte toujours sur le cumul annuel. Par
+ailleurs, la ventilation par ligne utilise la méthode du plus fort reste, pour que la somme des
+lignes égale le total **au centime près** (un arrondi ligne par ligne dérivait de 7 centimes sur
+104 trajets).
+
+**Impression.** Le bouton « Imprimer » ouvre la boîte d'impression du navigateur ; « Enregistrer au
+format PDF » produit un vrai fichier PDF. Aucune bibliothèque supplémentaire n'a été ajoutée : le
+document est mis en page en CSS (`@media print`), avec en-tête, détail des déplacements, barème
+appliqué et emplacements de signature. Les en-têtes de tableau se répètent sur chaque page.
+
+**Tout est paramétrable** (bouton « Réglages » de la page) : distances, péages, puissance fiscale,
+motorisation, termes reconnus par fournisseur, et les taux du barème — ce dernier étant révisé
+chaque année par l'administration, le figer dans le code aurait créé un piège de maintenance.
+
+**Lien avec les Comptes Courants d'Associés.** Tant que le virement n'est pas fait, la société doit
+cet argent à l'associé : un bandeau affiche le montant dû et le bouton « Porter au compte courant »
+crée le mouvement correspondant (apport, sous-type « frais perso »). Le calcul se fait en
+**différentiel** — total dû moins déjà porté — ce qui gère proprement le cas où l'on enregistre en
+plusieurs fois : franchir 5 000 km en cours d'année recalcule le taux de tous les trajets, et l'écart
+est rattrapé au prochain enregistrement au lieu d'être perdu. Le jour où le virement est effectué, il
+se saisit comme un remboursement depuis la page Comptes Associés, comme n'importe quel autre
+mouvement.
+
+⚠️ **Deux points à valider une fois :**
+- Les **distances sont pré-remplies avec des estimations** (56 km et 60 km aller-retour). Vérifie-les
+  sur un calculateur d'itinéraire avec tes adresses exactes : en cas de contrôle, la distance doit
+  être justifiable.
+- Ton **Citroën Jumper est peut-être immatriculé « CTTE »** (camionnette) et non « VP ». Le barème
+  kilométrique vise les voitures particulières ; pour un utilitaire, ton comptable préférera
+  peut-être les frais réels. À trancher avec lui — l'outil fonctionne dans les deux cas, seul le
+  mode de déduction change.
+
 ## 7. ⚠️ ACTION REQUISE DE TA PART
 
 1. **Exécute `db/migration_consolidee.sql`** dans Supabase → SQL Editor (une seule fois).
