@@ -28,8 +28,15 @@ CREATE TABLE IF NOT EXISTS mileage_trips (
 ALTER TABLE mileage_trips ADD COLUMN IF NOT EXISTS cca_movement_id uuid
   REFERENCES mouvements_cca(id) ON DELETE SET NULL;
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_mileage_trips_dedupe
-  ON mileage_trips(dedupe_key) WHERE dedupe_key IS NOT NULL;
+-- L'index anti-doublon doit être SIMPLE, surtout pas partiel.
+-- La détection insère avec « ON CONFLICT (dedupe_key) DO NOTHING », et
+-- PostgreSQL ne sait pas rattacher cette clause à un index partiel : il répond
+-- « there is no unique or exclusion constraint matching the ON CONFLICT
+-- specification » et la détection échoue en entier.
+-- Un index simple convient : les NULL étant distincts entre eux par défaut,
+-- les saisies manuelles (dedupe_key à NULL) ne se gênent pas.
+DROP INDEX IF EXISTS idx_mileage_trips_dedupe;
+CREATE UNIQUE INDEX idx_mileage_trips_dedupe ON mileage_trips(dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_mileage_trips_date ON mileage_trips(date);
 CREATE INDEX IF NOT EXISTS idx_mileage_trips_driver ON mileage_trips(driver);
 CREATE INDEX IF NOT EXISTS idx_mileage_trips_cca ON mileage_trips(cca_movement_id);
@@ -44,8 +51,12 @@ SELECT
   'mileage_trips (table)' AS objet,
   EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'mileage_trips') AS ok
 UNION ALL
-SELECT 'index anti-doublon',
-  EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_mileage_trips_dedupe')
+-- indpred IS NULL vérifie que l'index n'est PAS partiel : c'est la condition
+-- pour que la détection automatique fonctionne.
+SELECT 'index anti-doublon (non partiel)',
+  EXISTS (SELECT 1 FROM pg_index i
+          JOIN pg_class c ON c.oid = i.indexrelid
+          WHERE c.relname = 'idx_mileage_trips_dedupe' AND i.indpred IS NULL)
 UNION ALL
 SELECT 'lien compte courant associé',
   EXISTS (SELECT 1 FROM information_schema.columns

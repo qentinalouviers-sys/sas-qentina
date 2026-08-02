@@ -268,6 +268,24 @@ retenue : aucun montant n'est à recalculer.
 4. Redéploie, puis ouvre `/api/scanner/health` (connecté) : le bloc `config` doit afficher
    `"ok": true`.
 
+### Un piège PostgreSQL rencontré une fois, à connaître
+
+La détection automatique des trajets échouait alors que la base répondait normalement. La cause :
+`ON CONFLICT (colonne)` ne sait **pas** se rattacher à un index **partiel** ni à un index
+**d'expression**. PostgreSQL répond alors `there is no unique or exclusion constraint matching the
+ON CONFLICT specification`, et l'insertion entière est rejetée.
+
+L'index anti-doublon des trajets était partiel (`WHERE dedupe_key IS NOT NULL`) : il est désormais
+simple. Ça ne change rien à la protection recherchée, les NULL étant distincts entre eux par défaut
+en PostgreSQL — les saisies manuelles peuvent donc rester nombreuses.
+
+**Le même piège existe sur `idx_bank_transactions_unique`**, qui est un index d'expression
+(`lower(trim(regexp_replace(description…)))`) visé par un `ON CONFLICT (date, description, amount)`.
+L'import bancaire **fonctionne quand même** : la route `api/bank/extract` a un repli qui insère
+ligne à ligne et laisse l'index rejeter les doublons. Ce n'est donc pas une panne, mais l'import
+passe systématiquement par le chemin lent (un aller-retour par ligne au lieu d'un seul). À reprendre
+quand l'occasion se présentera.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 - **Réconcilier le CA du Dashboard (TTC) et du P&L (HT)** : les deux pages affichent un « CA »
