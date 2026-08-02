@@ -6,6 +6,7 @@ import {
   saveInvoice,
   updateIngredientPrices,
   autoReconcileBankTx,
+  linkBankTransaction,
   uploadInvoiceFile,
 } from '@/lib/invoices';
 
@@ -19,7 +20,9 @@ export async function POST(request: NextRequest) {
   if (auth.error) return auth.error;
 
   try {
-    const { pdfBase64, fileBase64, mimeType, filename } = await request.json();
+    // bank_tx_id (optionnel) : transaction bancaire précise à rapprocher.
+    // Si absent, on cherche automatiquement une transaction au même montant.
+    const { pdfBase64, fileBase64, mimeType, filename, bank_tx_id } = await request.json();
     const activeBase64 = fileBase64 || pdfBase64;
     if (!activeBase64) {
       return NextResponse.json({ error: 'Fichier requis (PDF ou image)' }, { status: 400 });
@@ -64,8 +67,15 @@ export async function POST(request: NextRequest) {
       await updateIngredientPrices(supabase, extracted.lignes);
     }
 
-    // 6. Rapprochement bancaire automatique
-    const reconciledTxId = await autoReconcileBankTx(supabase, saved.id, extracted);
+    // 6. Rapprochement bancaire : transaction désignée par l'appelant,
+    //    sinon recherche automatique par montant/date
+    let reconciledTxId: string | null = null;
+    if (bank_tx_id) {
+      await linkBankTransaction(supabase, bank_tx_id, saved.id, extracted.compte_comptable);
+      reconciledTxId = bank_tx_id;
+    } else {
+      reconciledTxId = await autoReconcileBankTx(supabase, saved.id, extracted);
+    }
 
     return NextResponse.json({
       success: true,
