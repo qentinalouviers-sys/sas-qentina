@@ -44,6 +44,22 @@ npm run dev
 2. Projet existant : exécuter **une fois** `db/migration_consolidee.sql` (idempotent,
    ré-exécutable sans risque). Elle crée toutes les colonnes/tables que le code attend.
 3. Créer le bucket Storage **`invoice-files`** (public) pour les fichiers de factures.
+4. Module frais kilométriques : exécuter `db/migration_trajets.sql`.
+
+## Déploiement
+
+Le projet est hébergé sur **Vercel** (`qentina-saas.vercel.app`), branché sur ce dépôt GitHub :
+**tout merge sur `main` déclenche un déploiement en production**, et chaque pull request obtient
+son propre déploiement de prévisualisation.
+
+Cette liaison se règle dans *Vercel → Settings → Git → Connected Git Repository*. Si elle est
+absente, Vercel ne publie que ce qu'on lui envoie manuellement en ligne de commande (`vercel`), et
+les merges sur GitHub restent invisibles en ligne — le symptôme est un `404` sur une page pourtant
+présente dans le dépôt. C'est arrivé une fois ; le réflexe est de vérifier cet écran avant de
+chercher le problème dans le code.
+
+Les variables d'environnement vivent dans *Settings → Environments* et sont indépendantes de la
+liaison Git : les reconnecter ne les efface pas.
 
 ## Architecture
 
