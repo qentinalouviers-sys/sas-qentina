@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { createServiceRoleClient } from '@/lib/supabase/server';
+import { requireUser } from '@/lib/supabase/api-auth';
 import { createClaudeMessage } from '@/lib/anthropic';
+import { extractJson } from '@/lib/ai/json';
 
 const SYSTEM_PROMPT = `Tu es un assistant d'analyse bancaire pour un restaurant.
 Analyse ce PDF de relevé de compte et extrait chaque ligne de transaction de manière très structurée.
@@ -80,75 +82,25 @@ function deriveStatus(t: { amount: number; category: string }): string {
 
 // ─── JSON Repair ────────────────────────────────────────────────────────────
 
-function cleanAndRepairJSON(jsonText: string): any {
-  let cleaned = jsonText.trim();
-
-  // Extract JSON block if surrounded by markdown code blocks or text
-  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-  if (jsonMatch) {
-    cleaned = jsonMatch[0];
-  }
-
-  // Pre-process description strings to replace unescaped internal double quotes
-  cleaned = cleaned.replace(/"description":\s*"([\s\S]*?)"\s*(?=,\s*"(?:amount|category|date)"|\s*\})/g, (match, desc) => {
-    const escapedDesc = desc.replace(/(?<!\\)"/g, "'");
-    return `"description": "${escapedDesc}"`;
-  });
-
-  // Try parsing directly
-  try {
-    return JSON.parse(cleaned);
-  } catch (initialError) {
-    console.warn('Direct JSON parsing failed, attempting cleanups...', initialError);
-  }
-
-  // Clean trailing commas in objects and arrays
-  cleaned = cleaned.replace(/,\s*([\]}])/g, '$1');
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    console.warn('Parsing failed after removing trailing commas. Attempting truncation repair...');
-  }
-
-  // Handle truncation: find the last completed transaction object in the array
-  let openBraces = 0;
-  let openBrackets = 0;
-  let inString = false;
-  let escape = false;
-  let lastValidCharIndex = -1;
-
-  for (let i = 0; i < cleaned.length; i++) {
-    const char = cleaned[i];
-    if (escape) { escape = false; continue; }
-    if (char === '\\') { escape = true; continue; }
-    if (char === '"') { inString = !inString; continue; }
-    if (!inString) {
-      if (char === '{') openBraces++;
-      else if (char === '}') {
-        openBraces--;
-        if (openBraces === 1 && openBrackets === 1) lastValidCharIndex = i;
-      } else if (char === '[') openBrackets++;
-      else if (char === ']') openBrackets--;
-    }
-  }
-
-  if (lastValidCharIndex !== -1) {
-    try {
-      const repaired = cleaned.substring(0, lastValidCharIndex + 1) + '\n  ]\n}';
-      console.log('Successfully repaired truncated JSON.');
-      return JSON.parse(repaired);
-    } catch (repairError) {
-      console.error('Failed to parse repaired JSON:', repairError);
-    }
-  }
-
-  throw new Error('Unable to parse or repair JSON.');
+/**
+ * Pré-traitement spécifique aux relevés bancaires : les libellés contiennent
+ * parfois des guillemets non échappés qui cassent le JSON. On les remplace
+ * avant de passer au parseur robuste partagé (extractJson).
+ */
+function parseBankJson(jsonText: string): any {
+  const cleaned = jsonText.replace(
+    /"description":\s*"([\s\S]*?)"\s*(?=,\s*"(?:amount|category|date)"|\s*\})/g,
+    (_match, desc) => `"description": "${desc.replace(/(?<!\\)"/g, "'")}"`
+  );
+  return extractJson(cleaned);
 }
 
 // ─── Route Handler ──────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   try {
     const { pdfBase64, csvText } = await request.json();
     if (!pdfBase64 && !csvText) {
@@ -195,11 +147,11 @@ export async function POST(request: NextRequest) {
 
     let extracted;
     try {
-      extracted = cleanAndRepairJSON(textContent.text);
-    } catch (parseError) {
+      extracted = parseBankJson(textContent.text);
+    } catch {
       console.error('Failed to parse Claude JSON response. Raw text:', textContent.text);
       return NextResponse.json(
-        { error: 'JSON non parsable après tentative de réparation', raw: textContent.text },
+        { error: 'JSON non parsable après tentative de réparation' },
         { status: 500 }
       );
     }

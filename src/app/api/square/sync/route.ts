@@ -1,27 +1,20 @@
 import { NextResponse } from 'next/server';
 import { createServiceRoleClient } from '@/lib/supabase/server';
+import { requireUser } from '@/lib/supabase/api-auth';
+import { squareFetch, toOrderRow, toItemRows } from '@/lib/square';
 
-const SQUARE_BASE = 'https://connect.squareup.com/v2';
-
-async function squareFetch(path: string, options: RequestInit = {}) {
-  const res = await fetch(`${SQUARE_BASE}${path}`, {
-    ...options,
-    headers: {
-      'Authorization': `Bearer ${process.env.SQUARE_ACCESS_TOKEN}`,
-      'Content-Type': 'application/json',
-      'Square-Version': '2024-12-18',
-      ...options.headers,
-    },
-  });
-  return res.json();
-}
-
+/**
+ * Synchronisation manuelle Square — importe les commandes COMPLETED
+ * des 365 derniers jours (par lots de 500, curseur de pagination).
+ */
 export async function POST() {
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   try {
     const supabase = createServiceRoleClient();
     const locationId = process.env.SQUARE_LOCATION_ID;
 
-    // Sync orders — last 365 days (1 an)
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - 365);
 
@@ -30,23 +23,20 @@ export async function POST() {
     let cursor: string | undefined = undefined;
 
     do {
-      const ordersBody: any = {
+      const ordersBody: Record<string, unknown> = {
         location_ids: [locationId],
         limit: 500,
         query: {
           filter: {
             date_time_filter: {
-              created_at: { start_at: startDate.toISOString() }
+              created_at: { start_at: startDate.toISOString() },
             },
-            state_filter: { states: ['COMPLETED'] }
+            state_filter: { states: ['COMPLETED'] },
           },
-          sort: { sort_field: 'CREATED_AT', sort_order: 'DESC' }
-        }
+          sort: { sort_field: 'CREATED_AT', sort_order: 'DESC' },
+        },
       };
-
-      if (cursor) {
-        ordersBody.cursor = cursor;
-      }
+      if (cursor) ordersBody.cursor = cursor;
 
       const ordersRes = await squareFetch('/orders/search', {
         method: 'POST',
@@ -58,94 +48,46 @@ export async function POST() {
         return NextResponse.json({ error: 'Square API Error', details: ordersRes.errors }, { status: 400 });
       }
 
-      if (ordersRes.orders && ordersRes.orders.length > 0) {
-        // 1. Prepare orders for batch upsert
-        const ordersToUpsert = ordersRes.orders.map((order: any) => {
-          const totalMoney = (order.total_money?.amount || 0) / 100;
-          const netAmount = (order.net_amounts?.total_money?.amount || 0) / 100;
-          const discountAmount = (order.total_discount_money?.amount || 0) / 100;
-          const serviceDate = order.created_at?.substring(0, 10);
-          return {
-            square_order_id: order.id,
-            total_money: totalMoney,
-            net_amount: netAmount,
-            discount_amount: discountAmount,
-            service: serviceDate,
-            created_at: order.created_at,
-            raw_data: order,
-          };
-        });
-
-        // 2. Batch upsert orders and select back the generated IDs
+      const orders: any[] = ordersRes.orders || [];
+      if (orders.length > 0) {
+        // 1. Upsert des commandes en lot, on récupère les UUID générés
         const { data: upsertedOrders, error: upsertError } = await supabase
           .from('square_orders')
-          .upsert(ordersToUpsert, { onConflict: 'square_order_id' })
+          .upsert(orders.map(toOrderRow), { onConflict: 'square_order_id' })
           .select('id, square_order_id');
 
-        if (upsertError) {
-          console.error('Upsert orders error:', upsertError);
-          throw upsertError;
-        }
+        if (upsertError) throw upsertError;
 
-        // Map square_order_id to database order UUID
-        const orderIdMap = new Map<string, string>();
-        if (upsertedOrders) {
-          upsertedOrders.forEach((o: any) => {
-            orderIdMap.set(o.square_order_id, o.id);
-          });
-        }
+        const orderIdMap = new Map<string, string>(
+          (upsertedOrders || []).map((o: { square_order_id: string; id: string }) => [o.square_order_id, o.id])
+        );
 
-        const itemsToInsert: any[] = [];
-        const orderIdsToClear: string[] = [];
-
-        for (const order of ordersRes.orders) {
+        // 2. Reconstruire les articles de ces commandes
+        const itemsToInsert = orders.flatMap(order => {
           const dbOrderId = orderIdMap.get(order.id);
-          if (dbOrderId) {
-            orderIdsToClear.push(dbOrderId);
-            if (order.line_items) {
-              order.line_items.forEach((item: any) => {
-                itemsToInsert.push({
-                  order_id: dbOrderId,
-                  name: item.name || 'Article',
-                  quantity: parseInt(item.quantity || '1'),
-                  base_price: (item.base_price_money?.amount || 0) / 100,
-                  total_price: (item.total_money?.amount || 0) / 100,
-                  category_name: item.category_name || null,
-                });
-              });
-            }
-          }
-        }
+          return dbOrderId ? toItemRows(order, dbOrderId) : [];
+        });
+        const orderIdsToClear = [...orderIdMap.values()];
 
-        // 3. Delete existing items for all these orders in one query
         if (orderIdsToClear.length > 0) {
           const { error: deleteError } = await supabase
             .from('square_items')
             .delete()
             .in('order_id', orderIdsToClear);
-
-          if (deleteError) {
-            console.error('Delete items error:', deleteError);
-            throw deleteError;
-          }
+          if (deleteError) throw deleteError;
         }
 
-        // 4. Batch insert all new items
         if (itemsToInsert.length > 0) {
           const { error: insertError } = await supabase
             .from('square_items')
             .insert(itemsToInsert);
-
-          if (insertError) {
-            console.error('Insert items error:', insertError);
-            throw insertError;
-          }
+          if (insertError) throw insertError;
           syncedItems += itemsToInsert.length;
         }
 
-        syncedOrders += ordersToUpsert.length;
+        syncedOrders += orders.length;
       }
-      
+
       cursor = ordersRes.cursor;
     } while (cursor);
 

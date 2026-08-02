@@ -1,7 +1,11 @@
 import { NextResponse } from 'next/server';
 import { getValidGoogleAccessToken } from '@/lib/google';
+import { requireUser } from '@/lib/supabase/api-auth';
 
 export async function POST(request: Request) {
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   try {
     const { reviewName, replyText } = await request.json();
     if (!reviewName || !replyText) return NextResponse.json({ error: 'Missing parameters' }, { status: 400 });

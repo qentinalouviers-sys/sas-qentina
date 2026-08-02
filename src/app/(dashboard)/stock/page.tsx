@@ -1,8 +1,9 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, downloadCSV } from '@/lib/utils';
+import { UNITS, convertQuantity } from '@/lib/recipes';
 import {
   Package, Search, Save, Download, CheckCircle2, Clock,
   AlertTriangle, X, RefreshCw, Layers, Zap, Flame, Edit2, Check
@@ -58,6 +59,57 @@ function getRayon(name: string): string {
   return 'autre';
 }
 
+// Seuil unique d'alerte d'écart (KPI + couleurs racontent la même histoire)
+const ECART_ALERT = 2;
+
+// ─── Local UI components ─────────────────────────────────────────────────────
+
+function SuccessBanner({ text, onClose }: { text: string; onClose: () => void }) {
+  return (
+    <div style={{ background: 'var(--green-light)', border: '1px solid var(--green)', borderRadius: 12, padding: '14px 18px', marginBottom: 24, display: 'flex', gap: 10, alignItems: 'center' }}>
+      <Check size={18} style={{ color: 'var(--green)' }} />
+      <span style={{ fontWeight: 600, color: 'var(--green)' }}>{text}</span>
+      <button style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }} onClick={onClose}><X size={16} /></button>
+    </div>
+  );
+}
+
+function RayonPill({ label, emoji, count, active, color, activeBg, completed, onClick }: {
+  label: string;
+  emoji?: string;
+  count: number | string;
+  active: boolean;
+  color: string;
+  activeBg?: string;
+  completed?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        padding: '8px 16px',
+        borderRadius: 99,
+        border: active ? `2px solid ${color}` : completed ? '2px solid var(--green)' : '2px solid var(--border)',
+        background: active ? (activeBg || `${color}18`) : completed ? 'var(--green-light)' : 'white',
+        color: active ? color : completed ? 'var(--green)' : 'var(--text-secondary)',
+        fontWeight: 600, fontSize: 13, cursor: 'pointer',
+        transition: 'all 0.2s',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {emoji ? `${emoji} ${label}` : label}
+      <span style={{
+        background: active ? color : completed ? 'var(--green)' : 'var(--border)',
+        color: (active || completed) ? 'white' : 'var(--text-muted)',
+        borderRadius: 99, fontSize: 11, fontWeight: 700,
+        padding: '1px 7px', minWidth: 20, textAlign: 'center',
+      }}>{count}</span>
+    </button>
+  );
+}
+
 // ─── Main Component ──────────────────────────────────────────────────────────
 
 export default function StockPage() {
@@ -88,7 +140,6 @@ export default function StockPage() {
   const [fixPrice, setFixPrice] = useState('');
   const [fixSaving, setFixSaving] = useState(false);
 
-  const searchRef = useRef<HTMLInputElement>(null);
   const supabase = createClient();
 
   // ─── Load Data ──────────────────────────────────────────────────────────────
@@ -96,44 +147,59 @@ export default function StockPage() {
   const loadData = useCallback(async () => {
     setLoading(true);
 
-    const { data: ingredients } = await supabase.from('ingredients').select('*').order('name');
+    const [
+      { data: ingredients },
+      { data: invoiceLines },
+      { data: recipeIngredients },
+      { data: squareItems },
+      { data: inventoryCounts },
+    ] = await Promise.all([
+      supabase.from('ingredients').select('*').order('name'),
+      supabase.from('invoice_lines').select('designation, quantity, unit').eq('category', 'alimentaire'),
+      supabase.from('recipe_ingredients').select('ingredient_id, quantity, unit, recipe:recipes(id, name)'),
+      supabase.from('square_items').select('name, quantity'),
+      supabase.from('inventory_counts').select('ingredient_id, quantity, unit_price').order('counted_at', { ascending: false }),
+    ]);
     if (!ingredients) { setLoading(false); return; }
 
-    const { data: invoiceLines } = await supabase
-      .from('invoice_lines').select('designation, quantity').eq('category', 'alimentaire');
-
-    const { data: recipeIngredients } = await supabase
-      .from('recipe_ingredients').select('ingredient_id, quantity, recipe:recipes(id, name)');
-
-    const { data: squareItems } = await supabase.from('square_items').select('name, quantity');
+    // Map id → ingredient (pour connaître l'unité cible lors des conversions)
+    const ingredientById = new Map<string, Ingredient>();
+    ingredients.forEach((ing: any) => ingredientById.set(ing.id, ing));
 
     // Sales map
     const recipeSold: Record<string, number> = {};
     squareItems?.forEach((si: any) => {
-      if (si.name) recipeSold[si.name.toLowerCase()] = (recipeSold[si.name.toLowerCase()] || 0) + (si.quantity || 0);
+      if (si.name) {
+        const key = si.name.trim().toLowerCase();
+        recipeSold[key] = (recipeSold[key] || 0) + (si.quantity || 0);
+      }
     });
 
-    // Theoretical consumption
+    // Theoretical consumption — chaque quantité de recette est convertie
+    // de l'unité de la ligne de recette vers l'unité de l'ingrédient
     const consoMap: Record<string, number> = {};
     (recipeIngredients as any[] || []).forEach((ri: any) => {
       if (!ri.recipe) return;
-      const sold = recipeSold[ri.recipe.name.toLowerCase()] || 0;
-      consoMap[ri.ingredient_id] = (consoMap[ri.ingredient_id] || 0) + (ri.quantity || 0) * sold;
+      const ing = ingredientById.get(ri.ingredient_id);
+      if (!ing) return;
+      const sold = recipeSold[ri.recipe.name.trim().toLowerCase()] || 0;
+      const qtyInIngredientUnit = convertQuantity(ri.quantity || 0, ri.unit || '', ing.unit || '');
+      consoMap[ri.ingredient_id] = (consoMap[ri.ingredient_id] || 0) + qtyInIngredientUnit * sold;
     });
 
-    // Purchases
+    // Purchases — quantités des factures converties vers l'unité de l'ingrédient
     const achatsMap: Record<string, number> = {};
     ingredients.forEach((ing: any) => {
       const matched = invoiceLines?.filter((l: any) =>
         l.designation?.toLowerCase().includes(ing.name.toLowerCase())
       ) || [];
-      achatsMap[ing.id] = matched.reduce((s: number, l: any) => s + (l.quantity || 0), 0);
+      achatsMap[ing.id] = matched.reduce(
+        (s: number, l: any) => s + convertQuantity(l.quantity || 0, l.unit || '', ing.unit || ''),
+        0
+      );
     });
 
     // Latest inventory
-    const { data: inventoryCounts } = await supabase
-      .from('inventory_counts').select('ingredient_id, quantity, unit_price')
-      .order('counted_at', { ascending: false });
 
     const latestInventory: Record<string, { quantity: number; unit_price: number }> = {};
     (inventoryCounts as any[] || []).forEach((ic: any) => {
@@ -163,13 +229,16 @@ export default function StockPage() {
   const handleSaveInventory = async () => {
     setSaving(true);
     const entries = Object.entries(inventoryInputs).filter(([, v]) => v !== '' && !isNaN(parseFloat(v)));
-    for (const [ingredientId, value] of entries) {
+    const rows = entries.map(([ingredientId, value]) => {
       const ing = stockData.find(s => s.ingredient.id === ingredientId);
-      await supabase.from('inventory_counts').insert({
+      return {
         ingredient_id: ingredientId,
         quantity: parseFloat(value),
         unit_price: ing?.ingredient.last_unit_price || 0,
-      });
+      };
+    });
+    if (rows.length > 0) {
+      await supabase.from('inventory_counts').insert(rows);
     }
     setMode('view');
     setInventoryInputs({});
@@ -194,7 +263,7 @@ export default function StockPage() {
       } else {
         alert('Erreur : ' + (data.error || 'Inconnu'));
       }
-    } catch (e) {
+    } catch {
       alert('Erreur de connexion à l\'API');
     }
     setAuditLoading(false);
@@ -227,7 +296,6 @@ export default function StockPage() {
   };
 
   // ─── Derived data ────────────────────────────────────────────────────────────
-
 
   const totalValo = stockData.reduce((s, r) => s + r.valorisation, 0);
   const countedCount = Object.keys(inventoryInputs).filter(k => inventoryInputs[k] !== '').length;
@@ -352,11 +420,7 @@ export default function StockPage() {
             prix_manquant:   '❓ Prix manquant',
           };
           if (visible.length === 0) return (
-            <div style={{ background: 'var(--green-light)', border: '1px solid var(--green)', borderRadius: 12, padding: '14px 18px', marginBottom: 24, display: 'flex', gap: 10, alignItems: 'center' }}>
-              <Check size={18} style={{ color: 'var(--green)' }} />
-              <span style={{ fontWeight: 600, color: 'var(--green)' }}>Toutes les anomalies ont été traitées ✅</span>
-              <button style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }} onClick={() => setShowAuditPanel(false)}><X size={16} /></button>
-            </div>
+            <SuccessBanner text="Toutes les anomalies ont été traitées ✅" onClose={() => setShowAuditPanel(false)} />
           );
           return (
             <div style={{ marginBottom: 24 }}>
@@ -396,7 +460,7 @@ export default function StockPage() {
                         padding: '14px 18px',
                         borderBottom: idx < visible.length - 1 ? '1px solid var(--border-light)' : 'none',
                         background: idx % 2 === 0 ? 'white' : 'var(--cream-light)',
-                        display: 'flex', alignItems: 'flex-start', gap: 14,
+                        display: 'flex', alignItems: 'flex-start', gap: 14, flexWrap: 'wrap',
                       }}
                     >
                       {/* Severity dot */}
@@ -488,11 +552,7 @@ export default function StockPage() {
 
         {/* ── audit empty result ─────────────────────────────────────────── */}
         {auditDone && anomalies.length === 0 && (
-          <div style={{ background: 'var(--green-light)', border: '1px solid var(--green)', borderRadius: 12, padding: '14px 18px', marginBottom: 24, display: 'flex', gap: 10, alignItems: 'center' }}>
-            <Check size={18} style={{ color: 'var(--green)' }} />
-            <span style={{ fontWeight: 600, color: 'var(--green)' }}>Aucune anomalie détectée — votre référentiel produits est cohérent ✅</span>
-            <button style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }} onClick={() => setAuditDone(false)}><X size={16} /></button>
-          </div>
+          <SuccessBanner text="Aucune anomalie détectée — votre référentiel produits est cohérent ✅" onClose={() => setAuditDone(false)} />
         )}
 
         {/* ── KPI Cards ──────────────────────────────────────────────────── */}
@@ -510,9 +570,9 @@ export default function StockPage() {
               <div className="kpi-label"><CheckCircle2 size={16} /> Comptés</div>
               <div className="kpi-value">{stockData.filter(s => s.stockPhysique !== null).length}</div>
             </div>
-            <div className="kpi-card" style={{ borderLeft: stockData.some(s => s.ecart !== null && Math.abs(s.ecart) > 5) ? '4px solid var(--orange)' : undefined }}>
+            <div className="kpi-card" style={{ borderLeft: stockData.some(s => s.ecart !== null && Math.abs(s.ecart) > ECART_ALERT) ? '4px solid var(--orange)' : undefined }}>
               <div className="kpi-label"><AlertTriangle size={16} /> Écarts détectés</div>
-              <div className="kpi-value">{stockData.filter(s => s.ecart !== null && Math.abs(s.ecart) > 0).length}</div>
+              <div className="kpi-value">{stockData.filter(s => s.ecart !== null && Math.abs(s.ecart) > ECART_ALERT).length}</div>
             </div>
           </div>
         )}
@@ -527,7 +587,7 @@ export default function StockPage() {
             border: '1px solid var(--border)',
             boxShadow: '0 2px 8px rgba(0,0,0,0.05)',
           }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10, flexWrap: 'wrap' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <Zap size={18} style={{ color: 'var(--teal)' }} />
                 <span style={{ fontWeight: 700, fontSize: 15 }}>Inventaire en cours</span>
@@ -566,11 +626,10 @@ export default function StockPage() {
         )}
 
         {/* ── Search + Filter Bar ─────────────────────────────────────────── */}
-        <div style={{ display: 'flex', gap: 12, marginBottom: 16, alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 12, marginBottom: 16, alignItems: 'center', flexWrap: 'wrap' }}>
           <div style={{ position: 'relative', flex: 1 }}>
             <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
             <input
-              ref={searchRef}
               className="form-input"
               style={{ paddingLeft: 38, width: '100%' }}
               placeholder="Rechercher un produit..."
@@ -595,87 +654,48 @@ export default function StockPage() {
         <div style={{ overflowX: 'auto', marginBottom: 20 }}>
           <div style={{ display: 'flex', gap: 8, minWidth: 'max-content', paddingBottom: 4 }}>
             {/* All tab */}
-            <button
+            <RayonPill
+              label="Tous"
+              emoji="🗂️"
+              count={rayonCounts['all'] || 0}
+              active={activeRayon === 'all'}
+              color="var(--teal)"
+              activeBg="var(--teal-bg)"
               onClick={() => setActiveRayon('all')}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 6,
-                padding: '8px 16px',
-                borderRadius: 99,
-                border: activeRayon === 'all' ? '2px solid var(--teal)' : '2px solid var(--border)',
-                background: activeRayon === 'all' ? 'var(--teal-bg)' : 'white',
-                color: activeRayon === 'all' ? 'var(--teal)' : 'var(--text-secondary)',
-                fontWeight: 600, fontSize: 13, cursor: 'pointer',
-                transition: 'all 0.2s',
-                whiteSpace: 'nowrap',
-              }}
-            >
-              🗂️ Tous
-              <span style={{
-                background: activeRayon === 'all' ? 'var(--teal)' : 'var(--border)',
-                color: activeRayon === 'all' ? 'white' : 'var(--text-muted)',
-                borderRadius: 99, fontSize: 11, fontWeight: 700,
-                padding: '1px 7px', minWidth: 20, textAlign: 'center',
-              }}>{rayonCounts['all'] || 0}</span>
-            </button>
+            />
 
             {RAYONS.map(rayon => {
               const count = rayonCounts[rayon.id] || 0;
               if (count === 0) return null;
-              const isActive = activeRayon === rayon.id;
               const countedInRayon = mode === 'inventory'
                 ? (rayonGroups[rayon.id] || []).filter(r => inventoryInputs[r.ingredient.id] !== '' && inventoryInputs[r.ingredient.id] !== undefined).length
                 : 0;
               const allCounted = mode === 'inventory' && countedInRayon === count && count > 0;
               return (
-                <button
+                <RayonPill
                   key={rayon.id}
+                  label={rayon.label}
+                  emoji={allCounted ? '✅' : rayon.emoji}
+                  count={mode === 'inventory' ? `${countedInRayon}/${count}` : count}
+                  active={activeRayon === rayon.id}
+                  color={rayon.color}
+                  completed={allCounted}
                   onClick={() => setActiveRayon(rayon.id)}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 6,
-                    padding: '8px 16px',
-                    borderRadius: 99,
-                    border: isActive ? `2px solid ${rayon.color}` : allCounted ? `2px solid var(--green)` : '2px solid var(--border)',
-                    background: isActive ? `${rayon.color}18` : allCounted ? 'var(--green-light)' : 'white',
-                    color: isActive ? rayon.color : allCounted ? 'var(--green)' : 'var(--text-secondary)',
-                    fontWeight: 600, fontSize: 13, cursor: 'pointer',
-                    transition: 'all 0.2s',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  {allCounted ? '✅' : rayon.emoji} {rayon.label}
-                  <span style={{
-                    background: isActive ? rayon.color : allCounted ? 'var(--green)' : 'var(--border)',
-                    color: (isActive || allCounted) ? 'white' : 'var(--text-muted)',
-                    borderRadius: 99, fontSize: 11, fontWeight: 700,
-                    padding: '1px 7px',
-                  }}>
-                    {mode === 'inventory' ? `${countedInRayon}/${count}` : count}
-                  </span>
-                </button>
+                />
               );
             })}
 
             {/* Autre tab */}
             {(rayonCounts['autre'] || 0) > 0 && (
-              <button
+              <RayonPill
+                label="Autres"
+                emoji="📋"
+                count={rayonCounts['autre']}
+                active={activeRayon === 'autre'}
+                color="#64748b"
+                activeBg="#94a3b820"
                 onClick={() => setActiveRayon('autre')}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 6,
-                  padding: '8px 16px', borderRadius: 99,
-                  border: activeRayon === 'autre' ? '2px solid #94a3b8' : '2px solid var(--border)',
-                  background: activeRayon === 'autre' ? '#94a3b820' : 'white',
-                  color: activeRayon === 'autre' ? '#64748b' : 'var(--text-secondary)',
-                  fontWeight: 600, fontSize: 13, cursor: 'pointer', transition: 'all 0.2s',
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                📋 Autres
-                <span style={{
-                  background: activeRayon === 'autre' ? '#64748b' : 'var(--border)',
-                  color: activeRayon === 'autre' ? 'white' : 'var(--text-muted)',
-                  borderRadius: 99, fontSize: 11, fontWeight: 700, padding: '1px 7px',
-                }}>{rayonCounts['autre']}</span>
-              </button>
+              />
             )}
           </div>
         </div>
@@ -695,7 +715,7 @@ export default function StockPage() {
                   return (
                     <div key={rayonId}>
                       {activeRayon === 'all' && (
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
                           <span style={{ fontSize: 20 }}>{rayon?.emoji || '📋'}</span>
                           <h3 style={{ fontSize: 15, fontWeight: 700, color: rayon?.color || '#64748b' }}>
                             {rayon?.label || 'Autres'}
@@ -744,7 +764,7 @@ export default function StockPage() {
                                 <td style={{ textAlign: 'right' }}>
                                   {row.ecart !== null ? (
                                     <span style={{
-                                      color: Math.abs(row.ecart) > 2 ? 'var(--red)' : 'var(--green)',
+                                      color: Math.abs(row.ecart) > ECART_ALERT ? 'var(--red)' : 'var(--green)',
                                       fontWeight: 700,
                                       fontSize: 13,
                                     }}>
@@ -877,12 +897,12 @@ export default function StockPage() {
                               </div>
 
                               {/* Écart preview */}
-                              {isCounted && row.stockTheorique !== 0 && (
+                              {isCounted && (
                                 <div style={{ marginTop: 6, fontSize: 12 }}>
                                   {(() => {
                                     const ecart = parseFloat(value) - row.stockTheorique;
                                     const sign = ecart >= 0 ? '+' : '';
-                                    const color = Math.abs(ecart) > 2 ? 'var(--red)' : 'var(--green)';
+                                    const color = Math.abs(ecart) > ECART_ALERT ? 'var(--red)' : 'var(--green)';
                                     return (
                                       <span style={{ color, fontWeight: 600 }}>
                                         Écart : {sign}{ecart.toFixed(2)} {row.ingredient.unit || ''}
@@ -956,9 +976,9 @@ export default function StockPage() {
             <div className="grid-2" style={{ gap: 12, marginBottom: 16 }}>
               {[
                 { label: 'Prix unitaire', value: formatCurrency(selectedRow.ingredient.last_unit_price), color: 'var(--teal)' },
-                { label: 'Unité', value: selectedRow.ingredient.unit || '—', color: 'var(--text)' },
-                { label: 'Achats cumulés', value: selectedRow.achats > 0 ? `${selectedRow.achats.toFixed(2)} ${selectedRow.ingredient.unit || ''}` : '—', color: 'var(--text)' },
-                { label: 'Conso. théorique', value: selectedRow.consoTheorique > 0 ? `${selectedRow.consoTheorique.toFixed(2)} ${selectedRow.ingredient.unit || ''}` : '—', color: 'var(--text)' },
+                { label: 'Unité', value: selectedRow.ingredient.unit || '—', color: 'var(--text-primary)' },
+                { label: 'Achats cumulés', value: selectedRow.achats > 0 ? `${selectedRow.achats.toFixed(2)} ${selectedRow.ingredient.unit || ''}` : '—', color: 'var(--text-primary)' },
+                { label: 'Conso. théorique', value: selectedRow.consoTheorique > 0 ? `${selectedRow.consoTheorique.toFixed(2)} ${selectedRow.ingredient.unit || ''}` : '—', color: 'var(--text-primary)' },
                 { label: 'Stock théorique', value: `${selectedRow.stockTheorique.toFixed(2)} ${selectedRow.ingredient.unit || ''}`, color: 'var(--text-secondary)' },
                 { label: 'Stock physique', value: selectedRow.stockPhysique !== null ? `${selectedRow.stockPhysique.toFixed(2)} ${selectedRow.ingredient.unit || ''}` : 'Non compté', color: selectedRow.stockPhysique !== null ? 'var(--teal)' : 'var(--text-muted)' },
               ].map(kpi => (
@@ -978,11 +998,11 @@ export default function StockPage() {
               {selectedRow.ecart !== null && (
                 <div className="card" style={{
                   textAlign: 'center',
-                  background: Math.abs(selectedRow.ecart) > 2 ? 'var(--red-light)' : 'var(--green-light)',
-                  border: `1px solid ${Math.abs(selectedRow.ecart) > 2 ? 'var(--red)' : 'var(--green)'}`,
+                  background: Math.abs(selectedRow.ecart) > ECART_ALERT ? 'var(--red-light)' : 'var(--green-light)',
+                  border: `1px solid ${Math.abs(selectedRow.ecart) > ECART_ALERT ? 'var(--red)' : 'var(--green)'}`,
                 }}>
                   <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, marginBottom: 4 }}>ÉCART</div>
-                  <div style={{ fontWeight: 800, fontSize: 18, color: Math.abs(selectedRow.ecart) > 2 ? 'var(--red)' : 'var(--green)' }}>
+                  <div style={{ fontWeight: 800, fontSize: 18, color: Math.abs(selectedRow.ecart) > ECART_ALERT ? 'var(--red)' : 'var(--green)' }}>
                     {selectedRow.ecart > 0 ? '+' : ''}{selectedRow.ecart.toFixed(2)} {selectedRow.ingredient.unit || ''}
                   </div>
                 </div>
@@ -994,6 +1014,7 @@ export default function StockPage() {
               <button className="btn btn-primary" onClick={() => {
                 setSelectedRow(null);
                 setMode('inventory');
+                setActiveRayon('all');
                 setSearch(selectedRow.ingredient.name);
                 setInventoryInputs({});
               }}>
@@ -1041,17 +1062,7 @@ export default function StockPage() {
                   value={fixUnit}
                   onChange={e => setFixUnit(e.target.value)}
                 >
-                  <option value="kg">kg</option>
-                  <option value="g">g</option>
-                  <option value="L">L</option>
-                  <option value="cL">cL</option>
-                  <option value="mL">mL</option>
-                  <option value="pièce">pièce</option>
-                  <option value="barquette">barquette</option>
-                  <option value="sachet">sachet</option>
-                  <option value="boîte">boîte</option>
-                  <option value="portion">portion</option>
-                  <option value="unité">unité</option>
+                  {UNITS.map(u => <option key={u} value={u}>{u}</option>)}
                 </select>
               </div>
 

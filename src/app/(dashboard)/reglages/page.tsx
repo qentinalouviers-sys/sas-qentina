@@ -3,42 +3,67 @@
 import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { Plus, Trash2, Save, Settings, Flame } from 'lucide-react';
+import { UNITS } from '@/lib/recipes';
 import type { Supplier, Ingredient } from '@/lib/types';
+
+const DEFAULT_OPENING_HOURS: Record<string, { Midi: boolean; Soir: boolean }> = {
+  Lun: { Midi: true, Soir: true }, Mar: { Midi: true, Soir: true },
+  Mer: { Midi: true, Soir: true }, Jeu: { Midi: true, Soir: true },
+  Ven: { Midi: true, Soir: true }, Sam: { Midi: true, Soir: true },
+  Dim: { Midi: true, Soir: true },
+};
 
 export default function ReglagesPage() {
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
+  const [loading, setLoading] = useState(true);
   const [newSupplier, setNewSupplier] = useState('');
   const [newIngredient, setNewIngredient] = useState({ name: '', unit: 'kg', last_unit_price: 0 });
   const [tab, setTab] = useState<'suppliers' | 'ingredients' | 'ia' | 'services'>('ingredients');
   const [fuegoContext, setFuegoContext] = useState('');
   const [savingContext, setSavingContext] = useState(false);
-  const [openingHours, setOpeningHours] = useState<Record<string, { Midi: boolean; Soir: boolean }>>({
-    Lun: { Midi: true, Soir: true }, Mar: { Midi: true, Soir: true },
-    Mer: { Midi: true, Soir: true }, Jeu: { Midi: true, Soir: true },
-    Ven: { Midi: true, Soir: true }, Sam: { Midi: true, Soir: true },
-    Dim: { Midi: true, Soir: true },
-  });
+  const [openingHours, setOpeningHours] = useState<Record<string, { Midi: boolean; Soir: boolean }>>({ ...DEFAULT_OPENING_HOURS });
   const [savingHours, setSavingHours] = useState(false);
 
   const supabase = createClient();
 
-  const loadData = useCallback(async () => {
-    const { data: s } = await supabase.from('suppliers').select('*').order('name');
-    setSuppliers(s || []);
-    const { data: i } = await supabase.from('ingredients').select('*').order('name');
-    setIngredients(i || []);
-    const { data: s_app } = await supabase.from('app_settings').select('value').eq('key', 'fuego_context').single();
-    if (s_app && s_app.value) setFuegoContext(s_app.value);
-    const { data: s_hours } = await supabase.from('app_settings').select('value').eq('key', 'opening_hours').single();
-    if (s_hours && s_hours.value) setOpeningHours(JSON.parse(s_hours.value));
+  const loadSuppliers = useCallback(async () => {
+    const { data } = await supabase.from('suppliers').select('*').order('name');
+    setSuppliers(data || []);
   }, [supabase]);
+
+  const loadIngredients = useCallback(async () => {
+    const { data } = await supabase.from('ingredients').select('*').order('name');
+    setIngredients(data || []);
+  }, [supabase]);
+
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    const [, , { data: settings }] = await Promise.all([
+      loadSuppliers(),
+      loadIngredients(),
+      supabase.from('app_settings').select('key, value').in('key', ['fuego_context', 'opening_hours']),
+    ]);
+    const ctx = settings?.find((s: any) => s.key === 'fuego_context');
+    if (ctx?.value) setFuegoContext(ctx.value);
+    const hours = settings?.find((s: any) => s.key === 'opening_hours');
+    if (hours?.value) {
+      try {
+        const parsed = JSON.parse(hours.value);
+        // Spread des défauts d'abord : évite les objets partiels
+        setOpeningHours({ ...DEFAULT_OPENING_HOURS, ...parsed });
+      } catch {
+        // Valeur corrompue → on conserve les horaires par défaut
+      }
+    }
+    setLoading(false);
+  }, [supabase, loadSuppliers, loadIngredients]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
   const saveOpeningHours = async () => {
     setSavingHours(true);
-    const { error } = await supabase.from('app_settings').upsert({ key: 'opening_hours', value: JSON.stringify(openingHours) });
+    const { error } = await supabase.from('app_settings').upsert({ key: 'opening_hours', value: JSON.stringify(openingHours), updated_at: new Date().toISOString() });
     setSavingHours(false);
     if (!error) alert('Horaires sauvegardés avec succès !');
     else alert('Erreur lors de la sauvegarde.');
@@ -48,13 +73,13 @@ export default function ReglagesPage() {
     if (!newSupplier.trim()) return;
     await supabase.from('suppliers').insert({ name: newSupplier.trim() });
     setNewSupplier('');
-    loadData();
+    loadSuppliers();
   };
 
   const deleteSupplier = async (id: string) => {
     if (!confirm('Supprimer ce fournisseur ?')) return;
     await supabase.from('suppliers').delete().eq('id', id);
-    loadData();
+    loadSuppliers();
   };
 
   const addIngredient = async () => {
@@ -66,26 +91,32 @@ export default function ReglagesPage() {
       last_updated: new Date().toISOString(),
     });
     setNewIngredient({ name: '', unit: 'kg', last_unit_price: 0 });
-    loadData();
+    loadIngredients();
   };
 
   const deleteIngredient = async (id: string) => {
-    if (!confirm('Supprimer cet ingrédient ?')) return;
+    if (!confirm('Supprimer cet ingrédient ? Il sera aussi retiré de toutes les fiches techniques et son historique d\'inventaire sera effacé.')) return;
     await supabase.from('ingredients').delete().eq('id', id);
-    loadData();
+    loadIngredients();
   };
 
   const updateIngredientPrice = async (id: string, price: number) => {
-    await supabase.from('ingredients').update({ last_unit_price: price, last_updated: new Date().toISOString() }).eq('id', id);
-    loadData();
+    const current = ingredients.find(i => i.id === id);
+    if (current && (current.last_unit_price ?? 0) === price) return; // valeur inchangée → pas d'update
+    const { error } = await supabase.from('ingredients').update({ last_unit_price: price, last_updated: new Date().toISOString() }).eq('id', id);
+    if (error) {
+      alert('Erreur lors de la mise à jour du prix.');
+      return;
+    }
+    loadIngredients();
   };
 
   const saveFuegoContext = async () => {
     setSavingContext(true);
-    const { error } = await supabase.from('app_settings').upsert({ key: 'fuego_context', value: fuegoContext });
+    const { error } = await supabase.from('app_settings').upsert({ key: 'fuego_context', value: fuegoContext, updated_at: new Date().toISOString() });
     setSavingContext(false);
     if (!error) alert('Contexte sauvegardé avec succès !');
-    else alert('Erreur. Assurez-vous que la table app_settings existe.');
+    else alert('Erreur lors de la sauvegarde.');
   };
 
   return (
@@ -95,8 +126,12 @@ export default function ReglagesPage() {
         <Settings size={22} style={{ color: 'var(--text-muted)' }} />
       </div>
       <div className="page-body">
+        {loading ? (
+          <div className="loading-page"><div className="spinner" style={{ width: 32, height: 32 }} /></div>
+        ) : (
+        <>
         {/* Tabs */}
-        <div className="period-selector" style={{ marginBottom: 24, flexWrap: 'wrap' }}>
+        <div className="period-selector" style={{ marginBottom: 24 }}>
           <button className={`period-btn ${tab === 'ingredients' ? 'active' : ''}`} onClick={() => setTab('ingredients')}>Ingrédients</button>
           <button className={`period-btn ${tab === 'suppliers' ? 'active' : ''}`} onClick={() => setTab('suppliers')}>Fournisseurs</button>
           <button className={`period-btn ${tab === 'services' ? 'active' : ''}`} onClick={() => setTab('services')}>Horaires & Services</button>
@@ -106,7 +141,7 @@ export default function ReglagesPage() {
         {tab === 'services' && (
           <div className="card">
             <div className="card-header"><div className="card-title">Jours et Services d'Ouverture</div></div>
-            <div style={{ padding: 24, paddingTop: 0 }}>
+            <div style={{ padding: '16px 0 0' }}>
               <p style={{ marginBottom: 16, color: 'var(--text-muted)', fontSize: 14 }}>
                 Configurez les services (Midi / Soir) où votre établissement est ouvert. Ces données seront utilisées pour affiner l'analyse de l'IA et vos statistiques de ventes.
               </p>
@@ -167,10 +202,10 @@ export default function ReglagesPage() {
             <div className="card-header"><div className="card-title">Référentiel ingrédients</div></div>
             <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
               <input className="form-input" style={{ flex: 2, minWidth: 150 }} value={newIngredient.name} onChange={e => setNewIngredient(p => ({ ...p, name: e.target.value }))} placeholder="Nom ingrédient" />
-              <select className="form-select" style={{ width: 100 }} value={newIngredient.unit} onChange={e => setNewIngredient(p => ({ ...p, unit: e.target.value }))}>
-                <option value="kg">kg</option><option value="L">L</option><option value="unité">unité</option><option value="g">g</option><option value="mL">mL</option>
+              <select className="form-select" style={{ minWidth: 90, flex: '0 1 auto' }} value={newIngredient.unit} onChange={e => setNewIngredient(p => ({ ...p, unit: e.target.value }))}>
+                {UNITS.map(u => <option key={u} value={u}>{u}</option>)}
               </select>
-              <input type="number" step="0.01" className="form-input" style={{ width: 120 }} value={newIngredient.last_unit_price} onChange={e => setNewIngredient(p => ({ ...p, last_unit_price: parseFloat(e.target.value) || 0 }))} placeholder="Prix/unité" />
+              <input type="number" step="0.01" className="form-input" style={{ minWidth: 90, flex: '0 1 auto' }} value={newIngredient.last_unit_price} onChange={e => setNewIngredient(p => ({ ...p, last_unit_price: parseFloat(e.target.value) || 0 }))} placeholder="Prix/unité" />
               <button className="btn btn-primary" onClick={addIngredient}><Plus size={18} /></button>
             </div>
             <div className="table-container">
@@ -186,7 +221,7 @@ export default function ReglagesPage() {
                           type="number"
                           step="0.01"
                           className="form-input"
-                          style={{ width: 100, padding: '4px 8px' }}
+                          style={{ width: 90, minHeight: 36, padding: '4px 8px' }}
                           defaultValue={i.last_unit_price ?? 0}
                           onBlur={e => updateIngredientPrice(i.id, parseFloat(e.target.value) || 0)}
                         /> €
@@ -213,7 +248,7 @@ export default function ReglagesPage() {
                 </div>
               </div>
             </div>
-            <div style={{ padding: 24, paddingTop: 0 }}>
+            <div style={{ padding: '16px 0 0' }}>
               <textarea
                 className="form-input"
                 style={{ width: '100%', minHeight: 200, resize: 'vertical', marginBottom: 16 }}
@@ -228,6 +263,8 @@ export default function ReglagesPage() {
               </div>
             </div>
           </div>
+        )}
+        </>
         )}
       </div>
     </>

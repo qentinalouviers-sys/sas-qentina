@@ -1,6 +1,10 @@
 import { NextResponse } from 'next/server';
+import { requireUser } from '@/lib/supabase/api-auth';
 
 export async function GET() {
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   try {
     const apiKey = process.env.GOOGLE_PLACES_API_KEY;
     const placeId = process.env.GOOGLE_PLACE_ID;

@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, getDateRange, toISODate, formatDate, CATEGORY_LABELS } from '@/lib/utils';
+import { getVatRate } from '@/lib/tva';
 import { 
   Percent, 
   TrendingUp, 
@@ -48,25 +49,45 @@ export default function TvaPage() {
     const endStr = toISODate(end);
 
     try {
-      // 0. Fetch masked suppliers from settings
-      const { data: settingsData } = await supabase
-        .from('app_settings')
-        .select('value')
-        .eq('key', 'masked_tva_suppliers');
-      
-      const loadedMaskedSuppliers: string[] = settingsData && settingsData.length > 0 && settingsData[0].value 
-        ? JSON.parse(settingsData[0].value) 
-        : [];
-      
-      setMaskedSuppliers(loadedMaskedSuppliers);
+      // Les 4 requêtes indépendantes sont exécutées en parallèle
+      const [
+        { data: settingsData },
+        { data: orders },
+        { data: invoices },
+        { data: bankTx },
+      ] = await Promise.all([
+        // 0. Fetch masked suppliers from settings
+        supabase
+          .from('app_settings')
+          .select('value')
+          .eq('key', 'masked_tva_suppliers'),
+        // 1. Fetch Square Orders in period to compute collected VAT
+        supabase
+          .from('square_orders')
+          .select('id, net_amount, service, square_order_id, raw_data')
+          .gte('service', startStr)
+          .lte('service', endStr)
+          .order('service', { ascending: false }),
+        // 2. Fetch Invoices in period
+        supabase
+          .from('invoices')
+          .select('id, date, invoice_number, total_ht, total_ttc, tva_recoverable, type_document, company_name_present, supplier:suppliers(name)')
+          .gte('date', startStr)
+          .lte('date', endStr),
+        // 3. Fetch Bank Transactions in period (expenses)
+        supabase
+          .from('bank_transactions')
+          .select('id, date, description, amount, category, invoice_id')
+          .in('category', ['variable_fournisseur', 'fixe_loyer', 'fixe_abonnement', 'fixe_assurance', 'autre'])
+          .gte('date', startStr)
+          .lte('date', endStr),
+      ]);
 
-      // 1. Fetch Square Orders in period to compute collected VAT
-      const { data: orders } = await supabase
-        .from('square_orders')
-        .select('id, net_amount, service, created_at, raw_data')
-        .gte('service', startStr)
-        .lte('service', endStr)
-        .order('service', { ascending: false });
+      const loadedMaskedSuppliers: string[] = settingsData && settingsData.length > 0 && settingsData[0].value
+        ? JSON.parse(settingsData[0].value)
+        : [];
+
+      setMaskedSuppliers(loadedMaskedSuppliers);
 
       const salesList = orders || [];
       
@@ -119,40 +140,29 @@ export default function TvaPage() {
         }
       });
 
-      // 2. Fetch Invoices in period
-      const { data: invoices } = await supabase
-        .from('invoices')
-        .select('id, date, invoice_number, total_ht, total_ttc, tva_recoverable, type_document, company_name_present, supplier:suppliers(name)')
-        .gte('date', startStr)
-        .lte('date', endStr);
-
       const invoicesList = invoices || [];
-
-      // 3. Fetch Bank Transactions in period (expenses)
-      const { data: bankTx } = await supabase
-        .from('bank_transactions')
-        .select('id, date, description, amount, category, invoice_id')
-        .in('category', ['variable_fournisseur', 'fixe_loyer', 'fixe_abonnement', 'fixe_assurance', 'autre'])
-        .gte('date', startStr)
-        .lte('date', endStr);
-
       const bankTxList = bankTx || [];
 
       // Set of linked invoice IDs to prevent duplicate counts
       const linkedInvoiceIds = new Set(bankTxList.map((tx: any) => tx.invoice_id).filter(Boolean));
 
+      // Factures liées à une transaction mais hors période : UNE seule requête
+      // groupée (avant : une requête par transaction — boucle N+1).
+      const invoicesById = new Map<any, any>(invoicesList.map((i: any) => [i.id, i]));
+      const missingInvoiceIds = [...linkedInvoiceIds].filter(id => !invoicesById.has(id));
+      if (missingInvoiceIds.length > 0) {
+        const { data: outerInvoices } = await supabase
+          .from('invoices')
+          .select('id, date, invoice_number, total_ht, total_ttc, tva_recoverable, type_document, company_name_present, supplier:suppliers(name)')
+          .in('id', missingInvoiceIds);
+        (outerInvoices || []).forEach((inv: any) => invoicesById.set(inv.id, inv));
+      }
+
       const consolidatedPurchases: any[] = [];
       let deductibleTva = 0;
       const supplierMap: Record<string, { name: string; ht: number; ttc: number; tva: number; count: number }> = {};
 
-      // Helper to determine VAT rate by category (standard restaurant rates)
-      const getVatRate = (category: string) => {
-        if (category === 'variable_fournisseur') return 0.10; // 10% average for raw ingredients
-        if (category === 'fixe_loyer' || category === 'fixe_abonnement' || category === 'autre') return 0.20; // 20%
-        return 0; // 0% for insurance, taxes, salaries
-      };
-
-      // A. Process paid items from Bank Transactions
+      // A. Process paid items from Bank Transactions (boucle synchrone, aucune requête)
       for (const tx of bankTxList) {
         const amt = Math.abs(tx.amount || 0);
         let tva = 0;
@@ -164,15 +174,7 @@ export default function TvaPage() {
         let isCompanyPresent = null;
 
         if (tx.invoice_id) {
-          let inv = invoicesList.find((i: any) => i.id === tx.invoice_id);
-          if (!inv) {
-            const { data: outerInv } = await supabase
-              .from('invoices')
-              .select('id, date, invoice_number, total_ht, total_ttc, tva_recoverable, type_document, company_name_present, supplier:suppliers(name)')
-              .eq('id', tx.invoice_id)
-              .single();
-            if (outerInv) inv = outerInv;
-          }
+          const inv = invoicesById.get(tx.invoice_id);
 
           if (inv) {
             const ttc = inv.total_ttc || amt;
@@ -332,22 +334,26 @@ export default function TvaPage() {
     setMaskedSuppliers(newMasked);
     setSaveStatus('saving');
 
-    try {
-      // 2. Delete existing row then insert to avoid conflicts
-      await supabase
-        .from('app_settings')
-        .delete()
-        .eq('key', 'masked_tva_suppliers');
+    // Annule la bascule optimiste (forme fonctionnelle : pas d'état périmé)
+    const revertOptimisticUpdate = () => {
+      setMaskedSuppliers(prev =>
+        prev.includes(supplierName)
+          ? prev.filter(name => name !== supplierName)
+          : [...prev, supplierName]
+      );
+    };
 
+    try {
+      // 2. Un seul upsert sur la clé primaire (remplace le delete + insert)
       const { error } = await supabase
         .from('app_settings')
-        .insert({ key: 'masked_tva_suppliers', value: JSON.stringify(newMasked) });
+        .upsert({ key: 'masked_tva_suppliers', value: JSON.stringify(newMasked) }, { onConflict: 'key' });
 
       if (error) {
         console.error('Error saving masked suppliers:', error);
         setSaveStatus('error');
         // Revert optimistic update
-        setMaskedSuppliers(maskedSuppliers);
+        revertOptimisticUpdate();
         return;
       }
 
@@ -359,7 +365,7 @@ export default function TvaPage() {
     } catch (error) {
       console.error('Error saving masked suppliers:', error);
       setSaveStatus('error');
-      setMaskedSuppliers(maskedSuppliers);
+      revertOptimisticUpdate();
       setTimeout(() => setSaveStatus('idle'), 3000);
     }
   };
@@ -440,15 +446,15 @@ export default function TvaPage() {
                 </div>
                 <div className="kpi-value">{formatCurrency(data.collectedTva)}</div>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6, display: 'flex', flexDirection: 'column', gap: 2 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 4 }}>
                     <span>Taux 10% (Restauration) :</span>
                     <strong>{formatCurrency(data.collectedTvaBreakdown['10%'])}</strong>
                   </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 4 }}>
                     <span>Taux 5.5% (Emporté) :</span>
                     <strong>{formatCurrency(data.collectedTvaBreakdown['5.5%'])}</strong>
                   </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 4 }}>
                     <span>Taux 20% (Alcools) :</span>
                     <strong>{formatCurrency(data.collectedTvaBreakdown['20%'])}</strong>
                   </div>
@@ -515,7 +521,7 @@ export default function TvaPage() {
                   <div className="card-title">Balance de TVA</div>
                   <Percent size={18} style={{ color: 'var(--teal)' }} />
                 </div>
-                <div className="chart-container" style={{ height: 260, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <div className="chart-container">
                   <ResponsiveContainer width="100%" height="100%">
                     <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 5 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" />
@@ -540,9 +546,9 @@ export default function TvaPage() {
                       <strong> votre sélection est sauvegardée automatiquement</strong>
                     </div>
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                     {saveStatus === 'saving' && (
-                      <span style={{ fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 5 }}>
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' }}>
                         <div className="spinner" style={{ width: 14, height: 14 }} /> Sauvegarde...
                       </span>
                     )}
@@ -679,7 +685,7 @@ export default function TvaPage() {
                               </td>
                               <td style={{ textAlign: 'center' }}>
                                 {purchase.invoiceId ? (
-                                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+                                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, flexWrap: 'wrap' }}>
                                     {purchase.tva_recoverable ? (
                                       <span className="badge" style={{ padding: '4px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700, background: 'rgba(45,143,94,0.1)', color: 'var(--green)', border: '1px solid rgba(45,143,94,0.2)' }}>
                                         Récupérable

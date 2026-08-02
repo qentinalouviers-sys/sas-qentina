@@ -62,12 +62,19 @@ interface QueueItem {
   // User action state
   actionTaken: boolean;
   selectedBankTxId: string | null;
-  paymentMethod: 'bank' | 'cash' | 'card_perso';
+  /** Renseigné par confirmAction ; jamais lu avant la confirmation. */
+  paymentMethod?: 'bank' | 'cash' | 'card_perso';
   associe?: 'justine' | 'yohan' | null;
   confirmedRef: string | null;
   showCandidates: boolean;
   showManualSelector: boolean;
   files?: File[];
+}
+
+interface MultiPageFile {
+  file: File;
+  /** Object URL créée à l'ajout du fichier, révoquée à la suppression/reset. */
+  previewUrl: string | null;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -86,6 +93,10 @@ const STATUS_LABEL: Record<QueueStatus, string> = {
   duplicate: 'Doublon',
 };
 
+// Étapes de progression affichées en points — libellés partagés via STATUS_LABEL.
+const PROGRESS_STEPS: QueueStatus[] = ['reading', 'uploading', 'analyzing', 'matching'];
+const STEP_ORDER: QueueStatus[] = ['pending', ...PROGRESS_STEPS, 'complete'];
+
 const ACCOUNTING_LABELS: Record<string, string> = {
   '601': '601 — Matières Premières',
   '607': '607 — Marchandises (Boissons)',
@@ -99,8 +110,6 @@ const ACCOUNTING_LABELS: Record<string, string> = {
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 const fmtSize = (b: number) =>
   b < 1024 ? `${b} o`
@@ -168,9 +177,8 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
   };
 
   // Step dots
-  const STEPS: QueueStatus[] = ['reading', 'uploading', 'analyzing', 'matching'];
-  const stepOrder: QueueStatus[] = ['pending', 'reading', 'uploading', 'analyzing', 'matching', 'complete'];
-  const stepIdx = stepOrder.indexOf(item.status);
+  const stepIdx = STEP_ORDER.indexOf(item.status);
+  const currentStep = PROGRESS_STEPS[Math.max(0, stepIdx - 1)];
 
   return (
     <div style={{
@@ -188,6 +196,7 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
 
         {/* Thumbnail / icon */}
         {item.preview ? (
+          // eslint-disable-next-line @next/next/no-img-element -- data URL locale, incompatible next/image
           <img src={item.preview} alt="" style={{
             width: 52, height: 52, borderRadius: 10, objectFit: 'cover',
             border: '1px solid var(--border-light)', flexShrink: 0,
@@ -266,7 +275,7 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
         {/* Step dots (only when not terminal) */}
         {!isTerminal && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 8 }}>
-            {STEPS.map((s, i) => {
+            {PROGRESS_STEPS.map((s, i) => {
               const done   = stepIdx > i + 1;
               const active = stepIdx === i + 1;
               return (
@@ -279,7 +288,7 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
               );
             })}
             <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 4 }}>
-              {['Lecture', 'Envoi', 'Analyse IA', 'Rapprochement'][Math.max(0, stepIdx - 1)] || 'En attente...'}
+              {currentStep ? STATUS_LABEL[currentStep] : 'En attente...'}
             </span>
           </div>
         )}
@@ -422,26 +431,21 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
                   {item.showCandidates && (
                     <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
                       {item.result.bank_candidates.map(c => (
-                        <div key={c.id} style={{
-                          display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
-                          background: 'var(--cream-light)', borderRadius: 10, padding: '10px 12px',
-                          border: '1px solid var(--border-light)',
-                        }}>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: 12, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.description}</div>
-                            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{formatDate(c.date)} · {c.date_diff}j d'écart</div>
-                          </div>
-                          <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--red)' }}>{formatCurrency(c.amount)}</span>
-                          <ScoreBadge score={c.score} />
-                          <button
-                            className="btn btn-secondary btn-sm"
-                            disabled={confirming}
-                            onClick={() => doConfirm(c.id, 'bank')}
-                            style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}
-                          >
-                            <Link2 size={12} /> Lier
-                          </button>
-                        </div>
+                        <CandidateRow
+                          key={c.id}
+                          c={c}
+                          compact
+                          action={
+                            <button
+                              className="btn btn-secondary btn-sm"
+                              disabled={confirming}
+                              onClick={() => doConfirm(c.id, 'bank')}
+                              style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}
+                            >
+                              <Link2 size={12} /> Lier
+                            </button>
+                          }
+                        />
                       ))}
                     </div>
                   )}
@@ -572,7 +576,7 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
                   <div style={{ fontSize: 11, fontWeight: 800, color: '#7C3AED', display: 'flex', alignItems: 'center', gap: 4 }}>
                     <Info size={12} /> Qui a réglé cette facture ?
                   </div>
-                  <div style={{ display: 'flex', gap: 8 }}>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                     <button
                       type="button"
                       className="btn btn-secondary btn-sm"
@@ -636,7 +640,7 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
                         key={tx.id}
                         onClick={() => doConfirm(tx.id, 'bank')}
                         style={{
-                          display: 'flex', alignItems: 'center', gap: 10, padding: '9px 14px',
+                          display: 'flex', alignItems: 'center', gap: 10, padding: '9px 14px', flexWrap: 'wrap',
                           cursor: 'pointer', borderBottom: '1px solid var(--border-light)',
                           transition: 'background 0.12s',
                         }}
@@ -679,27 +683,30 @@ function DataPill({ label, value, valueColor, mono }: { label: string; value: st
   );
 }
 
-function CandidateRow({ c }: { c: BankCandidate }) {
+function CandidateRow({ c, compact, action }: { c: BankCandidate; compact?: boolean; action?: React.ReactNode }) {
   return (
     <div style={{
-      display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+      display: 'flex', alignItems: 'center', gap: compact ? 8 : 10, flexWrap: 'wrap',
       background: 'var(--cream-light)', borderRadius: 10, padding: '10px 12px',
       border: '1px solid var(--border-light)',
     }}>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.description}</div>
-        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
-          {formatDate(c.date)} · écart : {c.date_diff} jour{c.date_diff > 1 ? 's' : ''} / {formatCurrency(c.amount_diff)}
+        <div style={{ fontSize: compact ? 12 : 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.description}</div>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: compact ? 0 : 2 }}>
+          {compact
+            ? <>{formatDate(c.date)} · {c.date_diff}j d'écart</>
+            : <>{formatDate(c.date)} · écart : {c.date_diff} jour{c.date_diff > 1 ? 's' : ''} / {formatCurrency(c.amount_diff)}</>}
         </div>
       </div>
-      <span style={{ fontSize: 15, fontWeight: 800, color: 'var(--red)' }}>{formatCurrency(c.amount)}</span>
+      <span style={{ fontSize: compact ? 13 : 15, fontWeight: compact ? 700 : 800, color: 'var(--red)' }}>{formatCurrency(c.amount)}</span>
       <ScoreBadge score={c.score} />
+      {action}
     </div>
   );
 }
 
 function ScoreBadge({ score }: { score: number }) {
-  const cls = score >= 80 ? { bg: 'rgba(45,143,94,0.15)', color: 'var(--green)' }
+  const cls = score >= 85 ? { bg: 'rgba(45,143,94,0.15)', color: 'var(--green)' }
     : score >= 55 ? { bg: 'rgba(232,155,62,0.15)', color: '#B45309' }
     : { bg: 'rgba(139,139,139,0.12)', color: 'var(--text-muted)' };
   return (
@@ -719,12 +726,18 @@ export default function ScannerPage() {
   const [bankTxLoaded, setBankTxLoaded] = useState(false);
 
   const [multiPageMode, setMultiPageMode] = useState(false);
-  const [multiPageFiles, setMultiPageFiles] = useState<File[]>([]);
+  const [multiPageFiles, setMultiPageFiles] = useState<MultiPageFile[]>([]);
 
-  const isProcessingRef = useRef(false);
-  const cameraRef       = useRef<HTMLInputElement>(null);
-  const fileRef         = useRef<HTMLInputElement>(null);
-  const supabase        = createClient();
+  const isProcessingRef  = useRef(false);
+  const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const cameraRef        = useRef<HTMLInputElement>(null);
+  const fileRef          = useRef<HTMLInputElement>(null);
+  const supabase         = createClient();
+
+  // Nettoyage du timer de progression au démontage du composant
+  useEffect(() => () => {
+    if (progressTimerRef.current) clearInterval(progressTimerRef.current);
+  }, []);
 
   // ── Queue helpers ──────────────────────────────────────────────────────────
   const setItem = useCallback((id: string, upd: Partial<QueueItem>) => {
@@ -739,7 +752,12 @@ export default function ScannerPage() {
       );
 
     if (multiPageMode) {
-      setMultiPageFiles(prev => [...prev, ...valid]);
+      // Object URL créée une seule fois à l'ajout (révoquée à la suppression/reset)
+      const pages: MultiPageFile[] = valid.map(file => ({
+        file,
+        previewUrl: file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
+      }));
+      setMultiPageFiles(prev => [...prev, ...pages]);
     } else {
       setQueue(prev => {
         const remaining = MAX_QUEUE - prev.length;
@@ -750,7 +768,7 @@ export default function ScannerPage() {
           file, preview: null,
           status: 'pending', progress: 0, step: 'En attente...',
           result: null, error: null,
-          actionTaken: false, selectedBankTxId: null, paymentMethod: 'bank',
+          actionTaken: false, selectedBankTxId: null,
           associe: null,
           confirmedRef: null, showCandidates: false, showManualSelector: false,
         }));
@@ -762,6 +780,22 @@ export default function ScannerPage() {
   const removeItem    = useCallback((id: string) => setQueue(prev => prev.filter(i => i.id !== id)), []);
   const clearFinished = useCallback(() => setQueue(prev => prev.filter(i => !TERMINAL.includes(i.status))), []);
 
+  // Révoque toutes les object URLs puis vide la liste multi-pages
+  const resetMultiPageFiles = useCallback(() => {
+    setMultiPageFiles(prev => {
+      prev.forEach(p => { if (p.previewUrl) URL.revokeObjectURL(p.previewUrl); });
+      return [];
+    });
+  }, []);
+
+  const removeMultiPageFile = useCallback((idx: number) => {
+    setMultiPageFiles(prev => prev.filter((p, i) => {
+      if (i !== idx) return true;
+      if (p.previewUrl) URL.revokeObjectURL(p.previewUrl);
+      return false;
+    }));
+  }, []);
+
   // ── Processing ─────────────────────────────────────────────────────────────
   const processItem = useCallback(async (item: QueueItem) => {
     if (isProcessingRef.current) return;
@@ -770,8 +804,6 @@ export default function ScannerPage() {
 
     const upd = (u: Partial<QueueItem>) =>
       setQueue(prev => prev.map(i => i.id === item.id ? { ...i, ...u } : i));
-
-    let timer: ReturnType<typeof setInterval> | null = null;
 
     try {
       // Step 1 — read
@@ -797,12 +829,11 @@ export default function ScannerPage() {
 
       // Step 2 — upload indicator
       upd({ status: 'uploading', progress: 22, step: 'Envoi vers le serveur...' });
-      await delay(180);
 
       // Step 3 — AI analysis (animated bar)
       upd({ status: 'analyzing', progress: 28, step: 'Analyse OCR par l\'IA...' });
       let fp = 28;
-      timer = setInterval(() => {
+      progressTimerRef.current = setInterval(() => {
         fp = Math.min(fp + Math.random() * 4 + 1, 82);
         setQueue(prev => prev.map(i => i.id === item.id ? { ...i, progress: Math.round(fp) } : i));
       }, 380);
@@ -816,13 +847,12 @@ export default function ScannerPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      clearInterval(timer!); timer = null;
+      if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; }
       const data = await res.json();
       if (!res.ok || !data.success) throw new Error(data.error || `Erreur ${res.status}`);
 
       // Step 4 — matching
       upd({ status: 'matching', progress: 90, step: 'Recherche de rapprochement bancaire...' });
-      await delay(550);
 
       // Step 5 — result
       if (data.is_duplicate) {
@@ -835,7 +865,7 @@ export default function ScannerPage() {
         upd({ status: 'complete', progress: 100, step: lbl, result: data });
       }
     } catch (e: any) {
-      if (timer) clearInterval(timer);
+      if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; }
       upd({ status: 'error', progress: 100, step: 'Erreur', error: e?.message || 'Erreur analyse IA' });
     } finally {
       isProcessingRef.current = false;
@@ -880,11 +910,11 @@ export default function ScannerPage() {
           associe: associe || null,
           step: '✅ Facture enregistrée', progress: 100,
         });
+        // La transaction vient d'être liée : on la retire de la liste locale
+        // pour ne plus la proposer aux éléments suivants de la file.
+        if (bankId) setBankTxList(prev => prev.filter(tx => tx.id !== bankId));
       } else {
-        const errorMsg = data.details
-          ? `${data.error}\n\n1er essai : ${data.details.firstAttempt || 'N/A'}\nFallback : ${data.details.fallbackAttempt || 'N/A'}`
-          : data.error || 'Inconnu';
-        alert('Erreur : ' + errorMsg);
+        alert('Erreur : ' + (data.error || 'Inconnu'));
         setItem(itemId, { step: 'Erreur enregistrement', progress: 100 });
       }
     } catch {
@@ -997,7 +1027,7 @@ export default function ScannerPage() {
                 checked={multiPageMode}
                 onChange={e => {
                   setMultiPageMode(e.target.checked);
-                  if (!e.target.checked) setMultiPageFiles([]);
+                  if (!e.target.checked) resetMultiPageFiles();
                 }}
                 style={{ width: 18, height: 18, cursor: 'pointer', accentColor: 'var(--teal)' }}
               />
@@ -1008,7 +1038,7 @@ export default function ScannerPage() {
             {multiPageMode && multiPageFiles.length > 0 && (
               <button
                 className="btn btn-ghost btn-sm"
-                onClick={() => setMultiPageFiles([])}
+                onClick={resetMultiPageFiles}
                 style={{ fontSize: 12, color: 'var(--red)', border: 'none', background: 'none', cursor: 'pointer' }}
               >
                 Tout réinitialiser
@@ -1064,12 +1094,12 @@ export default function ScannerPage() {
                   </div>
                 ) : (
                   <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', background: 'white', padding: 12, borderRadius: 8, border: '1px solid var(--border-light)' }}>
-                    {multiPageFiles.map((file, idx) => {
-                      const tempUrl = file.type.startsWith('image/') ? URL.createObjectURL(file) : null;
+                    {multiPageFiles.map((page, idx) => {
                       return (
                         <div key={idx} style={{ position: 'relative', width: 64, height: 64, borderRadius: 8, overflow: 'hidden', border: '1px solid var(--border-light)' }}>
-                          {tempUrl ? (
-                            <img src={tempUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                          {page.previewUrl ? (
+                            // eslint-disable-next-line @next/next/no-img-element -- blob local, incompatible next/image
+                            <img src={page.previewUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                           ) : (
                             <div style={{ width: '100%', height: '100%', background: 'var(--cream-light)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 'bold', color: 'var(--text-muted)' }}>
                               PDF
@@ -1080,7 +1110,7 @@ export default function ScannerPage() {
                           </span>
                           <button
                             type="button"
-                            onClick={() => setMultiPageFiles(prev => prev.filter((_, i) => i !== idx))}
+                            onClick={() => removeMultiPageFile(idx)}
                             style={{
                               position: 'absolute', top: 2, right: 2,
                               background: 'rgba(220, 38, 38, 0.95)', color: 'white',
@@ -1107,13 +1137,17 @@ export default function ScannerPage() {
                   </div>
                   <button
                     className="btn btn-primary"
+                    disabled={!canAdd}
                     style={{ padding: '10px 20px', fontSize: 13, fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', boxShadow: '0 4px 12px rgba(42,125,123,.25)' }}
                     onClick={() => {
-                      const itemFile = multiPageFiles[0];
+                      if (queue.length >= MAX_QUEUE) {
+                        alert(`File pleine (${MAX_QUEUE}/${MAX_QUEUE}) — terminez ou retirez des fichiers pour en ajouter de nouveaux.`);
+                        return;
+                      }
                       const queueItem: QueueItem = {
                         id: Math.random().toString(36).slice(2, 10),
-                        file: itemFile,
-                        files: multiPageFiles,
+                        file: multiPageFiles[0].file,
+                        files: multiPageFiles.map(p => p.file),
                         preview: null,
                         status: 'pending',
                         progress: 0,
@@ -1122,14 +1156,13 @@ export default function ScannerPage() {
                         error: null,
                         actionTaken: false,
                         selectedBankTxId: null,
-                        paymentMethod: 'bank',
                         associe: null,
                         confirmedRef: null,
                         showCandidates: false,
                         showManualSelector: false,
                       };
                       setQueue(prev => [...prev, queueItem]);
-                      setMultiPageFiles([]);
+                      resetMultiPageFiles();
                     }}
                   >
                     <Sparkles size={15} /> Étape 2 : Lancer l'analyse combinée ({multiPageFiles.length} page{multiPageFiles.length > 1 ? 's' : ''})

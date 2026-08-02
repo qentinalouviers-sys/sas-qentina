@@ -6,7 +6,7 @@ import { formatCurrency, CATEGORY_LABELS } from '@/lib/utils';
 import {
   ShoppingCart, Search, Plus, Trash2, Check, X, ChevronDown,
   ChevronUp, Package, RefreshCw, Building2,
-  ClipboardList, Star, Copy, List
+  ClipboardList, Star, Copy
 } from 'lucide-react';
 import type { Supplier, InvoiceLineCategory } from '@/lib/types';
 
@@ -56,6 +56,20 @@ function genId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
+// Regroupe des éléments (catalogue ou liste) par fournisseur
+function groupBySupplier<T extends { supplier_id: string | null; supplier_name: string | null }>(
+  items: T[],
+  fallbackName: string
+): { id: string; name: string; items: T[] }[] {
+  const groups: Record<string, { id: string; name: string; items: T[] }> = {};
+  items.forEach(item => {
+    const key = item.supplier_id || '__none__';
+    if (!groups[key]) groups[key] = { id: key, name: item.supplier_name || fallbackName, items: [] };
+    groups[key].items.push(item);
+  });
+  return Object.values(groups);
+}
+
 // ─── Main Component ──────────────────────────────────────────────────────────
 
 export default function ListeCoursesPage() {
@@ -80,9 +94,6 @@ export default function ListeCoursesPage() {
   const [showCustomModal, setShowCustomModal] = useState(false);
   const [customForm, setCustomForm] = useState({ designation: '', unit: 'pièce', quantity: 1, unit_price_ht: '', note: '', category: '' as InvoiceLineCategory | '', supplier_id: '' });
 
-  // Item editing
-  const [editingItemId, setEditingItemId] = useState<string | null>(null);
-
   // New list modal
   const [showNewListModal, setShowNewListModal] = useState(false);
   const [newListName, setNewListName] = useState('');
@@ -94,15 +105,16 @@ export default function ListeCoursesPage() {
   const loadData = useCallback(async () => {
     setLoading(true);
 
-    const { data: sup } = await supabase.from('suppliers').select('*').order('name');
-    setSuppliers(sup || []);
-
     // Aggregate invoice lines into a product catalog
-    const { data: lines } = await supabase
-      .from('invoice_lines')
-      .select('designation, unit, unit_price_ht, category, created_at, invoice:invoices(supplier_id, supplier:suppliers(id, name), date)')
-      .order('created_at', { ascending: false })
-      .limit(2000);
+    const [{ data: sup }, { data: lines }] = await Promise.all([
+      supabase.from('suppliers').select('*').order('name'),
+      supabase
+        .from('invoice_lines')
+        .select('designation, unit, unit_price_ht, category, created_at, invoice:invoices(supplier_id, supplier:suppliers(id, name), date)')
+        .order('created_at', { ascending: false })
+        .limit(2000),
+    ]);
+    setSuppliers(sup || []);
 
     if (lines) {
       // Build catalog: deduplicate by designation (normalized), keep latest price + count occurrences
@@ -126,15 +138,9 @@ export default function ListeCoursesPage() {
             order_count: 1,
           };
         } else {
+          // Les lignes arrivent triées created_at desc : la première occurrence
+          // porte déjà le prix le plus récent, on ne fait qu'incrémenter le compteur
           map[key].order_count++;
-          // Keep most recent price
-          if (date && map[key].last_date && date > map[key].last_date!) {
-            map[key].unit_price_ht = l.unit_price_ht;
-            map[key].unit = l.unit;
-            map[key].last_date = date;
-            map[key].supplier_id = supplierId;
-            map[key].supplier_name = supplierName;
-          }
         }
       });
 
@@ -159,7 +165,7 @@ export default function ListeCoursesPage() {
         if (parsed.length > 0) setActiveListId(parsed[0].id);
       } catch { /* ignore */ }
     } else {
-      // Create default list
+      // Create default list (et la persister immédiatement)
       const defaultList: ShoppingList = {
         id: genId(),
         name: 'Liste du ' + new Date().toLocaleDateString('fr-FR'),
@@ -168,6 +174,7 @@ export default function ListeCoursesPage() {
       };
       setLists([defaultList]);
       setActiveListId(defaultList.id);
+      localStorage.setItem('qentina_shopping_lists', JSON.stringify([defaultList]));
     }
   }, []);
 
@@ -210,7 +217,7 @@ export default function ListeCoursesPage() {
     if (!activeList) return;
     // Check if already in list
     const exists = activeList.items.find(
-      i => i.designation.toLowerCase() === product.designation.toLowerCase()
+      i => i.designation.trim().toLowerCase() === product.designation.trim().toLowerCase()
     );
     if (exists) {
       // Increment quantity
@@ -273,7 +280,12 @@ export default function ListeCoursesPage() {
   };
 
   const updateItemQty = (itemId: string, qty: number) => {
-    if (!activeList || qty < 0) return;
+    if (!activeList) return;
+    if (qty <= 0) {
+      // Le stepper descend à 0 → on retire l'article de la liste
+      removeItem(itemId);
+      return;
+    }
     updateList({
       ...activeList,
       items: activeList.items.map(i => i.id === itemId ? { ...i, quantity: qty } : i),
@@ -297,16 +309,10 @@ export default function ListeCoursesPage() {
   }, [catalog, search, filterSupplier, filterCategory]);
 
   // Group by supplier for catalog
-  const catalogBySupplier = useMemo(() => {
-    const groups: Record<string, { name: string; products: CatalogProduct[] }> = {};
-    filteredCatalog.forEach(p => {
-      const key = p.supplier_id || '__none__';
-      const name = p.supplier_name || 'Fournisseur inconnu';
-      if (!groups[key]) groups[key] = { name, products: [] };
-      groups[key].products.push(p);
-    });
-    return Object.entries(groups).sort(([, a], [, b]) => b.products.length - a.products.length);
-  }, [filteredCatalog]);
+  const catalogBySupplier = useMemo(
+    () => groupBySupplier(filteredCatalog, 'Fournisseur inconnu').sort((a, b) => b.items.length - a.items.length),
+    [filteredCatalog]
+  );
 
   // List stats
   const listStats = useMemo(() => {
@@ -317,17 +323,10 @@ export default function ListeCoursesPage() {
   }, [activeList]);
 
   // List grouped by supplier
-  const listBySupplier = useMemo(() => {
-    if (!activeList) return [];
-    const groups: Record<string, { name: string; items: ListItem[] }> = {};
-    activeList.items.forEach(item => {
-      const key = item.supplier_id || '__none__';
-      const name = item.supplier_name || 'Non assigné';
-      if (!groups[key]) groups[key] = { name, items: [] };
-      groups[key].items.push(item);
-    });
-    return Object.entries(groups).map(([id, g]) => ({ id, ...g }));
-  }, [activeList]);
+  const listBySupplier = useMemo(
+    () => activeList ? groupBySupplier(activeList.items, 'Non assigné') : [],
+    [activeList]
+  );
 
   // Export list as text
   const exportList = () => {
@@ -344,11 +343,13 @@ export default function ListeCoursesPage() {
       text += '\n';
     });
     text += `\nTotal estimé HT : ${formatCurrency(listStats.totalPrice)}`;
-    navigator.clipboard.writeText(text).then(() => alert('Liste copiée dans le presse-papier ! 📋'));
+    navigator.clipboard.writeText(text)
+      .then(() => alert('Liste copiée dans le presse-papier ! 📋'))
+      .catch(() => alert('Erreur : impossible de copier la liste dans le presse-papier.'));
   };
 
   const isInList = (designation: string) =>
-    !!activeList?.items.find(i => i.designation.toLowerCase() === designation.toLowerCase());
+    !!activeList?.items.find(i => i.designation.trim().toLowerCase() === designation.trim().toLowerCase());
 
   // ─── Render ────────────────────────────────────────────────────────────────
 
@@ -425,8 +426,18 @@ export default function ListeCoursesPage() {
                   </span>
                   {lists.length > 1 && (
                     <span
+                      role="button"
+                      aria-label="Supprimer la liste"
+                      tabIndex={0}
                       style={{ marginLeft: 2, opacity: 0.5 }}
                       onClick={e => { e.stopPropagation(); deleteList(list.id); }}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          deleteList(list.id);
+                        }
+                      }}
                     >
                       <X size={11} />
                     </span>
@@ -569,12 +580,12 @@ export default function ListeCoursesPage() {
                             {/* Quantity control */}
                             <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
                               <button
-                                style={{ width: 22, height: 22, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--cream)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700 }}
+                                style={{ width: 30, height: 30, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--cream)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, touchAction: 'manipulation' }}
                                 onClick={() => updateItemQty(item.id, item.quantity - 1)}
                               >−</button>
                               <span style={{ fontSize: 13, fontWeight: 700, minWidth: 20, textAlign: 'center' }}>{item.quantity}</span>
                               <button
-                                style={{ width: 22, height: 22, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--cream)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700 }}
+                                style={{ width: 30, height: 30, borderRadius: 6, border: '1px solid var(--border)', background: 'var(--cream)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 700, touchAction: 'manipulation' }}
                                 onClick={() => updateItemQty(item.id, item.quantity + 1)}
                               >+</button>
                               <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 2 }}>{item.unit}</span>
@@ -671,8 +682,8 @@ export default function ListeCoursesPage() {
               ) : catalogBySupplier.length === 0 ? (
                 <div className="empty-state"><Package size={40} /><p>Aucun produit trouvé</p></div>
               ) : (
-                catalogBySupplier.map(([supId, { name: supName, products }]) => {
-                  const isExpanded = expandedSuppliers.has(supId) || (search !== '' || filterCategory !== '');
+                catalogBySupplier.map(({ id: supId, name: supName, items: products }) => {
+                  const isExpanded = expandedSuppliers.has(supId) || (search !== '' || filterCategory !== '' || filterSupplier !== '');
                   return (
                     <div
                       key={supId}
@@ -774,7 +785,7 @@ export default function ListeCoursesPage() {
                                 <button
                                   onClick={() => addToList(product)}
                                   style={{
-                                    width: 30, height: 30, borderRadius: 8, flexShrink: 0,
+                                    width: 36, height: 36, borderRadius: 8, flexShrink: 0,
                                     border: alreadyIn ? '2px solid var(--green)' : '2px solid var(--teal)',
                                     background: alreadyIn ? 'var(--green)' : 'var(--teal-bg)',
                                     color: alreadyIn ? 'white' : 'var(--teal)',

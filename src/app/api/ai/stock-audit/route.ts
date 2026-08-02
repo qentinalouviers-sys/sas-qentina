@@ -2,10 +2,14 @@ import { NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { createClaudeMessage } from '@/lib/anthropic';
+import { requireUser } from '@/lib/supabase/api-auth';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 export async function POST() {
+  const auth = await requireUser();
+  if (auth.error) return auth.error;
+
   try {
     const supabase = createServiceRoleClient();
 

@@ -58,6 +58,26 @@ export function toISODate(date: Date): string {
   return format(date, 'yyyy-MM-dd');
 }
 
+/**
+ * Heure locale du restaurant (Europe/Paris), quel que soit le fuseau du
+ * serveur ou du navigateur. Gère automatiquement heure d'été / d'hiver
+ * (l'ancien code faisait getUTCHours() + 2, faux la moitié de l'année).
+ */
+export function getParisHour(date: Date): number {
+  return parseInt(
+    new Intl.DateTimeFormat('fr-FR', { hour: 'numeric', hour12: false, timeZone: 'Europe/Paris' }).format(date),
+    10
+  );
+}
+
+const DAYS_FR = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
+
+/** Nom du jour (français) en heure de Paris. */
+export function getParisDayName(date: Date): string {
+  const idx = new Date(date.toLocaleString('en-US', { timeZone: 'Europe/Paris' })).getDay();
+  return DAYS_FR[idx];
+}
+
 export function downloadCSV(data: Record<string, unknown>[], filename: string) {
   if (data.length === 0) return;
   const headers = Object.keys(data[0]);

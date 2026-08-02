@@ -1,14 +1,13 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatPercent, getDateRange, toISODate, formatDate } from '@/lib/utils';
-import { 
-  TrendingUp, 
-  DollarSign, 
-  Users, 
-  Landmark, 
-  Receipt, 
+import {
+  TrendingUp,
+  DollarSign,
+  Users,
+  Receipt,
   PieChart as PieIcon, 
   Sparkles,
   Info,
@@ -26,6 +25,42 @@ const getHtAmount = (o: any) => {
   const tax = (raw.total_tax_money?.amount || raw.net_amounts?.tax_money?.amount || 0) / 100;
   return (o.net_amount || 0) - tax;
 };
+
+// Formateur de ligne de modale pour une transaction bancaire (Date / Libellé / Montant),
+// paramétré par la couleur du montant.
+const makeBankRowFormatter = (color: string) => (t: any) => ({
+  id: String(t.id),
+  cells: [
+    formatDate(t.date),
+    t.description,
+    <strong key="amt" style={{ color }}>{formatCurrency(Math.abs(t.amount || 0))}</strong>
+  ]
+});
+
+// Ligne cliquable du tableau P&L (poste de détail indenté).
+// Le flex est posé sur un <div> interne à la cellule (jamais sur le <td>,
+// ce qui casserait l'alignement des colonnes du tableau).
+interface PnlRowProps {
+  label: string;
+  value: number;
+  ratio: number;
+  note: string;
+  color?: string;
+  onClick: () => void;
+}
+
+const PnlRow = ({ label, value, ratio, note, color = 'var(--text-secondary)', onClick }: PnlRowProps) => (
+  <tr onClick={onClick} style={{ cursor: 'pointer' }} className="interactive-row">
+    <td style={{ paddingLeft: 32 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <Eye size={12} style={{ color }} /> {label}
+      </div>
+    </td>
+    <td style={{ textAlign: 'right' }}>{formatCurrency(value)}</td>
+    <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>{formatPercent(ratio)}</td>
+    <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>{note}</td>
+  </tr>
+);
 
 export default function PnlPage() {
   const [period, setPeriod] = useState<PeriodFilter>('month');
@@ -89,51 +124,96 @@ export default function PnlPage() {
     const endStr = toISODate(end);
 
     try {
-      // A. Récupérer les IDs masqués depuis app_settings
-      const { data: settingsData } = await supabase
-        .from('app_settings')
-        .select('value')
-        .eq('key', 'masked_items');
-      
-      const loadedMaskedIds: string[] = settingsData && settingsData.length > 0 && settingsData[0].value 
-        ? JSON.parse(settingsData[0].value) 
+      // Les 8 requêtes indépendantes sont lancées en parallèle ;
+      // seules les lignes de factures (invoice_lines) dépendent des factures → second temps.
+      const [
+        { data: settingsData },
+        { data: orders },
+        { data: bankRecettes },
+        { data: invoices },
+        { data: bankSuppliers },
+        { data: timecards },
+        { data: bankSalaries },
+        { data: fixedTx },
+      ] = await Promise.all([
+        // A. IDs masqués depuis app_settings
+        supabase
+          .from('app_settings')
+          .select('value')
+          .eq('key', 'masked_items'),
+        // 1. Chiffre d'Affaires (Square Orders)
+        supabase
+          .from('square_orders')
+          .select('id, net_amount, service, square_order_id, created_at, raw_data')
+          .gte('service', startStr)
+          .lte('service', endStr)
+          .order('service', { ascending: false }),
+        // CA Banque (Recettes)
+        supabase
+          .from('bank_transactions')
+          .select('id, date, description, amount, status')
+          .eq('category', 'recette')
+          .gte('date', startStr)
+          .lte('date', endStr)
+          .order('date', { ascending: false }),
+        // 2. Factures fournisseurs
+        supabase
+          .from('invoices')
+          .select('id')
+          .gte('date', startStr)
+          .lte('date', endStr),
+        // Achats Fournisseurs non lettrés (dans banque directement, non lié à facture)
+        supabase
+          .from('bank_transactions')
+          .select('id, date, description, amount, status')
+          .eq('category', 'variable_fournisseur')
+          .is('invoice_id', null)
+          .gte('date', startStr)
+          .lte('date', endStr)
+          .order('date', { ascending: false }),
+        // 3. Masse Salariale — Timecards (Salaires théoriques)
+        supabase
+          .from('labor_timecards')
+          .select('id, employee_name, start_at, end_at, hours_worked, hourly_rate')
+          .gte('start_at', start.toISOString())
+          .lte('start_at', end.toISOString())
+          .order('start_at', { ascending: false }),
+        // Banque Salaires & Charges
+        supabase
+          .from('bank_transactions')
+          .select('id, date, description, amount, status')
+          .eq('category', 'variable_salaire')
+          .gte('date', startStr)
+          .lte('date', endStr)
+          .order('date', { ascending: false }),
+        // 4. Charges Fixes (Banque)
+        supabase
+          .from('bank_transactions')
+          .select('id, date, description, amount, category, status')
+          .in('category', ['fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'impot_taxe', 'autre'])
+          .gte('date', startStr)
+          .lte('date', endStr)
+          .order('date', { ascending: false }),
+      ]);
+
+      const loadedMaskedIds: string[] = settingsData && settingsData.length > 0 && settingsData[0].value
+        ? JSON.parse(settingsData[0].value)
         : [];
-      
+
       setMaskedIds(loadedMaskedIds);
 
       // 1. Chiffre d'Affaires (Square Orders)
-      const { data: orders } = await supabase
-        .from('square_orders')
-        .select('id, net_amount, service, square_order_id, created_at, raw_data')
-        .gte('service', startStr)
-        .lte('service', endStr)
-        .order('service', { ascending: false });
-      
       const ordersList = orders || [];
       const activeOrders = ordersList.filter((o: any) => !loadedMaskedIds.includes(String(o.id)));
       const caSquare = activeOrders.reduce((s: number, o: any) => s + getHtAmount(o), 0);
 
       // CA Banque (Recettes)
-      const { data: bankRecettes } = await supabase
-        .from('bank_transactions')
-        .select('id, date, description, amount, status')
-        .eq('category', 'recette')
-        .gte('date', startStr)
-        .lte('date', endStr)
-        .order('date', { ascending: false });
-      
       const bankRecettesList = bankRecettes || [];
       const activeBankRecettes = bankRecettesList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
       const caBank = activeBankRecettes.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
       const totalCA = caSquare; // Ventes d'exploitation comme CA primaire
 
-      // 2. Factures fournisseurs & lignes
-      const { data: invoices } = await supabase
-        .from('invoices')
-        .select('id')
-        .gte('date', startStr)
-        .lte('date', endStr);
-
+      // 2. Lignes de factures (dépend des factures récupérées ci-dessus)
       const invoiceIds = invoices?.map((i: any) => i.id) || [];
       
       let purchasesAlim = 0;
@@ -164,15 +244,6 @@ export default function PnlPage() {
       }
 
       // Achats Fournisseurs non lettrés (dans banque directement, non lié à facture)
-      const { data: bankSuppliers } = await supabase
-        .from('bank_transactions')
-        .select('id, date, description, amount, status')
-        .eq('category', 'variable_fournisseur')
-        .is('invoice_id', null)
-        .gte('date', startStr)
-        .lte('date', endStr)
-        .order('date', { ascending: false });
-      
       const bankSuppliersUnreconciledList = bankSuppliers || [];
       const activeBankSuppliers = bankSuppliersUnreconciledList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
       const bankSuppliersUnreconciled = activeBankSuppliers.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
@@ -180,26 +251,11 @@ export default function PnlPage() {
 
       // 3. Masse Salariale
       // Timecards (Salaires théoriques)
-      const { data: timecards } = await supabase
-        .from('labor_timecards')
-        .select('id, employee_name, start_at, end_at, hours_worked, hourly_rate')
-        .gte('start_at', start.toISOString())
-        .lte('start_at', end.toISOString())
-        .order('start_at', { ascending: false });
-
       const timecardsList = timecards || [];
       const activeTimecards = timecardsList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
       const laborTimecards = activeTimecards.reduce((s: number, t: any) => s + (t.hours_worked || 0) * (t.hourly_rate || 0), 0);
 
       // Banque Salaires & Charges
-      const { data: bankSalaries } = await supabase
-        .from('bank_transactions')
-        .select('id, date, description, amount, status')
-        .eq('category', 'variable_salaire')
-        .gte('date', startStr)
-        .lte('date', endStr)
-        .order('date', { ascending: false });
-
       const bankSalariesList = bankSalaries || [];
       const activeBankSalaries = bankSalariesList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
       const laborBank = activeBankSalaries.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
@@ -209,14 +265,6 @@ export default function PnlPage() {
       const activeLabor = useBankLabor ? laborBank : laborTimecards;
 
       // 4. Charges Fixes (Banque)
-      const { data: fixedTx } = await supabase
-        .from('bank_transactions')
-        .select('id, date, description, amount, category, status')
-        .in('category', ['fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'impot_taxe', 'autre'])
-        .gte('date', startStr)
-        .lte('date', endStr)
-        .order('date', { ascending: false });
-
       const fixedTxList = fixedTx || [];
       const activeFixedTx = fixedTxList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
       
@@ -328,16 +376,16 @@ export default function PnlPage() {
     }
   };
 
-  // Préparation des données pour les graphiques
-  const breakdownData = [
+  // Préparation des données pour les graphiques (mémoïsées)
+  const breakdownData = useMemo(() => [
     { name: 'Chiffre d\'Affaires', montant: data.totalCA, fill: 'var(--teal)' },
     { name: 'Coût Matières', montant: data.totalCogs, fill: 'var(--orange)' },
     { name: 'Charges Personnel', montant: data.activeLabor, fill: 'var(--red)' },
     { name: 'Charges Fixes & Ops', montant: data.totalFixedCharges, fill: 'var(--text-muted)' },
     { name: 'EBE (Marge Opé.)', montant: data.ebitda, fill: data.ebitda >= 0 ? 'var(--green)' : 'var(--red)' },
-  ];
+  ], [data]);
 
-  const expensesPieData = [
+  const expensesPieData = useMemo(() => [
     { name: 'Alimentaire', value: data.purchasesAlim, color: '#E89B3E' },
     { name: 'Boissons', value: data.purchasesBoisson, color: '#3A9D9B' },
     { name: 'Emballages', value: data.purchasesEmballage, color: '#9061F9' },
@@ -348,7 +396,7 @@ export default function PnlPage() {
     { name: 'Abonnements', value: data.chargesAbonnement, color: '#EC4899' },
     { name: 'Impôts & Taxes', value: data.chargesImpot, color: '#6B7280' },
     { name: 'Matériel & Divers', value: data.chargesAutreBank + data.purchasesMateriel + data.purchasesAutreInvoices, color: '#9CA3AF' },
-  ].filter(item => item.value > 0);
+  ].filter(item => item.value > 0), [data]);
 
   const calculateRatio = (amount: number) => {
     return data.totalCA > 0 ? (amount / data.totalCA) * 100 : 0;
@@ -390,14 +438,7 @@ export default function PnlPage() {
         title = 'Détail des Recettes Bancaires';
         headers = ['Date Opération', 'Libellé de l\'opération', 'Montant'];
         rawItemsList = data.bankRecettesList;
-        formatRowFunction = (t: any) => ({
-          id: String(t.id),
-          cells: [
-            formatDate(t.date),
-            t.description,
-            <strong key="amt" style={{ color: 'var(--green)' }}>{formatCurrency(t.amount)}</strong>
-          ]
-        });
+        formatRowFunction = makeBankRowFormatter('var(--green)');
         break;
 
       case 'purchases_alim':
@@ -438,28 +479,14 @@ export default function PnlPage() {
         title = 'Paiements Fournisseurs (Flux directs Banque)';
         headers = ['Date Opération', 'Libellé de l\'opération', 'Montant'];
         rawItemsList = data.bankSuppliersUnreconciledList;
-        formatRowFunction = (t: any) => ({
-          id: String(t.id),
-          cells: [
-            formatDate(t.date),
-            t.description,
-            <strong key="amt" style={{ color: 'var(--red)' }}>{formatCurrency(Math.abs(t.amount || 0))}</strong>
-          ]
-        });
+        formatRowFunction = makeBankRowFormatter('var(--red)');
         break;
 
       case 'labor_bank':
         title = 'Paiements Salaires & Charges réels (Banque)';
         headers = ['Date Opération', 'Libellé de l\'opération', 'Montant'];
         rawItemsList = data.bankSalariesList;
-        formatRowFunction = (t: any) => ({
-          id: String(t.id),
-          cells: [
-            formatDate(t.date),
-            t.description,
-            <strong key="amt" style={{ color: 'var(--red)' }}>{formatCurrency(Math.abs(t.amount || 0))}</strong>
-          ]
-        });
+        formatRowFunction = makeBankRowFormatter('var(--red)');
         break;
 
       case 'labor_timecards':
@@ -505,14 +532,7 @@ export default function PnlPage() {
         headers = ['Date Opération', 'Libellé de l\'opération', 'Montant'];
         
         rawItemsList = data.fixedTxList.filter((t: any) => t.category === bankCat);
-        formatRowFunction = (t: any) => ({
-          id: String(t.id),
-          cells: [
-            formatDate(t.date),
-            t.description,
-            <strong key="amt" style={{ color: 'var(--text-primary)' }}>{formatCurrency(Math.abs(t.amount || 0))}</strong>
-          ]
-        });
+        formatRowFunction = makeBankRowFormatter('var(--text-primary)');
         break;
       
       default:
@@ -602,7 +622,7 @@ export default function PnlPage() {
             )}
           </div>
 
-          <div className="table-container" style={{ maxHeight: '450px', overflowY: 'auto' }}>
+          <div className="table-container" style={{ maxHeight: '60vh', overflowY: 'auto' }}>
             {displayedItems.length === 0 ? (
               <div className="empty-state" style={{ padding: '32px' }}>
                 <p>Aucune écriture active trouvée.</p>
@@ -624,8 +644,8 @@ export default function PnlPage() {
                         <th 
                           key={idx} 
                           style={
-                            isRightAlign ? { textAlign: 'right' } : 
-                            isCenterAlign ? { textAlign: 'center', width: '80px' } : 
+                            isRightAlign ? { textAlign: 'right' } :
+                            isCenterAlign ? { textAlign: 'center', whiteSpace: 'nowrap' } :
                             {}
                           }
                         >
@@ -795,7 +815,7 @@ export default function PnlPage() {
                   <div className="card-title">Structure du Résultat Opérationnel</div>
                   <TrendingUp size={20} style={{ color: 'var(--teal)' }} />
                 </div>
-                <div className="chart-container" style={{ height: 260 }}>
+                <div className="chart-container">
                   <ResponsiveContainer>
                     <BarChart data={breakdownData}>
                       <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" />
@@ -818,7 +838,7 @@ export default function PnlPage() {
                   <div className="card-title">Répartition des charges</div>
                   <PieIcon size={20} style={{ color: 'var(--teal)' }} />
                 </div>
-                <div className="chart-container" style={{ height: 260 }}>
+                <div className="chart-container">
                   {expensesPieData.length > 0 ? (
                     <ResponsiveContainer>
                       <PieChart>
@@ -860,7 +880,7 @@ export default function PnlPage() {
               </div>
 
               <div className="table-container">
-                <table className="pnl-table">
+                <table>
                   <thead>
                     <tr>
                       <th style={{ width: '45%' }}>Postes Budgétaires</th>
@@ -879,28 +899,22 @@ export default function PnlPage() {
                       <td style={{ textAlign: 'right', color: 'var(--teal)' }}>100,0 %</td>
                       <td>Volume opérationnel net</td>
                     </tr>
-                    <tr onClick={() => openDetail('ca_square')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--teal)' }} /> CA Ventes (Square POS)
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.caSquare)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.caSquare))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>Ventes directes caisse (cliquer pour voir/exclure)</td>
-                    </tr>
-                    <tr onClick={() => openDetail('ca_bank')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--teal)' }} /> Recettes Bancaires validées
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.caBank)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.caBank))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                        Dépôts identifiés (cliquer pour voir/exclure)
-                      </td>
-                    </tr>
+                    <PnlRow
+                      label="CA Ventes (Square POS)"
+                      value={data.caSquare}
+                      ratio={calculateRatio(data.caSquare)}
+                      color="var(--teal)"
+                      note="Ventes directes caisse (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('ca_square')}
+                    />
+                    <PnlRow
+                      label="Recettes Bancaires validées (hors total)"
+                      value={data.caBank}
+                      ratio={calculateRatio(data.caBank)}
+                      color="var(--teal)"
+                      note="Dépôts identifiés (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('ca_bank')}
+                    />
 
                     {/* SECTION 2: COUT MATIERES */}
                     <tr style={{ background: 'var(--cream-light)', fontWeight: 700 }}>
@@ -913,50 +927,38 @@ export default function PnlPage() {
                       </td>
                       <td>Food Cost global</td>
                     </tr>
-                    <tr onClick={() => openDetail('purchases_alim')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--orange)' }} /> Achats Alimentaires
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.purchasesAlim)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.purchasesAlim))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>Lignes factures (cliquer pour voir/exclure)</td>
-                    </tr>
-                    <tr onClick={() => openDetail('purchases_boisson')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--orange)' }} /> Achats Boissons
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.purchasesBoisson)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.purchasesBoisson))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>Lignes factures (cliquer pour voir/exclure)</td>
-                    </tr>
-                    <tr onClick={() => openDetail('purchases_emballage')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--orange)' }} /> Achats Emballages
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.purchasesEmballage)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.purchasesEmballage))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>Consommables & emballages (cliquer pour voir/exclure)</td>
-                    </tr>
-                    <tr onClick={() => openDetail('bank_suppliers_unreconciled')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--orange)' }} /> Paiements Fournisseurs (flux direct)
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
-                        {formatCurrency(data.bankSuppliersUnreconciled)}
-                      </td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.bankSuppliersUnreconciled))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                        Dépenses banque sans factures PDF (cliquer pour voir/exclure)
-                      </td>
-                    </tr>
+                    <PnlRow
+                      label="Achats Alimentaires"
+                      value={data.purchasesAlim}
+                      ratio={calculateRatio(data.purchasesAlim)}
+                      color="var(--orange)"
+                      note="Lignes factures (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('purchases_alim')}
+                    />
+                    <PnlRow
+                      label="Achats Boissons"
+                      value={data.purchasesBoisson}
+                      ratio={calculateRatio(data.purchasesBoisson)}
+                      color="var(--orange)"
+                      note="Lignes factures (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('purchases_boisson')}
+                    />
+                    <PnlRow
+                      label="Achats Emballages"
+                      value={data.purchasesEmballage}
+                      ratio={calculateRatio(data.purchasesEmballage)}
+                      color="var(--orange)"
+                      note="Consommables & emballages (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('purchases_emballage')}
+                    />
+                    <PnlRow
+                      label="Paiements Fournisseurs (flux direct)"
+                      value={data.bankSuppliersUnreconciled}
+                      ratio={calculateRatio(data.bankSuppliersUnreconciled)}
+                      color="var(--orange)"
+                      note="Dépenses banque sans factures PDF (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('bank_suppliers_unreconciled')}
+                    />
 
                     {/* SECTION 3: MARGE BRUTE */}
                     <tr style={{ background: '#E6F5ED', fontWeight: 800 }}>
@@ -981,30 +983,22 @@ export default function PnlPage() {
                       </td>
                       <td>Ressources Humaines</td>
                     </tr>
-                    <tr onClick={() => openDetail('labor_bank')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--red)' }} /> Salaires & Charges réels (Banque)
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.laborBank)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.laborBank))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                        Flux bancaires salaires (cliquer pour voir/exclure)
-                      </td>
-                    </tr>
-                    <tr onClick={() => openDetail('labor_timecards')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--red)' }} /> Salaires planifiés / Pointage (Timecards)
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.laborTimecards)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.laborTimecards))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                        Timecards Square (cliquer pour voir/exclure)
-                      </td>
-                    </tr>
+                    <PnlRow
+                      label="Salaires & Charges réels (Banque)"
+                      value={data.laborBank}
+                      ratio={calculateRatio(data.laborBank)}
+                      color="var(--red)"
+                      note="Flux bancaires salaires (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('labor_bank')}
+                    />
+                    <PnlRow
+                      label="Salaires planifiés / Pointage (Timecards)"
+                      value={data.laborTimecards}
+                      ratio={calculateRatio(data.laborTimecards)}
+                      color="var(--red)"
+                      note="Timecards Square (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('labor_timecards')}
+                    />
 
                     {/* SECTION 5: CHARGES FIXES */}
                     <tr style={{ background: 'var(--cream-light)', fontWeight: 700 }}>
@@ -1017,70 +1011,48 @@ export default function PnlPage() {
                       </td>
                       <td>Frais généraux & structure</td>
                     </tr>
-                    <tr onClick={() => openDetail('charges_loyer')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--text-secondary)' }} /> Loyers & Charges locatives
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.chargesLoyer)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.chargesLoyer))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loyers immobiliers (cliquer pour voir/exclure)</td>
-                    </tr>
-                    <tr onClick={() => openDetail('charges_assurance')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--text-secondary)' }} /> Assurances d&apos;exploitation
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.chargesAssurance)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.chargesAssurance))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>RC Pro, locaux (cliquer pour voir/exclure)</td>
-                    </tr>
-                    <tr onClick={() => openDetail('charges_abonnement')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--text-secondary)' }} /> Abonnements (Logiciels, internet...)
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.chargesAbonnement)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.chargesAbonnement))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>Outils SAAS, telecom (cliquer pour voir/exclure)</td>
-                    </tr>
-                    <tr onClick={() => openDetail('charges_impot')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--text-secondary)' }} /> Impôts & Taxes
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.chargesImpot)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.chargesImpot))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>Taxes foncières, impôts (cliquer pour voir/exclure)</td>
-                    </tr>
-                    <tr onClick={() => openDetail('purchases_materiel')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--text-secondary)' }} /> Achats de Matériel non immobilisé
-                      </td>
-                      <td style={{ textAlign: 'right' }}>{formatCurrency(data.purchasesMateriel)}</td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.purchasesMateriel))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>Factures matériel (cliquer pour voir/exclure)</td>
-                    </tr>
-                    <tr onClick={() => openDetail('charges_autre_bank')} style={{ cursor: 'pointer' }} className="interactive-row">
-                      <td style={{ paddingLeft: 32, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <Eye size={12} style={{ color: 'var(--text-secondary)' }} /> Frais divers & Autres charges
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
-                        {formatCurrency(data.chargesAutreBank + data.purchasesAutreInvoices)}
-                      </td>
-                      <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
-                        {formatPercent(calculateRatio(data.chargesAutreBank + data.purchasesAutreInvoices))}
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                        Banque & Factures divers (cliquer pour voir/exclure)
-                      </td>
-                    </tr>
+                    <PnlRow
+                      label="Loyers & Charges locatives"
+                      value={data.chargesLoyer}
+                      ratio={calculateRatio(data.chargesLoyer)}
+                      note="Loyers immobiliers (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('charges_loyer')}
+                    />
+                    <PnlRow
+                      label="Assurances d'exploitation"
+                      value={data.chargesAssurance}
+                      ratio={calculateRatio(data.chargesAssurance)}
+                      note="RC Pro, locaux (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('charges_assurance')}
+                    />
+                    <PnlRow
+                      label="Abonnements (Logiciels, internet...)"
+                      value={data.chargesAbonnement}
+                      ratio={calculateRatio(data.chargesAbonnement)}
+                      note="Outils SAAS, telecom (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('charges_abonnement')}
+                    />
+                    <PnlRow
+                      label="Impôts & Taxes"
+                      value={data.chargesImpot}
+                      ratio={calculateRatio(data.chargesImpot)}
+                      note="Taxes foncières, impôts (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('charges_impot')}
+                    />
+                    <PnlRow
+                      label="Achats de Matériel non immobilisé"
+                      value={data.purchasesMateriel}
+                      ratio={calculateRatio(data.purchasesMateriel)}
+                      note="Factures matériel (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('purchases_materiel')}
+                    />
+                    <PnlRow
+                      label="Frais divers & Autres charges"
+                      value={data.chargesAutreBank + data.purchasesAutreInvoices}
+                      ratio={calculateRatio(data.chargesAutreBank + data.purchasesAutreInvoices)}
+                      note="Banque & Factures divers (cliquer pour voir/exclure)"
+                      onClick={() => openDetail('charges_autre_bank')}
+                    />
 
                     {/* EBITDA */}
                     <tr style={{ 
@@ -1089,7 +1061,7 @@ export default function PnlPage() {
                       fontSize: 15
                     }}>
                       <td style={{ color: data.ebitda >= 0 ? 'var(--green)' : 'var(--red)' }}>
-                        EXCÉDENT BRUT D'EXPLOITATION (EBE / EBITDA)
+                        EXCÉDENT BRUT D&apos;EXPLOITATION (EBE / EBITDA)
                       </td>
                       <td style={{ 
                         textAlign: 'right', 

@@ -1,14 +1,33 @@
 import Anthropic from '@anthropic-ai/sdk';
+import type { MessageCreateParams } from '@anthropic-ai/sdk/resources/messages';
 
-export const PRIMARY_MODEL = 'claude-sonnet-4-6';
-export const FALLBACK_OPUS = 'claude-opus-4-6';
-export const FALLBACK_HAIKU = 'claude-haiku-4-5-20251001';
+/**
+ * anthropic.ts — Appel Claude avec bascule automatique en cas d'indisponibilité.
+ *
+ * Choix des modèles :
+ *  - Sonnet 5 en principal : vision haute résolution (2576 px contre 1568 px
+ *    sur Sonnet 4.6) au même tarif — la lecture des petits caractères sur une
+ *    photo de ticket y gagne nettement. Le « raisonnement » est désactivé :
+ *    l'OCR de facture n'en a pas besoin et il ferait grimper coût et latence.
+ *  - Opus 4.8 en secours (le plus capable), puis Haiku 4.5 (le plus rapide).
+ */
+
+export const PRIMARY_MODEL = 'claude-sonnet-5';
+export const FALLBACK_OPUS = 'claude-opus-4-8';
+export const FALLBACK_HAIKU = 'claude-haiku-4-5';
+
+const MODELS = [PRIMARY_MODEL, FALLBACK_OPUS, FALLBACK_HAIKU];
 
 interface ClaudeOptions {
-  messages: any[];
+  messages: MessageCreateParams['messages'];
   system?: string;
   max_tokens?: number;
-  temperature?: number;
+}
+
+/** Vrai si l'erreur justifie d'essayer le modèle suivant (surcharge, quota, panne). */
+function isTransient(e: { status?: number; message?: string }): boolean {
+  return e.status === 529 || e.status === 429 || e.status === 500
+    || !!e.message?.includes('Overloaded');
 }
 
 export async function createClaudeMessage(
@@ -16,33 +35,28 @@ export async function createClaudeMessage(
   options: ClaudeOptions
 ) {
   const maxTokens = options.max_tokens ?? 4096;
-  const modelsToTry = [PRIMARY_MODEL, FALLBACK_OPUS, FALLBACK_HAIKU];
-  let lastError: any = null;
+  let lastError: unknown = null;
 
-  for (let i = 0; i < modelsToTry.length; i++) {
-    const currentModel = modelsToTry[i];
+  for (let i = 0; i < MODELS.length; i++) {
+    const model = MODELS[i];
     try {
-      console.log(`[Claude API] Tentative avec le modèle : ${currentModel}`);
-      const response = await anthropic.messages.create({
-        ...options,
-        model: currentModel,
+      return await anthropic.messages.create({
+        model,
         max_tokens: maxTokens,
+        system: options.system,
+        messages: options.messages,
+        // Pas de raisonnement étendu : extraction structurée, pas de déduction.
+        thinking: { type: 'disabled' },
       });
-      return response;
     } catch (e: any) {
       lastError = e;
-      const isOverloaded = e.status === 529 || (e.message && e.message.includes('Overloaded'));
-      const isRateLimit = e.status === 429;
-      const isInternalError = e.status === 500;
+      console.error(`[Claude] Échec du modèle ${model} — code ${e.status} : ${e.message}`);
 
-      console.error(`[Claude API] Échec du modèle ${currentModel}. Code : ${e.status}, Erreur : ${e.message}`);
-
-      if (i < modelsToTry.length - 1 && (isOverloaded || isRateLimit || isInternalError)) {
-        console.warn(`[Claude API] Modèle ${currentModel} indisponible. Bascule vers le modèle de secours : ${modelsToTry[i + 1]}`);
-        continue;
-      }
-      throw e; // Lancer l'erreur s'il s'agit d'une erreur client (ex. 400 Bad Request) ou s'il n'y a plus de modèle de secours
+      // Erreur client (400, clé invalide…) → inutile d'essayer un autre modèle
+      if (i === MODELS.length - 1 || !isTransient(e)) throw e;
+      console.warn(`[Claude] Bascule vers le modèle de secours : ${MODELS[i + 1]}`);
     }
   }
+
   throw lastError;
 }
