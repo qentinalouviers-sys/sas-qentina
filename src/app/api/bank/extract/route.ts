@@ -137,8 +137,26 @@ export async function POST(request: NextRequest) {
     const response = await createClaudeMessage(anthropic, {
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: contentBlock }],
-      max_tokens: 4096,
+      // Un relevé mensuel produit facilement plus de 4 096 tokens de JSON :
+      // c'est l'ancienne valeur, et elle tronquait la réponse en silence.
+      max_tokens: 32000,
     });
+
+    // Réponse coupée par la limite de tokens. Le parseur sait « réparer » un
+    // JSON tronqué en le refermant au dernier objet complet — sur un relevé
+    // bancaire, ça importerait un relevé incomplet sans le dire. On refuse.
+    if (response.stop_reason === 'max_tokens') {
+      console.error('Bank extract: réponse tronquée (max_tokens atteint)');
+      return NextResponse.json(
+        {
+          error:
+            'Le relevé est trop long pour être traité en une fois. Découpe-le par mois '
+            + 'et importe les fichiers un par un — mieux vaut refuser que d’importer '
+            + 'un relevé incomplet sans le signaler.',
+        },
+        { status: 422 }
+      );
+    }
 
     const textContent = response.content.find(c => c.type === 'text');
     if (!textContent || textContent.type !== 'text') {
@@ -265,8 +283,14 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ success: true, count: insertedCount ?? toInsertRows.length });
 
-  } catch (error) {
+  } catch (error: any) {
     console.error('Bank extract error:', error);
-    return NextResponse.json({ error: 'Erreur extraction banque' }, { status: 500 });
+    // On renvoie la cause réelle : un « Erreur extraction banque » nu ne laisse
+    // que le code 500 à l'écran et fait chercher la panne au mauvais endroit.
+    const detail = error?.error?.error?.message || error?.message || 'erreur inconnue';
+    return NextResponse.json(
+      { error: `Erreur extraction banque : ${detail}` },
+      { status: error?.status === 429 ? 429 : 500 }
+    );
   }
 }

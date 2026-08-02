@@ -40,14 +40,19 @@ export async function createClaudeMessage(
   for (let i = 0; i < MODELS.length; i++) {
     const model = MODELS[i];
     try {
-      return await anthropic.messages.create({
+      // On passe par le streaming même si on attend la réponse complète :
+      // au-delà d'environ 16 000 tokens de sortie, une requête classique
+      // dépasse le délai HTTP du SDK et échoue sans rien renvoyer. Le
+      // streaming supprime ce plafond ; `finalMessage()` rend exactement le
+      // même objet qu'un appel non streamé.
+      return await anthropic.messages.stream({
         model,
         max_tokens: maxTokens,
         system: options.system,
         messages: options.messages,
         // Pas de raisonnement étendu : extraction structurée, pas de déduction.
         thinking: { type: 'disabled' },
-      });
+      }).finalMessage();
     } catch (e: any) {
       lastError = e;
       console.error(`[Claude] Échec du modèle ${model} — code ${e.status} : ${e.message}`);

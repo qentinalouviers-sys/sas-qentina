@@ -286,6 +286,31 @@ ligne à ligne et laisse l'index rejeter les doublons. Ce n'est donc pas une pan
 passe systématiquement par le chemin lent (un aller-retour par ligne au lieu d'un seul). À reprendre
 quand l'occasion se présentera.
 
+### Réponses IA tronquées : le bug le plus dangereux trouvé
+
+Toutes les extractions IA étaient plafonnées à **4 096 tokens de réponse**. Au-delà, Claude s'arrête
+au milieu du JSON. Or le parseur partagé « répare » un JSON tronqué en le refermant au dernier objet
+complet — le résultat est un JSON valide, accepté sans erreur, **amputé de sa fin**.
+
+Conséquence : un relevé bancaire ou une facture trop longue entrait en base **incomplet et
+silencieusement**. Pas de message, pas d'échec — juste des lignes manquantes. Sur une facture Metro
+de plus de cent lignes, cela fausse le stock, la liste de courses et la TVA sans qu'aucun indicateur
+ne bouge. C'est plus grave qu'une erreur visible : une erreur, on la corrige ; une donnée
+silencieusement fausse, on la comptabilise.
+
+Trois corrections :
+
+1. **Plafond porté à 32 000 tokens** sur l'import bancaire et l'OCR de factures.
+2. **Appels en streaming** (`lib/anthropic.ts`) : au-delà d'environ 16 000 tokens de sortie, une
+   requête classique dépasse le délai HTTP du SDK et échoue sans rien renvoyer. Le streaming lève ce
+   plafond ; la réponse obtenue est identique.
+3. **Troncature détectée et refusée.** Si Claude s'arrête sur la limite, l'import est rejeté avec un
+   message qui dit quoi faire (découper le relevé, scanner la facture en deux). Mieux vaut un refus
+   explicite qu'un import incomplet.
+
+Le message d'erreur de l'import bancaire renvoie désormais la cause réelle : il se contentait d'un
+« Erreur extraction banque » qui ne laissait qu'un code 500 à l'écran.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 - **Réconcilier le CA du Dashboard (TTC) et du P&L (HT)** : les deux pages affichent un « CA »

@@ -142,8 +142,19 @@ export async function runInvoiceOcr(files: OcrFile[]): Promise<ExtractedInvoiceD
         { type: 'text', text: 'Extrais les données de ces pages faisant partie du même document.' },
       ],
     }],
-    max_tokens: 4096,
+    // Une facture Metro peut compter plus de cent lignes : à 4 096 tokens
+    // (l'ancienne valeur) la réponse était tronquée, et le parseur la
+    // « réparait » en coupant les dernières lignes — la facture entrait alors
+    // en base incomplète, faussant le stock et la TVA sans aucun signal.
+    max_tokens: 32000,
   });
+
+  if (response.stop_reason === 'max_tokens') {
+    throw new Error(
+      'Facture trop longue pour être lue en une fois. Scanne-la en deux parties : '
+      + 'mieux vaut deux imports que des lignes manquantes sans avertissement.'
+    );
+  }
 
   const textContent = response.content.find((c: any) => c.type === 'text');
   if (!textContent || textContent.type !== 'text') {
