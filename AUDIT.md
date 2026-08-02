@@ -311,6 +311,46 @@ Trois corrections :
 Le message d'erreur de l'import bancaire renvoie désormais la cause réelle : il se contentait d'un
 « Erreur extraction banque » qui ne laissait qu'un code 500 à l'écran.
 
+### Le CSV bancaire est désormais lu directement, sans IA
+
+Un relevé exporté en CSV est **déjà structuré**. Le faire retranscrire ligne à ligne par une IA
+revenait à accepter un risque d'erreur sur des montants, pour un travail qu'une lecture de fichier
+fait exactement. Sur un relevé réel de deux mois (177 opérations), cela demandait environ 8 000
+tokens de réponse — au-dessus de l'ancien plafond, d'où l'échec.
+
+`src/lib/bank-csv.ts` lit le fichier directement : dates et montants sont exacts par construction.
+L'IA ne reçoit plus que les **libellés distincts** — 64 au lieu de 177 lignes — et ne fait que ce
+qu'elle fait mieux qu'une règle : deviner la catégorie comptable. Si le format n'est pas reconnu, le
+code retombe automatiquement sur l'extraction par IA ; les relevés PDF continuent de passer par elle.
+
+**Un second bug est apparu à la lecture du vrai fichier :** les lignes 1 et 179 ne sont pas des
+opérations mais les **soldes d'ouverture et de clôture**. Elles portent une date et un montant
+valides, et l'IA les importait comme deux recettes fantômes — faussant le rapprochement bancaire.
+Le lecteur les écarte (elles n'ont que quatre colonnes au lieu de huit).
+
+Contrôle de cohérence sur le relevé réel, la banque fournissant elle-même la somme de contrôle :
+
+| | |
+|---|---|
+| Solde d'ouverture imprimé | 1 768,44 € |
+| + somme des 177 opérations lues | 477,46 € |
+| = solde recalculé | **2 245,90 €** |
+| Solde de clôture imprimé | **2 245,90 €** |
+
+Concordance au centime. Ré-importer le même fichier n'ajoute aucune ligne.
+
+**La catégorisation passe d'abord par des règles locales.** Les libellés bancaires sont très
+répétitifs : une table de motifs (Square, Metro, Eurocibus, Carrefour, Urssaf, EDF, Verisure…)
+couvre les deux tiers des lignes instantanément et gratuitement. L'IA ne reçoit que les libellés
+inhabituels — 46 au lieu de 177 lignes.
+
+Conséquence utile, découverte le jour où le compte Anthropic s'est retrouvé à court de crédit :
+**l'import bancaire fonctionne même sans IA du tout.** Sur le relevé réel, sans un seul appel API,
+177 opérations sont importées avec des montants exacts et 120 d'entre elles déjà catégorisées, dont
+la totalité des encaissements Square. Les 57 restantes arrivent en « autre » et la réponse le
+signale. Un outil de gestion qui s'arrête net parce qu'un service tiers est indisponible est un
+outil fragile ; celui-ci se contente de perdre en confort.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 - **Réconcilier le CA du Dashboard (TTC) et du P&L (HT)** : les deux pages affichent un « CA »
