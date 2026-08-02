@@ -215,6 +215,15 @@ appliqué et emplacements de signature. Les en-têtes de tableau se répètent s
 motorisation, termes reconnus par fournisseur, et les taux du barème — ce dernier étant révisé
 chaque année par l'administration, le figer dans le code aurait créé un piège de maintenance.
 
+**Lien avec les Comptes Courants d'Associés.** Tant que le virement n'est pas fait, la société doit
+cet argent à l'associé : un bandeau affiche le montant dû et le bouton « Porter au compte courant »
+crée le mouvement correspondant (apport, sous-type « frais perso »). Le calcul se fait en
+**différentiel** — total dû moins déjà porté — ce qui gère proprement le cas où l'on enregistre en
+plusieurs fois : franchir 5 000 km en cours d'année recalcule le taux de tous les trajets, et l'écart
+est rattrapé au prochain enregistrement au lieu d'être perdu. Le jour où le virement est effectué, il
+se saisit comme un remboursement depuis la page Comptes Associés, comme n'importe quel autre
+mouvement.
+
 ⚠️ **Deux points à valider une fois :**
 - Les **distances sont pré-remplies avec des estimations** (56 km et 60 km aller-retour). Vérifie-les
   sur un calculateur d'itinéraire avec tes adresses exactes : en cas de contrôle, la distance doit

@@ -5,7 +5,7 @@ import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate, toISODate } from '@/lib/utils';
 import {
   Car, Plus, Trash2, Printer, RefreshCw, Settings, Save,
-  AlertTriangle, Coins, Route, Receipt, Check,
+  AlertTriangle, Coins, Route, Receipt, Check, Landmark,
 } from 'lucide-react';
 import { KpiCard, SectionHeader, Modal, EmptyState, LoadingPage } from '@/components/ui';
 import {
@@ -24,6 +24,7 @@ interface Trip {
   invoice_id: string | null;
   source: string;
   note: string | null;
+  cca_movement_id: string | null;
 }
 
 const CV_OPTIONS: { value: CvBracket; label: string }[] = [
@@ -53,18 +54,22 @@ export default function TrajetsPage() {
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState(EMPTY_FORM);
   const [detecting, setDetecting] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [ccaMovements, setCcaMovements] = useState<{ id: string; montant: number }[]>([]);
   const [message, setMessage] = useState<{ type: 'success' | 'warning'; text: string } | null>(null);
 
   // ── Chargement ────────────────────────────────────────────────────────────
   const loadData = useCallback(async () => {
     setLoading(true);
     const supabase = createClient();
-    const [tripsRes, settingsRes] = await Promise.all([
+    const [tripsRes, settingsRes, ccaRes] = await Promise.all([
       supabase.from('mileage_trips').select('*').order('date', { ascending: false }),
       supabase.from('app_settings').select('value').eq('key', 'mileage_config').maybeSingle(),
+      supabase.from('mouvements_cca').select('id, montant').eq('sous_type', 'frais_perso_reverse'),
     ]);
 
     setTrips((tripsRes.data as Trip[]) || []);
+    setCcaMovements((ccaRes.data as { id: string; montant: number }[]) || []);
 
     if (settingsRes.data?.value) {
       try {
@@ -231,6 +236,79 @@ export default function TrajetsPage() {
     [yearTrips, totals.totalKm, totals.allowance]
   );
 
+  // Montant déjà porté au compte courant pour cette année/ce conducteur.
+  const recorded = useMemo(() => {
+    const linked = new Set(yearTrips.map(t => t.cca_movement_id).filter(Boolean));
+    return Math.round(
+      ccaMovements.filter(m => linked.has(m.id)).reduce((s, m) => s + (Number(m.montant) || 0), 0) * 100
+    ) / 100;
+  }, [yearTrips, ccaMovements]);
+
+  // Reste à porter = total dû − déjà porté.
+  // Se corrige tout seul : le barème étant progressif, franchir 5 000 km
+  // relève le taux de TOUS les trajets de l'année ; l'écart est rattrapé au
+  // prochain enregistrement plutôt que perdu.
+  const remaining = Math.round((totals.total - recorded) * 100) / 100;
+
+  const recordToCca = async () => {
+    if (remaining <= 0) return;
+    const unrecorded = yearTrips.filter(t => !t.cca_movement_id);
+    if (unrecorded.length === 0 && remaining <= 0) return;
+
+    setRecording(true);
+    setMessage(null);
+    try {
+      const supabase = createClient();
+      const isPastYear = year < new Date().getFullYear();
+      const movementDate = isPastYear ? `${year}-12-31` : toISODate(new Date());
+
+      const { data: movement, error } = await supabase
+        .from('mouvements_cca')
+        .insert({
+          date: movementDate,
+          associe: driver,
+          sens: 'apport',
+          sous_type: 'frais_perso_reverse',
+          montant: remaining,
+          note: `Frais kilométriques ${year} — ${yearTrips.length} trajet${yearTrips.length > 1 ? 's' : ''}, `
+              + `${totals.totalKm.toLocaleString('fr-FR')} km`
+              + (totals.tolls > 0 ? ` + péages` : '')
+              + (recorded > 0 ? ` (complément)` : ''),
+          rapproche_banque: false,
+        })
+        .select('id')
+        .single();
+
+      if (error || !movement) throw error ?? new Error('Insertion impossible');
+
+      // On rattache les trajets non encore portés à ce mouvement.
+      if (unrecorded.length > 0) {
+        const { error: linkError } = await supabase
+          .from('mileage_trips')
+          .update({ cca_movement_id: movement.id })
+          .in('id', unrecorded.map(t => t.id));
+        if (linkError) throw linkError;
+      }
+
+      await loadData();
+      setMessage({
+        type: 'success',
+        text: `${formatCurrency(remaining)} porté au compte courant de ${driver === 'justine' ? 'Justine' : 'Yohan'}. `
+            + `Quand tu feras le virement, enregistre-le comme remboursement depuis la page Comptes Associés.`,
+      });
+    } catch (e: any) {
+      console.error('Enregistrement CCA:', e);
+      setMessage({
+        type: 'warning',
+        text: e?.message?.includes('cca_movement_id')
+          ? "Colonne manquante : relance db/migration_trajets.sql dans Supabase."
+          : `Enregistrement impossible : ${e?.message || 'erreur inconnue'}`,
+      });
+    } finally {
+      setRecording(false);
+    }
+  };
+
   const years = useMemo(() => {
     const set = new Set<number>([new Date().getFullYear()]);
     trips.forEach(t => { if (t.date) set.add(Number(t.date.slice(0, 4))); });
@@ -318,6 +396,42 @@ export default function TrajetsPage() {
             accentColor="#E89B3E"
           />
         </div>
+
+        {/* ── Compte courant d'associé ───────────────────────────────────── */}
+        {yearTrips.length > 0 && (
+          <div className="card no-print" style={{
+            marginBottom: 24,
+            borderLeft: `4px solid ${remaining > 0 ? 'var(--orange)' : 'var(--green)'}`,
+            display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap',
+          }}>
+            <Landmark size={22} style={{ color: remaining > 0 ? 'var(--orange)' : 'var(--green)', flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 240 }}>
+              <div style={{ fontWeight: 700, fontSize: 14 }}>
+                {remaining > 0
+                  ? `La société doit ${formatCurrency(remaining)} à ${driverName}`
+                  : `Tout est porté au compte courant de ${driverName}`}
+              </div>
+              <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginTop: 3 }}>
+                {recorded > 0 && (
+                  <>Déjà porté : <strong>{formatCurrency(recorded)}</strong> · </>
+                )}
+                Total {year} : <strong>{formatCurrency(totals.total)}</strong>
+                {remaining > 0 && (
+                  <> · tant que le virement n&apos;est pas fait, ce montant reste dû à l&apos;associé</>
+                )}
+              </div>
+            </div>
+            <button
+              className="btn btn-primary"
+              onClick={recordToCca}
+              disabled={recording || remaining <= 0}
+              style={{ flexShrink: 0 }}
+            >
+              <Landmark size={16} />
+              {recording ? 'Enregistrement…' : 'Porter au compte courant'}
+            </button>
+          </div>
+        )}
 
         {/* ── Note de frais (écran + impression) ─────────────────────────── */}
         <div className="expense-report">

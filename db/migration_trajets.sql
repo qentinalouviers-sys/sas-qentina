@@ -18,13 +18,21 @@ CREATE TABLE IF NOT EXISTS mileage_trips (
   -- par destination, même si la détection automatique est relancée ou si
   -- plusieurs factures du même fournisseur existent le même jour.
   dedupe_key text,
+  -- Mouvement de compte courant d'associé qui a comptabilisé ce trajet.
+  -- NULL = pas encore porté au compte courant.
+  cca_movement_id uuid REFERENCES mouvements_cca(id) ON DELETE SET NULL,
   created_at timestamptz DEFAULT now()
 );
+
+-- Si la table existait déjà sans cette colonne (première version du module)
+ALTER TABLE mileage_trips ADD COLUMN IF NOT EXISTS cca_movement_id uuid
+  REFERENCES mouvements_cca(id) ON DELETE SET NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mileage_trips_dedupe
   ON mileage_trips(dedupe_key) WHERE dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_mileage_trips_date ON mileage_trips(date);
 CREATE INDEX IF NOT EXISTS idx_mileage_trips_driver ON mileage_trips(driver);
+CREATE INDEX IF NOT EXISTS idx_mileage_trips_cca ON mileage_trips(cca_movement_id);
 
 ALTER TABLE mileage_trips ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Authenticated users full access" ON mileage_trips;
@@ -37,4 +45,8 @@ SELECT
   EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'mileage_trips') AS ok
 UNION ALL
 SELECT 'index anti-doublon',
-  EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_mileage_trips_dedupe');
+  EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_mileage_trips_dedupe')
+UNION ALL
+SELECT 'lien compte courant associé',
+  EXISTS (SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'mileage_trips' AND column_name = 'cca_movement_id');
