@@ -1,0 +1,111 @@
+/**
+ * bank-csv.ts — Lecture déterministe d'un export CSV de relevé bancaire.
+ *
+ * Pourquoi ne pas laisser l'IA lire le CSV : un export bancaire est déjà
+ * structuré. Lui faire retranscrire chaque ligne, c'est accepter un risque
+ * d'erreur sur des montants — et se heurter à la limite de tokens dès qu'un
+ * relevé dépasse quelques dizaines d'opérations. Ici les dates et les montants
+ * sont lus caractère par caractère : ils sont exacts par construction.
+ *
+ * L'IA reste utile pour ce qu'elle fait mieux qu'une règle : deviner la
+ * catégorie comptable d'un libellé. On ne lui envoie donc que les libellés
+ * DISTINCTS (65 pour 177 lignes sur un relevé réel), pas les lignes.
+ */
+
+export interface ParsedBankRow {
+  /** Format ISO YYYY-MM-DD. */
+  date: string;
+  /** Libellé tel qu'il sera enregistré (espaces normalisés). */
+  description: string;
+  /** Négatif pour une dépense. */
+  amount: number;
+  /** Libellé normalisé servant de clé de catégorisation. */
+  categoryKey: string;
+}
+
+export interface BankCsvResult {
+  rows: ParsedBankRow[];
+  /** Lignes écartées : soldes d'ouverture/clôture, en-têtes, lignes vides. */
+  skipped: number;
+}
+
+const DATE_RE = /^(\d{2})\/(\d{2})\/(\d{4})$/;
+const AMOUNT_RE = /^-?\d+(?:[.,]\d+)?$/;
+
+/** Espaces multiples réduits à un seul, bords coupés. */
+function squash(s: string): string {
+  return (s || '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Clé de regroupement d'un libellé pour la catégorisation.
+ * « CB42METRO FRANCE     04/06/26 » et « CB42METRO FRANCE  19/06/26 » sont le
+ * même commerçant : on retire le préfixe du terminal carte et la date de
+ * transaction collée en fin de libellé.
+ */
+export function categoryKeyOf(label: string): string {
+  return squash(label)
+    .replace(/\s*\d{2}\/\d{2}\/\d{2,4}$/, '')
+    .replace(/^CB\d+/i, '')
+    .trim()
+    .toUpperCase();
+}
+
+/**
+ * Lit un export CSV de relevé bancaire.
+ *
+ * Renvoie un tableau vide si le format n'est pas reconnu — l'appelant peut
+ * alors basculer sur l'extraction par IA plutôt que d'échouer.
+ */
+export function parseBankCsv(text: string): BankCsvResult {
+  // Les exports bancaires sont souvent en UTF-8 avec BOM : sans ça, la
+  // première date devient « ﻿01/06/2026 » et la ligne est rejetée.
+  const clean = (text || '').replace(/^﻿/, '');
+  const lines = clean.split(/\r?\n/).filter(l => l.trim());
+
+  const rows: ParsedBankRow[] = [];
+  let skipped = 0;
+
+  for (const line of lines) {
+    const f = line.split(';');
+
+    // Les lignes de solde d'ouverture et de clôture portent une date et un
+    // montant valides mais seulement quatre colonnes. Sans ce filtre, elles
+    // entreraient en base comme deux opérations fantômes.
+    if (f.length < 6) { skipped++; continue; }
+
+    const dateMatch = f[0]?.trim().match(DATE_RE);
+    const rawAmount = f[1]?.trim() ?? '';
+    if (!dateMatch || !AMOUNT_RE.test(rawAmount)) { skipped++; continue; }
+
+    const amount = parseFloat(rawAmount.replace(',', '.'));
+    if (!Number.isFinite(amount)) { skipped++; continue; }
+
+    // Selon le type d'opération, la banque écrit le libellé en 5ᵉ colonne
+    // (carte, prélèvement) ou en 6ᵉ (virement SEPA).
+    const description = squash(f[4]) || squash(f[5]) || squash(f[2]) || 'Opération';
+
+    const [, dd, mm, yyyy] = dateMatch;
+    rows.push({
+      date: `${yyyy}-${mm}-${dd}`,
+      description,
+      amount: Math.round(amount * 100) / 100,
+      categoryKey: categoryKeyOf(description),
+    });
+  }
+
+  return { rows, skipped };
+}
+
+/** Libellés distincts à soumettre à la catégorisation, dans l'ordre d'apparition. */
+export function distinctCategoryKeys(rows: ParsedBankRow[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const r of rows) {
+    if (r.categoryKey && !seen.has(r.categoryKey)) {
+      seen.add(r.categoryKey);
+      out.push(r.categoryKey);
+    }
+  }
+  return out;
+}

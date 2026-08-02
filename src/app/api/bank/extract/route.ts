@@ -4,6 +4,75 @@ import { createServiceRoleClient } from '@/lib/supabase/server';
 import { requireUser } from '@/lib/supabase/api-auth';
 import { createClaudeMessage } from '@/lib/anthropic';
 import { extractJson } from '@/lib/ai/json';
+import { parseBankCsv, distinctCategoryKeys, type ParsedBankRow } from '@/lib/bank-csv';
+
+const CATEGORIES = [
+  'fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'variable_fournisseur',
+  'variable_salaire', 'impot_taxe', 'recette', 'autre',
+] as const;
+
+const CATEGORY_PROMPT = `Tu catégorises des libellés d'opérations bancaires pour un restaurant.
+
+On te donne une liste de libellés. Renvoie UNIQUEMENT un JSON de la forme :
+{ "categories": { "LIBELLÉ EXACT": "categorie", ... } }
+
+Catégories autorisées : ${CATEGORIES.join(' | ')}
+
+Règles :
+- fixe_loyer : loyers, charges locatives
+- fixe_assurance : assurances
+- fixe_abonnement : internet, téléphone, électricité, eau, gaz, logiciels, télésurveillance
+- variable_fournisseur : achats de marchandises (Metro, Mozzalat, Eurocibus, grossistes,
+  supermarchés, boucheries, primeurs)
+- variable_salaire : salaires, acomptes
+- impot_taxe : URSSAF, impôts, TVA, cotisations
+- recette : encaissements Square, Stripe, UberEats, Deliveroo, remises de chèques
+- autre : virements personnels, frais bancaires, retraits
+
+Reprends les libellés EXACTEMENT tels qu'ils te sont donnés, sans les reformuler.`;
+
+/**
+ * Catégorise les libellés distincts d'un relevé.
+ *
+ * En cas d'échec on ne fait pas échouer l'import : les montants et les dates
+ * sont déjà exacts, et une catégorie se corrige en deux clics dans l'écran
+ * Banque — perdre le relevé entier serait bien plus coûteux.
+ */
+async function categorizeLabels(
+  anthropic: Anthropic,
+  labels: string[]
+): Promise<Record<string, string> | null> {
+  if (labels.length === 0) return {};
+  try {
+    const response = await createClaudeMessage(anthropic, {
+      system: CATEGORY_PROMPT,
+      messages: [{ role: 'user', content: `Libellés à catégoriser :\n${labels.join('\n')}` }],
+      max_tokens: 8000,
+    });
+    if (response.stop_reason === 'max_tokens') return null;
+
+    const textContent = response.content.find(c => c.type === 'text');
+    if (!textContent || textContent.type !== 'text') return null;
+
+    const parsed = extractJson<{ categories?: Record<string, string> }>(textContent.text);
+    return parsed?.categories ?? null;
+  } catch (e) {
+    console.error('Catégorisation des libellés impossible:', e);
+    return null;
+  }
+}
+
+/** Applique les catégories aux lignes lues, avec un repli raisonnable. */
+function toTransactions(rows: ParsedBankRow[], categories: Record<string, string> | null) {
+  const allowed = new Set<string>(CATEGORIES);
+  return rows.map(r => {
+    const guess = categories?.[r.categoryKey];
+    const category = guess && allowed.has(guess)
+      ? guess
+      : (r.amount > 0 ? 'recette' : 'autre');
+    return { date: r.date, description: r.description, amount: r.amount, category };
+  });
+}
 
 const SYSTEM_PROMPT = `Tu es un assistant d'analyse bancaire pour un restaurant.
 Analyse ce PDF de relevé de compte et extrait chaque ligne de transaction de manière très structurée.
@@ -109,6 +178,28 @@ export async function POST(request: NextRequest) {
 
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+    // ── Voie rapide : CSV lu directement ───────────────────────────────────
+    // Un export bancaire est déjà structuré. Le lire nous-mêmes rend les dates
+    // et les montants exacts par construction, écarte les lignes de solde
+    // d'ouverture et de clôture (qui entreraient sinon comme des opérations
+    // fantômes), et supprime toute limite de taille. L'IA ne sert plus qu'à
+    // catégoriser les libellés distincts — 64 appels de contexte au lieu de 177
+    // lignes à retranscrire. Si le format n'est pas reconnu, on retombe sur
+    // l'extraction par IA plus bas.
+    let csvExtracted: { transactions: any[] } | null = null;
+    let csvDegraded = false;
+    if (csvText) {
+      const { rows, skipped } = parseBankCsv(csvText);
+      if (rows.length > 0) {
+        const categories = await categorizeLabels(anthropic, distinctCategoryKeys(rows));
+        csvDegraded = categories === null;
+        csvExtracted = { transactions: toTransactions(rows, categories) };
+        console.info(
+          `Bank CSV lu directement : ${rows.length} opérations, ${skipped} ligne(s) de solde écartée(s)`
+        );
+      }
+    }
+
     let contentBlock: any[] = [];
     if (pdfBase64) {
       contentBlock = [
@@ -134,44 +225,50 @@ export async function POST(request: NextRequest) {
       ];
     }
 
-    const response = await createClaudeMessage(anthropic, {
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: contentBlock }],
-      // Un relevé mensuel produit facilement plus de 4 096 tokens de JSON :
-      // c'est l'ancienne valeur, et elle tronquait la réponse en silence.
-      max_tokens: 32000,
-    });
+    let extracted: any;
 
-    // Réponse coupée par la limite de tokens. Le parseur sait « réparer » un
-    // JSON tronqué en le refermant au dernier objet complet — sur un relevé
-    // bancaire, ça importerait un relevé incomplet sans le dire. On refuse.
-    if (response.stop_reason === 'max_tokens') {
-      console.error('Bank extract: réponse tronquée (max_tokens atteint)');
-      return NextResponse.json(
-        {
-          error:
-            'Le relevé est trop long pour être traité en une fois. Découpe-le par mois '
-            + 'et importe les fichiers un par un — mieux vaut refuser que d’importer '
-            + 'un relevé incomplet sans le signaler.',
-        },
-        { status: 422 }
-      );
-    }
+    if (csvExtracted) {
+      extracted = csvExtracted;
+    } else {
+      // Voie IA : PDF, ou CSV dont le format n'a pas été reconnu.
+      const response = await createClaudeMessage(anthropic, {
+        system: SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: contentBlock }],
+        // Un relevé mensuel produit facilement plus de 4 096 tokens de JSON :
+        // c'est l'ancienne valeur, et elle tronquait la réponse en silence.
+        max_tokens: 32000,
+      });
 
-    const textContent = response.content.find(c => c.type === 'text');
-    if (!textContent || textContent.type !== 'text') {
-      return NextResponse.json({ error: 'Réponse Claude invalide' }, { status: 500 });
-    }
+      // Réponse coupée par la limite de tokens. Le parseur sait « réparer » un
+      // JSON tronqué en le refermant au dernier objet complet — sur un relevé
+      // bancaire, ça importerait un relevé incomplet sans le dire. On refuse.
+      if (response.stop_reason === 'max_tokens') {
+        console.error('Bank extract: réponse tronquée (max_tokens atteint)');
+        return NextResponse.json(
+          {
+            error:
+              'Le relevé est trop long pour être traité en une fois. Découpe-le par mois '
+              + 'et importe les fichiers un par un — mieux vaut refuser que d’importer '
+              + 'un relevé incomplet sans le signaler.',
+          },
+          { status: 422 }
+        );
+      }
 
-    let extracted;
-    try {
-      extracted = parseBankJson(textContent.text);
-    } catch {
-      console.error('Failed to parse Claude JSON response. Raw text:', textContent.text);
-      return NextResponse.json(
-        { error: 'JSON non parsable après tentative de réparation' },
-        { status: 500 }
-      );
+      const textContent = response.content.find(c => c.type === 'text');
+      if (!textContent || textContent.type !== 'text') {
+        return NextResponse.json({ error: 'Réponse Claude invalide' }, { status: 500 });
+      }
+
+      try {
+        extracted = parseBankJson(textContent.text);
+      } catch {
+        console.error('Failed to parse Claude JSON response. Raw text:', textContent.text);
+        return NextResponse.json(
+          { error: 'JSON non parsable après tentative de réparation' },
+          { status: 500 }
+        );
+      }
     }
 
     if (!extracted.transactions || !Array.isArray(extracted.transactions)) {
@@ -253,6 +350,13 @@ export async function POST(request: NextRequest) {
       });
     }
 
+    // Les montants sont exacts même quand la catégorisation a échoué : on
+    // importe, mais on le dit, pour que les catégories soient revues.
+    const degradedNote = csvDegraded
+      ? 'Opérations importées avec des montants exacts, mais les catégories n’ont pas pu '
+        + 'être déterminées : vérifie-les dans la liste.'
+      : undefined;
+
     // ── STEP 4 : Insert with upsert + ON CONFLICT DO NOTHING ──────────────
     // The DB-level unique index (migration_dedup.sql) is the ultimate safety net.
     // ignoreDuplicates: true maps to ON CONFLICT DO NOTHING.
@@ -278,10 +382,14 @@ export async function POST(request: NextRequest) {
           console.error('Row insert error (non-duplicate):', rowErr);
         }
       }
-      return NextResponse.json({ success: true, count: fallbackCount });
+      return NextResponse.json({ success: true, count: fallbackCount, message: degradedNote });
     }
 
-    return NextResponse.json({ success: true, count: insertedCount ?? toInsertRows.length });
+    return NextResponse.json({
+      success: true,
+      count: insertedCount ?? toInsertRows.length,
+      message: degradedNote,
+    });
 
   } catch (error: any) {
     console.error('Bank extract error:', error);
