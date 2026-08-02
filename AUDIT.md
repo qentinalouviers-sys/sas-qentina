@@ -339,6 +339,18 @@ Contrôle de cohérence sur le relevé réel, la banque fournissant elle-même l
 
 Concordance au centime. Ré-importer le même fichier n'ajoute aucune ligne.
 
+**La catégorisation passe d'abord par des règles locales.** Les libellés bancaires sont très
+répétitifs : une table de motifs (Square, Metro, Eurocibus, Carrefour, Urssaf, EDF, Verisure…)
+couvre les deux tiers des lignes instantanément et gratuitement. L'IA ne reçoit que les libellés
+inhabituels — 46 au lieu de 177 lignes.
+
+Conséquence utile, découverte le jour où le compte Anthropic s'est retrouvé à court de crédit :
+**l'import bancaire fonctionne même sans IA du tout.** Sur le relevé réel, sans un seul appel API,
+177 opérations sont importées avec des montants exacts et 120 d'entre elles déjà catégorisées, dont
+la totalité des encaissements Square. Les 57 restantes arrivent en « autre » et la réponse le
+signale. Un outil de gestion qui s'arrête net parce qu'un service tiers est indisponible est un
+outil fragile ; celui-ci se contente de perdre en confort.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 - **Réconcilier le CA du Dashboard (TTC) et du P&L (HT)** : les deux pages affichent un « CA »

@@ -97,6 +97,66 @@ export function parseBankCsv(text: string): BankCsvResult {
   return { rows, skipped };
 }
 
+/**
+ * Catégorisation par règles, sans appel à l'IA.
+ *
+ * Les libellés bancaires sont très répétitifs : sur un relevé réel, une
+ * poignée de motifs couvre la grande majorité des lignes. Les traiter ici rend
+ * l'import instantané, gratuit, déterministe — et surtout **fonctionnel même
+ * quand l'API Claude est indisponible ou à court de crédit**. L'IA n'est
+ * sollicitée que pour ce que les règles ne reconnaissent pas.
+ *
+ * L'ordre compte : le premier motif trouvé gagne, du plus spécifique au plus
+ * général.
+ */
+const RULES: { category: string; terms: string[] }[] = [
+  { category: 'recette', terms: [
+    'squareup', 'square', 'stripe', 'ubereats', 'uber eats', 'deliveroo',
+    'just eat', 'remise cheque', 'remise de cheque', 'rem chq', 'remise chq',
+  ]},
+  { category: 'impot_taxe', terms: [
+    'urssaf', 'dgfip', 'impot', 'impots', 'tresor public', 'tva', 'rsi', 'cotisation',
+  ]},
+  { category: 'fixe_assurance', terms: [
+    'assurance', 'axa', 'maaf', 'macif', 'allianz', 'generali', 'groupama', 'mma', 'swisslife',
+    // IARD = incendie, accidents et risques divers : terme du métier de l'assurance.
+    'abeille', 'iard',
+  ]},
+  { category: 'fixe_abonnement', terms: [
+    'verisure', 'abon', 'orange', 'sfr', 'bouygues', 'free ', 'edf', 'engie', 'totalenergies',
+    'electricite', 'veolia', 'suez', 'internet', 'telecom', 'spotify', 'adobe',
+    'google', 'microsoft',
+  ]},
+  { category: 'fixe_loyer', terms: ['loyer', 'sci ', 'bail'] },
+  { category: 'variable_salaire', terms: ['salaire', 'paie', 'acompte', 'remuneration'] },
+  { category: 'variable_fournisseur', terms: [
+    'metro', 'euro cibus', 'eurocibus', 'mozzalat', 'promocash', 'transgourmet',
+    'carrefour', 'intermarche', 'leclerc', 'auchan', 'lidl', 'aldi', 'grand frais',
+    'butcher', 'boucherie', 'primeur', 'entrepots', 'brake', 'pomona', 'davigel',
+  ]},
+];
+
+/** Retire les accents et met en minuscules, pour comparer des libellés. */
+function fold(s: string): string {
+  return (s || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // marques diacritiques combinantes
+    .toLowerCase();
+}
+
+/**
+ * Catégorie déduite d'un libellé, ou `null` si aucune règle ne s'applique.
+ * Ce sont des valeurs par défaut : elles se corrigent dans l'écran Banque.
+ */
+export function categoryFromRules(label: string): string | null {
+  const l = fold(label);
+  if (!l) return null;
+  for (const rule of RULES) {
+    if (rule.terms.some(t => l.includes(t))) return rule.category;
+  }
+  return null;
+}
+
 /** Libellés distincts à soumettre à la catégorisation, dans l'ordre d'apparition. */
 export function distinctCategoryKeys(rows: ParsedBankRow[]): string[] {
   const seen = new Set<string>();

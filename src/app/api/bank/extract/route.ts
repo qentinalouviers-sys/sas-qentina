@@ -4,7 +4,9 @@ import { createServiceRoleClient } from '@/lib/supabase/server';
 import { requireUser } from '@/lib/supabase/api-auth';
 import { createClaudeMessage } from '@/lib/anthropic';
 import { extractJson } from '@/lib/ai/json';
-import { parseBankCsv, distinctCategoryKeys, type ParsedBankRow } from '@/lib/bank-csv';
+import {
+  parseBankCsv, distinctCategoryKeys, categoryFromRules, type ParsedBankRow,
+} from '@/lib/bank-csv';
 
 const CATEGORIES = [
   'fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'variable_fournisseur',
@@ -62,14 +64,21 @@ async function categorizeLabels(
   }
 }
 
-/** Applique les catégories aux lignes lues, avec un repli raisonnable. */
+/**
+ * Applique les catégories aux lignes lues.
+ *
+ * Ordre de priorité : règle locale, puis réponse de l'IA, puis repli sur le
+ * sens du montant. Les règles passent devant parce qu'elles sont sûres et
+ * gratuites ; l'IA ne tranche que ce qu'elles ne reconnaissent pas.
+ */
 function toTransactions(rows: ParsedBankRow[], categories: Record<string, string> | null) {
   const allowed = new Set<string>(CATEGORIES);
   return rows.map(r => {
-    const guess = categories?.[r.categoryKey];
-    const category = guess && allowed.has(guess)
-      ? guess
-      : (r.amount > 0 ? 'recette' : 'autre');
+    const byRule = categoryFromRules(r.categoryKey);
+    const byAi = categories?.[r.categoryKey];
+    const category = byRule
+      ?? (byAi && allowed.has(byAi) ? byAi : null)
+      ?? (r.amount > 0 ? 'recette' : 'autre');
     return { date: r.date, description: r.description, amount: r.amount, category };
   });
 }
@@ -191,11 +200,15 @@ export async function POST(request: NextRequest) {
     if (csvText) {
       const { rows, skipped } = parseBankCsv(csvText);
       if (rows.length > 0) {
-        const categories = await categorizeLabels(anthropic, distinctCategoryKeys(rows));
-        csvDegraded = categories === null;
+        // Les règles locales couvrent la majorité des libellés sans rien
+        // coûter ; on ne soumet à l'IA que ceux qu'elles ne reconnaissent pas.
+        const unknown = distinctCategoryKeys(rows).filter(k => !categoryFromRules(k));
+        const categories = await categorizeLabels(anthropic, unknown);
+        csvDegraded = categories === null && unknown.length > 0;
         csvExtracted = { transactions: toTransactions(rows, categories) };
         console.info(
-          `Bank CSV lu directement : ${rows.length} opérations, ${skipped} ligne(s) de solde écartée(s)`
+          `Bank CSV lu directement : ${rows.length} opérations, ${skipped} ligne(s) de solde `
+          + `écartée(s), ${unknown.length} libellé(s) soumis à l'IA`
         );
       }
     }
@@ -353,8 +366,9 @@ export async function POST(request: NextRequest) {
     // Les montants sont exacts même quand la catégorisation a échoué : on
     // importe, mais on le dit, pour que les catégories soient revues.
     const degradedNote = csvDegraded
-      ? 'Opérations importées avec des montants exacts, mais les catégories n’ont pas pu '
-        + 'être déterminées : vérifie-les dans la liste.'
+      ? 'Montants et dates exacts, et les libellés courants ont été catégorisés par règles. '
+        + 'Les libellés inhabituels n’ont pas pu l’être (IA indisponible) : ils sont en '
+        + '« autre », à revoir dans la liste.'
       : undefined;
 
     // ── STEP 4 : Insert with upsert + ON CONFLICT DO NOTHING ──────────────
