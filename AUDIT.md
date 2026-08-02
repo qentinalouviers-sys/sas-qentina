@@ -147,13 +147,52 @@ Pour revenir en arrière, une seule ligne à changer dans `src/lib/anthropic.ts`
 - **Nettoyage** : 25 scripts de débogage et le dossier `scratch/` supprimés (ils restent dans
   l'historique git si besoin).
 
+## 6 bis. Déploiement (Vercel)
+
+L'app tourne sur Vercel. Deux points valent d'être connus :
+
+- **`src/middleware.ts` n'existe plus** : renommé en **`src/proxy.ts`**, la convention officielle de
+  Next.js 16 (`middleware` y est déprécié, un codemod dédié existe). Vérifié sur un vrai serveur de
+  production : `/dashboard` renvoie bien 307 vers `/login`, les API renvoient 401, `/login` reste
+  accessible. Pense à corriger ta documentation interne si elle cite l'ancien nom.
+- **Les déploiements de prévisualisation** ont une URL différente à chaque branche : le webhook
+  Square n'y sera pas validé. C'est normal, seule la production reçoit les événements Square.
+
+### `NEXT_PUBLIC_APP_URL` : la variable qui casse tout en silence
+
+Elle sert à **deux vérifications de sécurité** : la signature HMAC du webhook Square, et la
+redirection OAuth Google. Si elle manquait, la signature était calculée sur
+`undefined/api/square/webhook` et Square recevait un `401 Invalid signature` — un message trompeur
+qui accuse Square alors que la cause est une variable oubliée.
+
+Le code est désormais défensif (`src/lib/env.ts`) :
+
+| Situation | Comportement |
+|---|---|
+| Variable définie | Fonctionnement normal |
+| Absente, mais sur Vercel | Repli automatique sur `VERCEL_PROJECT_PRODUCTION_URL` + avertissement dans les logs |
+| Absente hors Vercel, en production | **503** explicite (« Configuration serveur incomplète ») au lieu d'un 401 trompeur ; Square réessaiera une fois la variable ajoutée |
+| Absente en développement | `http://localhost:3000` |
+
+**Pour vérifier ta configuration sans attendre une panne** : connecte-toi puis ouvre
+`/api/scanner/health`. Le bloc `config` liste les variables manquantes et leur impact, sans jamais
+révéler la moindre valeur secrète.
+
+```json
+{ "config": { "ok": true, "app_url": "https://…", "missing_required": [], "missing_optional": [] } }
+```
+
 ## 7. ⚠️ ACTION REQUISE DE TA PART
 
 1. **Exécute `db/migration_consolidee.sql`** dans Supabase → SQL Editor (une seule fois).
    Le code n'a plus de « plan B » : sans cette migration, l'enregistrement de factures échouera.
-2. **Vérifie que `SQUARE_WEBHOOK_SECRET` est bien renseigné** dans tes variables d'environnement
+2. **Ajoute `NEXT_PUBLIC_APP_URL`** dans Vercel → Settings → Environment Variables (Production),
+   avec ton domaine exact, sans barre oblique finale. Elle doit être identique dans le Square
+   Developer Dashboard et la Google Cloud Console.
+3. **Vérifie que `SQUARE_WEBHOOK_SECRET` est bien renseigné** dans tes variables d'environnement
    (Vercel) — c'est lui qui authentifie les événements envoyés par Square.
-3. Redéploie l'application.
+4. Redéploie, puis ouvre `/api/scanner/health` (connecté) : le bloc `config` doit afficher
+   `"ok": true`.
 
 ## 8. Pistes pour la suite (non faites, à discuter)
 

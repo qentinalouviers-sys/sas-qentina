@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import crypto from 'crypto';
 import { requireUser } from '@/lib/supabase/api-auth';
+import { getAppUrl } from '@/lib/env';
 
 /**
  * Démarre le flux OAuth Google (Business Profile).
@@ -11,8 +12,17 @@ export async function GET() {
   const auth = await requireUser();
   if (auth.error) return auth.error;
 
+  let redirectUri: string;
+  try {
+    // En production, mieux vaut une erreur claire qu'une redirection
+    // silencieuse vers localhost (que Google refuserait de toute façon).
+    redirectUri = `${getAppUrl()}/api/google/callback`;
+  } catch (e: any) {
+    console.error('[Google OAuth]', e.message);
+    return NextResponse.json({ error: 'Configuration serveur incomplète', details: e.message }, { status: 503 });
+  }
+
   const clientId = process.env.GOOGLE_CLIENT_ID;
-  const redirectUri = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/google/callback`;
   const scope = 'https://www.googleapis.com/auth/business.manage';
   const state = crypto.randomBytes(24).toString('hex');
 

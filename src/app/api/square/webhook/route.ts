@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { squareFetch, upsertSquareOrder } from '@/lib/square';
+import { tryGetAppUrl } from '@/lib/env';
 
 /**
  * Webhook Square — reçoit les événements de paiement/commande en temps réel.
@@ -19,7 +20,25 @@ export async function POST(request: NextRequest) {
       if (!signature) {
         return NextResponse.json({ error: 'Missing signature' }, { status: 401 });
       }
-      const notificationUrl = `${process.env.NEXT_PUBLIC_APP_URL}/api/square/webhook`;
+
+      // Sans URL publique, la signature serait calculée sur « undefined/... »
+      // et échouerait systématiquement. On répond 503 (problème de
+      // configuration côté serveur) plutôt qu'un 401 trompeur : Square
+      // réessaiera une fois la variable ajoutée.
+      const appUrl = tryGetAppUrl();
+      if (!appUrl) {
+        console.error(
+          '[Square Webhook] NEXT_PUBLIC_APP_URL est absent : impossible de vérifier la signature. ' +
+          'Les ventes en temps réel sont REJETÉES tant que la variable n\'est pas définie sur Vercel ' +
+          '(Settings → Environment Variables), avec la même valeur que dans le Square Developer Dashboard.'
+        );
+        return NextResponse.json(
+          { error: 'Configuration serveur incomplète : NEXT_PUBLIC_APP_URL manquant' },
+          { status: 503 }
+        );
+      }
+
+      const notificationUrl = `${appUrl}/api/square/webhook`;
       const expected = crypto
         .createHmac('sha256', webhookSecret)
         .update(notificationUrl + body)

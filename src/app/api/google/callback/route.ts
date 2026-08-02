@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { requireUser } from '@/lib/supabase/api-auth';
+import { getAppUrl } from '@/lib/env';
 
 /**
  * Retour du flux OAuth Google : échange le code contre les jetons,
@@ -22,9 +23,19 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Invalid OAuth state' }, { status: 400 });
   }
 
+  // Doit être rigoureusement identique à l'URI envoyée à l'étape /auth,
+  // sinon Google refuse l'échange du code.
+  let appUrl: string;
+  try {
+    appUrl = getAppUrl();
+  } catch (e: any) {
+    console.error('[Google OAuth]', e.message);
+    return NextResponse.json({ error: 'Configuration serveur incomplète', details: e.message }, { status: 503 });
+  }
+
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/google/callback`;
+  const redirectUri = `${appUrl}/api/google/callback`;
 
   try {
     const res = await fetch('https://oauth2.googleapis.com/token', {
@@ -51,7 +62,7 @@ export async function GET(request: NextRequest) {
     const expiry = Date.now() + (data.expires_in * 1000);
     await supabase.from('app_settings').upsert({ key: 'google_access_token', value: JSON.stringify({ token: data.access_token, expiry }) });
 
-    const response = NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/avis?google_auth=success`);
+    const response = NextResponse.redirect(`${appUrl}/avis?google_auth=success`);
     response.cookies.delete('google_oauth_state');
     return response;
   } catch (error: any) {

@@ -1,7 +1,45 @@
 import { NextResponse } from 'next/server';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { requireUser } from '@/lib/supabase/api-auth';
+import { tryGetAppUrl } from '@/lib/env';
 import Anthropic from '@anthropic-ai/sdk';
+
+/**
+ * Contrôle des variables d'environnement : indique ce qui est configuré
+ * sans jamais révéler la moindre valeur secrète.
+ */
+function checkConfig() {
+  const required: { variable: string; impact: string }[] = [
+    { variable: 'NEXT_PUBLIC_SUPABASE_URL', impact: 'Base de données' },
+    { variable: 'NEXT_PUBLIC_SUPABASE_ANON_KEY', impact: 'Base de données' },
+    { variable: 'SUPABASE_SERVICE_ROLE_KEY', impact: 'Base de données (serveur)' },
+    { variable: 'ANTHROPIC_API_KEY', impact: 'Scanner IA & Fuego' },
+    { variable: 'SQUARE_ACCESS_TOKEN', impact: 'Ventes Square' },
+    { variable: 'SQUARE_LOCATION_ID', impact: 'Ventes Square' },
+    { variable: 'SQUARE_WEBHOOK_SECRET', impact: 'Ventes en temps réel' },
+  ];
+
+  const missing = required.filter(r => !process.env[r.variable]?.trim());
+
+  const appUrl = tryGetAppUrl();
+  if (!appUrl) {
+    missing.push({
+      variable: 'NEXT_PUBLIC_APP_URL',
+      impact: 'Webhook Square rejeté + connexion Google impossible',
+    });
+  }
+
+  // Variables optionnelles (les avis Google fonctionnent sans)
+  const optional = ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_PLACES_API_KEY', 'GOOGLE_PLACE_ID']
+    .filter(key => !process.env[key]?.trim());
+
+  return {
+    ok: missing.length === 0,
+    app_url: appUrl,
+    missing_required: missing,
+    missing_optional: optional,
+  };
+}
 
 /**
  * Diagnostic du scanner (réservé aux utilisateurs connectés) :
@@ -53,6 +91,7 @@ export async function GET() {
   const supabase = createServiceRoleClient();
   const results: Record<string, any> = {};
 
+  const config = checkConfig();
   const aiHealth = await checkAnthropicHealth();
 
   // Bucket de stockage
@@ -94,7 +133,8 @@ export async function GET() {
   const allOk = results.bucket_invoice_files_exists && results.upload_test === 'OK';
 
   return NextResponse.json({
-    status: allOk && aiHealth.status !== 'red' ? 'OK' : 'PARTIAL',
+    status: allOk && aiHealth.status !== 'red' && config.ok ? 'OK' : 'PARTIAL',
+    config,
     ai: aiHealth,
     ...results,
   });
