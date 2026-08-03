@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { requireUser } from '@/lib/supabase/api-auth';
 import { categoryFromRules } from '@/lib/bank-csv';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
 
 /**
  * Réapplique les règles de catégorisation aux dépenses restées non classées.
@@ -39,19 +40,20 @@ export async function POST(request: NextRequest) {
   const dryRun = request.nextUrl.searchParams.get('dryRun') === '1';
   const supabase = createServiceRoleClient();
 
-  const { data, error } = await supabase
-    .from('bank_transactions')
-    .select('id, date, description, amount, category')
-    .or('category.is.null,category.eq.autre');
-
-  if (error) {
+  let rows: any[];
+  try {
+    rows = await fetchAllRows<any>((from, to) => supabase
+      .from('bank_transactions')
+      .select('id, date, description, amount, category')
+      .or('category.is.null,category.eq.autre')
+      .range(from, to));
+  } catch (e: any) {
     return NextResponse.json(
-      { error: `Lecture des mouvements impossible : ${error.message}` },
+      { error: `Lecture des mouvements impossible : ${e.message}` },
       { status: 500 },
     );
   }
 
-  const rows = data || [];
   const proposals: Proposal[] = [];
 
   for (const t of rows) {

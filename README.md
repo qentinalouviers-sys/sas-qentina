@@ -116,7 +116,7 @@ base et consomme l'API Square.
 npm run verify:compta
 ```
 
-138 contrôles de non-régression sur les calculs de TVA, la classification des
+146 contrôles de non-régression sur les calculs de TVA, la classification des
 écritures, le lettrage et la détection des anomalies. **À lancer après toute
 modification touchant `src/lib/tva.ts`, `src/lib/accounting.ts`,
 `src/lib/bank-csv.ts`, `src/lib/interventions.ts`, `src/lib/reconciliation.ts`,
@@ -126,7 +126,8 @@ réconciliant pas avec son total, taux à 7 % classé en 5,5 %, encaissement tra
 comme un achat, coût matières HT divisé par un chiffre d'affaires TTC, dépenses
 et encaissements se compensant dans un même compteur, encaissement Square
 proposé en lettrage d'une facture EDF, « 28 jours sans vente » comptés le 3 du
-mois. Les données sont synthétiques, aucune base n'est requise.
+mois, chiffre d'affaires annuel lu sur 1 000 commandes au lieu de 1 788. Les
+données sont synthétiques, aucune base n'est requise.
 
 Trois règles structurent la comptabilité de l'outil, et ne doivent pas être
 contournées :
@@ -192,7 +193,7 @@ src/
 │   ├── Interventions.tsx     # Module « À faire » de l'accueil (signal d'alerte)
 │   └── Sidebar.tsx           # Navigation desktop + bottom-nav mobile
 └── lib/
-    ├── supabase/             # Clients (browser, server, service-role) + requireUser()
+    ├── supabase/             # Clients + requireUser() + fetch-all (pagination)
     ├── square.ts             # API Square + écriture des commandes (sync ET webhook)
     ├── invoices.ts           # Enregistrement de facture unifié (scanner + import direct)
     ├── ai/                   # Prompt OCR unique, parseur JSON robuste
@@ -205,6 +206,32 @@ src/
     ├── recipes.ts            # Coût des recettes + conversion d'unités (anti-cycle)
     └── utils.ts              # Formats €/dates, fuseau Europe/Paris, CSV
 ```
+
+### Le plafond des 1 000 lignes
+
+**Supabase tronque toute réponse à 1 000 lignes, sans le signaler.** `error` reste
+nul et le tableau est parfaitement valide — simplement incomplet. Sur un exercice
+de 1 788 commandes, le chiffre d'affaires affiché était amputé de 44 %, et comme
+le CA est le dénominateur de tous les ratios, le food cost et la masse salariale
+étaient gonflés d'autant pendant que la TVA collectée était minorée.
+
+Le symptôme reconnaissable est un **compte exactement rond** : 1 000 commandes,
+1 000 écritures. Une donnée réelle ne tombe pas sur un compte rond ; une limite,
+si.
+
+Toute lecture dont le volume dépend d'une période, d'un volume de ventes ou d'un
+historique passe donc par `fetchAllRows` (`src/lib/supabase/fetch-all.ts`), qui
+pagine avec `.range()`. Quand le filtre est un `in(...)` sur une longue liste
+d'identifiants, `fetchAllRowsIn` découpe **aussi** la liste : 1 788 UUID dans une
+URL font 66 Ko, au-delà de ce que les passerelles HTTP acceptent.
+
+Seules peuvent s'en dispenser les requêtes bornées par construction : un
+`.limit(n)` avec n ≤ 1 000, un `.eq()` sur une clé primaire, une table de
+réglages. Attention — un `.limit(2000)` **ne fonctionne pas** : le serveur en
+rend 1 000 sans broncher.
+
+Le faux client Supabase de `npm run verify:compta` applique le même plafond,
+pour que le défaut soit visible en test.
 
 ### Principes à respecter (pour les évolutions futures)
 

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { fetchAllRows, fetchAllRowsIn } from '@/lib/supabase/fetch-all';
 import {
   formatCurrency, formatPercent, getDateRange, toISODate, formatDate,
   getParisHour, getParisDayName, FOOD_COST_TARGET,
@@ -140,43 +141,49 @@ export default function DashboardPage() {
 
     // Toutes les lectures indépendantes partent EN PARALLÈLE
     // (avant : 10 allers-retours en série → chargement 3-4× plus lent)
+    // Toute lecture dont le volume dépend de la période est paginée : Supabase
+    // tronque à 1 000 lignes sans le signaler. Sur un exercice de 1 788
+    // commandes, le CA affiché ici était amputé de 44 % — et avec lui le food
+    // cost, la masse salariale et la marge, qui s'en servent de dénominateur.
     const [
       settingsRes,
-      ordersRes,
+      orders,
       tvaRes,
-      invoicesRes,
-      bankSuppliersRes,
-      timecardsRes,
-      bankSalariesRes,
-      fixedTxRes,
-      inventoryRes,
+      invoicesRows,
+      bankSuppliersRows,
+      timecardsRows,
+      bankSalariesRows,
+      fixedTxRows,
+      inventoryRows,
       recipesRes,
     ] = await Promise.all([
       supabase.from('app_settings').select('value').eq('key', 'masked_items'),
-      supabase.from('square_orders')
+      fetchAllRows<any>((f0, f1) => supabase.from('square_orders')
         .select('id, net_amount, service, created_at, raw_data')
-        .gte('service', startStr).lte('service', endStr),
+        .gte('service', startStr).lte('service', endStr).range(f0, f1)),
       computeTva(supabase, startStr, endStr),
-      supabase.from('invoices')
+      fetchAllRows<any>((f0, f1) => supabase.from('invoices')
         .select('id, total_ht, total_ttc, supplier:suppliers(name)')
-        .gte('date', startStr).lte('date', endStr),
-      supabase.from('bank_transactions')
+        .gte('date', startStr).lte('date', endStr).range(f0, f1)),
+      fetchAllRows<any>((f0, f1) => supabase.from('bank_transactions')
         .select('id, amount, description, category')
         .eq('category', 'variable_fournisseur')
         .is('invoice_id', null)
-        .gte('date', startStr).lte('date', endStr),
-      supabase.from('labor_timecards')
+        .gte('date', startStr).lte('date', endStr).range(f0, f1)),
+      fetchAllRows<any>((f0, f1) => supabase.from('labor_timecards')
         .select('id, hours_worked, hourly_rate')
-        .gte('start_at', start.toISOString()).lte('start_at', end.toISOString()),
-      supabase.from('bank_transactions')
+        .gte('start_at', start.toISOString()).lte('start_at', end.toISOString())
+        .range(f0, f1)),
+      fetchAllRows<any>((f0, f1) => supabase.from('bank_transactions')
         .select('id, amount, description, category')
         .eq('category', 'variable_salaire')
-        .gte('date', startStr).lte('date', endStr),
-      supabase.from('bank_transactions')
+        .gte('date', startStr).lte('date', endStr).range(f0, f1)),
+      fetchAllRows<any>((f0, f1) => supabase.from('bank_transactions')
         .select('id, amount, category, description, date')
         .in('category', ['fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'impot_taxe', 'investissement', 'autre'])
-        .gte('date', startStr).lte('date', endStr),
-      supabase.from('inventory_counts').select('quantity, unit_price'),
+        .gte('date', startStr).lte('date', endStr).range(f0, f1)),
+      fetchAllRows<any>((f0, f1) => supabase.from('inventory_counts')
+        .select('quantity, unit_price').range(f0, f1)),
       supabase.from('recipes')
         .select('id, name, selling_price, portions, recipe_ingredients(quantity, ingredient:ingredients(last_unit_price))')
         .not('selling_price', 'is', null),
@@ -196,7 +203,7 @@ export default function DashboardPage() {
     // Deux montants, et jamais l'un pour l'autre : le TTC est ce que le client
     // a payé (c'est le chiffre de la caisse), le HT est la seule base sur
     // laquelle un ratio de gestion se calcule.
-    const activeOrders = (ordersRes.data || []).filter(notMasked);
+    const activeOrders = orders.filter(notMasked);
     const caTotal = activeOrders.reduce((s: number, o: any) => s + (o.net_amount || 0), 0);
     const caHt = activeOrders.reduce((s: number, o: any) => s + orderHtAmount(o), 0);
     const validOrders = activeOrders.filter((o: any) => (o.net_amount || 0) > 0);
@@ -244,7 +251,7 @@ export default function DashboardPage() {
     });
 
     // ── 2. Factures & lignes ─────────────────────────────────────────────────
-    const invoices = invoicesRes.data || [];
+    const invoices = invoicesRows;
     const invoiceIds = invoices.map((i: any) => i.id);
 
     let purchasesAlim = 0, purchasesBoisson = 0, purchasesEmballage = 0;
@@ -254,12 +261,13 @@ export default function DashboardPage() {
     let activeInvoiceLines: any[] = [];
 
     if (invoiceIds.length > 0) {
-      const { data: lines } = await supabase
+      const lines = await fetchAllRowsIn<any, string>(invoiceIds, (ids, f0, f1) => supabase
         .from('invoice_lines')
         .select('id, total_ht, category, designation, invoice:invoices(date, supplier:suppliers(name))')
-        .in('invoice_id', invoiceIds);
+        .in('invoice_id', ids)
+        .range(f0, f1));
 
-      activeInvoiceLines = (lines || []).filter(notMasked);
+      activeInvoiceLines = lines.filter(notMasked);
 
       const catMap: Record<string, number> = {};
       activeInvoiceLines.forEach((l: any) => {
@@ -295,7 +303,7 @@ export default function DashboardPage() {
     //  - les montants bancaires sont TTC, les lignes de facture HT : on ramène
     //    les premiers en HT pour que le ratio veuille dire quelque chose.
     const matcher = makeInvoiceMatcher(invoices as any[]);
-    const bankSuppliersUnreconciled = sansFlux(bankSuppliersRes.data || [])
+    const bankSuppliersUnreconciled = sansFlux(bankSuppliersRows)
       .filter(notMasked)
       .filter((t: any) => !matcher.alreadyInvoiced(t))
       .reduce((s: number, t: any) => s + bankAmountHt(t, 'variable_fournisseur'), 0);
@@ -304,10 +312,10 @@ export default function DashboardPage() {
     const foodCost = caHt > 0 ? (foodCostAmt / caHt) * 100 : 0;
 
     // ── 4. Masse salariale ───────────────────────────────────────────────────
-    const laborTimecards = (timecardsRes.data || [])
+    const laborTimecards = timecardsRows
       .filter(notMasked)
       .reduce((s: number, t: any) => s + (t.hours_worked || 0) * (t.hourly_rate || 0), 0);
-    const laborBank = sansFlux(bankSalariesRes.data || [])
+    const laborBank = sansFlux(bankSalariesRows)
       .filter(notMasked)
       .reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
 
@@ -315,7 +323,7 @@ export default function DashboardPage() {
     const ratioSalariale = caHt > 0 ? (totalLabor / caHt) * 100 : 0;
 
     // ── 5. Charges fixes ─────────────────────────────────────────────────────
-    const activeFixedTx = sansFlux(fixedTxRes.data || [])
+    const activeFixedTx = sansFlux(fixedTxRows)
       .filter(notMasked)
       .filter((t: any) => !matcher.alreadyInvoiced(t));
     const fixedFromBank = activeFixedTx.reduce((s: number, t: any) => s + bankAmountHt(t), 0);
@@ -346,19 +354,20 @@ export default function DashboardPage() {
     setChargesDetails(tempDetails);
 
     // ── 6. Stock valorisé ────────────────────────────────────────────────────
-    const stockValorise = (inventoryRes.data || [])
+    const stockValorise = inventoryRows
       .reduce((s: number, i: any) => s + (i.quantity || 0) * (i.unit_price || 0), 0);
 
     // ── 7. Top produits (sur les commandes déjà chargées) ───────────────────
-    const oIds = (ordersRes.data || []).map((o: any) => o.id);
+    const oIds = orders.map((o: any) => o.id);
     let topProduits: { name: string; quantity: number; ca: number }[] = [];
     if (oIds.length > 0) {
-      const { data: items } = await supabase
+      const items = await fetchAllRowsIn<any, string>(oIds, (ids, f0, f1) => supabase
         .from('square_items')
         .select('name, quantity, total_price')
-        .in('order_id', oIds);
+        .in('order_id', ids)
+        .range(f0, f1));
       const prodMap: Record<string, { qty: number; ca: number }> = {};
-      (items || []).forEach((i: any) => {
+      items.forEach((i: any) => {
         if (!i.name) return;
         if (!prodMap[i.name]) prodMap[i.name] = { qty: 0, ca: 0 };
         prodMap[i.name].qty += i.quantity || 0;

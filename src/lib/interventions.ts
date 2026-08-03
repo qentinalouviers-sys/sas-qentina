@@ -23,6 +23,7 @@
  */
 
 import { SupabaseClient } from '@supabase/supabase-js';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { foldLabel, isFinancialFlow, round2 } from './accounting';
 import { computeTva, TvaResult } from './tva';
 
@@ -486,27 +487,36 @@ export async function collectInterventionFacts(
 ): Promise<InterventionFacts> {
   const { start, end, today } = opts;
 
-  const [ordersRes, lastRes, bankRes, invoicesRes, suppliersRes, ccaRes, tripsRes, tva] =
+  // Chaque lecture dont le volume dépend de la période est paginée : Supabase
+  // tronque à 1 000 lignes sans le dire. Sur un exercice de 1 788 commandes, ce
+  // module comparait les versements bancaires à un CA amputé de 44 % — et
+  // annonçait « des ventes manquantes » en désignant la mauvaise cause.
+  const [orders, lastRes, bank, invoices, suppliers, cca, trips, tva] =
     await Promise.all([
-      supabase.from('square_orders')
+      fetchAllRows<any>((f0, f1) => supabase.from('square_orders')
         .select('service, net_amount, raw_data')
-        .gte('service', start).lte('service', end),
+        .gte('service', start).lte('service', end)
+        .range(f0, f1)),
+      // Bornée par construction : une seule ligne demandée.
       supabase.from('square_orders')
         .select('service')
         .order('service', { ascending: false })
         .limit(1),
-      supabase.from('bank_transactions')
+      fetchAllRows<any>((f0, f1) => supabase.from('bank_transactions')
         .select('date, description, amount, category, invoice_id')
-        .gte('date', start).lte('date', end),
-      supabase.from('invoices').select('id, date'),
-      supabase.from('suppliers').select('name'),
-      supabase.from('mouvements_cca').select('associe, sens, montant'),
-      supabase.from('mileage_trips').select('id, cca_movement_id'),
+        .gte('date', start).lte('date', end)
+        .range(f0, f1)),
+      fetchAllRows<any>((f0, f1) => supabase.from('invoices')
+        .select('id, date').range(f0, f1)),
+      fetchAllRows<any>((f0, f1) => supabase.from('suppliers')
+        .select('name').range(f0, f1)),
+      fetchAllRows<any>((f0, f1) => supabase.from('mouvements_cca')
+        .select('associe, sens, montant').range(f0, f1)),
+      fetchAllRows<any>((f0, f1) => supabase.from('mileage_trips')
+        .select('id, cca_movement_id').range(f0, f1)),
       computeTva(supabase, start, end),
     ]);
 
-  // ── Ventes Square ────────────────────────────────────────────────────────
-  const orders = (ordersRes.data || []) as any[];
   let caSquareTtc = 0;
   let caSquareHt = 0;
   const daysWithSales = new Set<string>();
@@ -522,7 +532,7 @@ export async function collectInterventionFacts(
   }
 
   // ── Banque ───────────────────────────────────────────────────────────────
-  const bank = (bankRes.data || []) as any[];
+  // (lu plus haut, paginé)
   let squarePayoutsTtc = 0;
   let squarePayoutsCount = 0;
   let debitsCount = 0;
@@ -552,25 +562,23 @@ export async function collectInterventionFacts(
   }
 
   // ── Factures : dates de repli ────────────────────────────────────────────
-  const invoices = (invoicesRes.data || []) as any[];
   const suspect = invoices.filter(i => /^\d{4}-01-01$/.test(String(i.date || '')));
 
   // ── Fournisseurs : encodage cassé ────────────────────────────────────────
   // « Ã » et « Â » ne peuvent pas apparaître dans un nom français correct : ce
   // sont les octets d'un caractère UTF-8 relu comme du latin-1 (« MÃ©tro »).
-  const mojibake = ((suppliersRes.data || []) as any[])
-    .map(s => String(s.name || ''))
+  const mojibake = suppliers
+    .map((s: any) => String(s.name || ''))
     .filter(n => /[ÃÂ]/.test(n) || n.includes('�'));
 
   // ── Comptes courants d'associés ──────────────────────────────────────────
   const balances = new Map<string, number>();
-  for (const m of (ccaRes.data || []) as any[]) {
+  for (const m of cca) {
     const signed = m.sens === 'apport' ? (m.montant || 0) : -(m.montant || 0);
     balances.set(m.associe, round2((balances.get(m.associe) || 0) + signed));
   }
 
-  const tripsNotInCca = ((tripsRes.data || []) as any[])
-    .filter(t => !t.cca_movement_id).length;
+  const tripsNotInCca = trips.filter((t: any) => !t.cca_movement_id).length;
 
   return {
     start, end, today,

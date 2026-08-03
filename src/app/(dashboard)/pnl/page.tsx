@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { fetchAllRows, fetchAllRowsIn } from '@/lib/supabase/fetch-all';
 import { formatCurrency, formatPercent, getDateRange, toISODate, formatDate } from '@/lib/utils';
 import {
   isFinancialFlow, orderHtAmount, bankAmountHt, makeInvoiceMatcher,
@@ -131,15 +132,18 @@ export default function PnlPage() {
     try {
       // Les 8 requêtes indépendantes sont lancées en parallèle ;
       // seules les lignes de factures (invoice_lines) dépendent des factures → second temps.
+      // Toute lecture dont le volume dépend de la période est paginée :
+      // Supabase tronque à 1 000 lignes sans le signaler, et sur un exercice
+      // complet le chiffre d'affaires s'en trouvait amputé de 44 %.
       const [
         { data: settingsData },
-        { data: orders },
-        { data: bankRecettes },
-        { data: invoices },
-        { data: bankSuppliers },
-        { data: timecards },
-        { data: bankSalaries },
-        { data: fixedTx },
+        orders,
+        bankRecettes,
+        invoices,
+        bankSuppliers,
+        timecards,
+        bankSalaries,
+        fixedTx,
       ] = await Promise.all([
         // A. IDs masqués depuis app_settings
         supabase
@@ -147,61 +151,68 @@ export default function PnlPage() {
           .select('value')
           .eq('key', 'masked_items'),
         // 1. Chiffre d'Affaires (Square Orders)
-        supabase
+        fetchAllRows<any>((f0, f1) => supabase
           .from('square_orders')
           .select('id, net_amount, service, square_order_id, created_at, raw_data')
           .gte('service', startStr)
           .lte('service', endStr)
-          .order('service', { ascending: false }),
+          .order('service', { ascending: false })
+          .range(f0, f1)),
         // CA Banque (Recettes)
-        supabase
+        fetchAllRows<any>((f0, f1) => supabase
           .from('bank_transactions')
           .select('id, date, description, amount, status')
           .eq('category', 'recette')
           .gte('date', startStr)
           .lte('date', endStr)
-          .order('date', { ascending: false }),
+          .order('date', { ascending: false })
+          .range(f0, f1)),
         // 2. Factures fournisseurs.
         // `total_ttc` sert au rapprochement souple ci-dessous : sans lui, une
         // facture scannée et son paiement bancaire non lettré sont comptés
         // deux fois dans le coût matières.
-        supabase
+        fetchAllRows<any>((f0, f1) => supabase
           .from('invoices')
           .select('id, date, total_ttc')
           .gte('date', startStr)
-          .lte('date', endStr),
+          .lte('date', endStr)
+          .range(f0, f1)),
         // Achats Fournisseurs non lettrés (dans banque directement, non lié à facture)
-        supabase
+        fetchAllRows<any>((f0, f1) => supabase
           .from('bank_transactions')
           .select('id, date, description, amount, status')
           .eq('category', 'variable_fournisseur')
           .is('invoice_id', null)
           .gte('date', startStr)
           .lte('date', endStr)
-          .order('date', { ascending: false }),
+          .order('date', { ascending: false })
+          .range(f0, f1)),
         // 3. Masse Salariale — Timecards (Salaires théoriques)
-        supabase
+        fetchAllRows<any>((f0, f1) => supabase
           .from('labor_timecards')
           .select('id, employee_name, start_at, end_at, hours_worked, hourly_rate')
           .gte('start_at', start.toISOString())
           .lte('start_at', end.toISOString())
-          .order('start_at', { ascending: false }),
+          .order('start_at', { ascending: false })
+          .range(f0, f1)),
         // Banque Salaires & Charges
-        supabase
+        fetchAllRows<any>((f0, f1) => supabase
           .from('bank_transactions')
           .select('id, date, description, amount, status')
           .eq('category', 'variable_salaire')
           .gte('date', startStr)
           .lte('date', endStr)
-          .order('date', { ascending: false }),
+          .order('date', { ascending: false })
+          .range(f0, f1)),
         // 4. Charges Fixes (Banque)
-        supabase
+        fetchAllRows<any>((f0, f1) => supabase
           .from('bank_transactions')
           .select('id, date, description, amount, category, status')
           .in('category', ['fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'impot_taxe', 'investissement', 'autre'])
           .gte('date', startStr)
           .lte('date', endStr)
-          .order('date', { ascending: false }),
+          .order('date', { ascending: false })
+          .range(f0, f1)),
       ]);
 
       const loadedMaskedIds: string[] = settingsData && settingsData.length > 0 && settingsData[0].value
@@ -246,12 +257,13 @@ export default function PnlPage() {
       let invoiceLinesList: any[] = [];
 
       if (invoiceIds.length > 0) {
-        const { data: lines } = await supabase
+        // Une facture Metro peut compter plus de cent lignes : quelques
+        // dizaines de factures suffisent à dépasser le plafond des 1 000.
+        invoiceLinesList = await fetchAllRowsIn<any, string>(invoiceIds, (ids, f0, f1) => supabase
           .from('invoice_lines')
           .select('id, total_ht, designation, quantity, unit, unit_price_ht, category, invoice:invoices(date, invoice_number, supplier:suppliers(name))')
-          .in('invoice_id', invoiceIds);
-        
-        invoiceLinesList = lines || [];
+          .in('invoice_id', ids)
+          .range(f0, f1));
         
         const activeInvoiceLines = invoiceLinesList.filter((l: any) => !loadedMaskedIds.includes(String(l.id)));
         

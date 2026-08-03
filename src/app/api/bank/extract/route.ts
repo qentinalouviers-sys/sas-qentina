@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { createServiceRoleClient } from '@/lib/supabase/server';
+import { fetchAllRowsIn } from '@/lib/supabase/fetch-all';
 import { requireUser } from '@/lib/supabase/api-auth';
 import { createClaudeMessage } from '@/lib/anthropic';
 import { extractJson } from '@/lib/ai/json';
@@ -335,13 +336,18 @@ export async function POST(request: NextRequest) {
     // Collect all unique dates present in the batch for a bounded DB query
     const uniqueDates = [...new Set([...batchMap.values()].map(v => v.tx.date))];
 
-    const { data: existing, error: fetchError } = await supabase
-      .from('bank_transactions')
-      .select('date, description, amount')
-      .in('date', uniqueDates);
-
-    if (fetchError) {
-      console.error('Error fetching existing transactions:', fetchError);
+    // Paginé, et pour une raison précise : ce contrôle décide de ce qui est un
+    // doublon. Tronqué à 1 000 lignes, il déclarerait « nouvelles » des
+    // écritures déjà en base et les ré-importerait en double.
+    let existing: any[];
+    try {
+      existing = await fetchAllRowsIn<any, string>(uniqueDates, (dates, f0, f1) => supabase
+        .from('bank_transactions')
+        .select('date, description, amount')
+        .in('date', dates)
+        .range(f0, f1));
+    } catch (e) {
+      console.error('Error fetching existing transactions:', e);
       return NextResponse.json({ error: 'Erreur vérification doublons' }, { status: 500 });
     }
 

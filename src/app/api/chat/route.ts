@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { createServiceRoleClient } from '@/lib/supabase/server';
+import { fetchAllRows, fetchAllRowsIn } from '@/lib/supabase/fetch-all';
 import { createClaudeMessage } from '@/lib/anthropic';
 import { startOfMonth, endOfMonth, format } from 'date-fns';
 import { requireUser } from '@/lib/supabase/api-auth';
@@ -23,15 +24,18 @@ export async function POST(request: NextRequest) {
     const endStr = format(endOfMonth(now), 'yyyy-MM-dd');
 
     // Fetch Sales
-    const { data: orders } = await supabase
+    // Paginé : un mois chargé dépasse 1 000 commandes, et Fuego conseillerait
+    // alors sur un chiffre d'affaires tronqué sans le savoir.
+    const orders = await fetchAllRows<any>((f0, f1) => supabase
       .from('square_orders')
       .select('net_amount, service')
       .gte('service', startStr)
       .lte('service', endStr)
-      .gt('net_amount', 0); // Exclude 0 amount
+      .gt('net_amount', 0) // Exclude 0 amount
+      .range(f0, f1));
 
-    const caTotal = orders?.reduce((sum, o) => sum + (o.net_amount || 0), 0) || 0;
-    const nbCommandes = orders?.length || 0;
+    const caTotal = orders.reduce((sum, o) => sum + (o.net_amount || 0), 0);
+    const nbCommandes = orders.length;
     const ticketMoyen = nbCommandes > 0 ? caTotal / nbCommandes : 0;
 
     // Fetch Invoices (Food)
@@ -44,12 +48,13 @@ export async function POST(request: NextRequest) {
     const invoiceIds = invoices?.map(i => i.id) || [];
     let achatsAlim = 0;
     if (invoiceIds.length > 0) {
-      const { data: lines } = await supabase
+      const lines = await fetchAllRowsIn<any, string>(invoiceIds, (ids, f0, f1) => supabase
         .from('invoice_lines')
         .select('total_ht')
-        .in('invoice_id', invoiceIds)
-        .eq('category', 'alimentaire');
-      achatsAlim = lines?.reduce((sum, l) => sum + (l.total_ht || 0), 0) || 0;
+        .in('invoice_id', ids)
+        .eq('category', 'alimentaire')
+        .range(f0, f1));
+      achatsAlim = lines.reduce((sum, l) => sum + (l.total_ht || 0), 0);
     }
     const foodCost = caTotal > 0 ? (achatsAlim / caTotal) * 100 : 0;
 

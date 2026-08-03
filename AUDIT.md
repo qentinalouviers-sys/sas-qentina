@@ -710,6 +710,59 @@ Deux points signalés par l'audit externe n'étaient pas des défauts :
   cela fait une seule journée. Le 0 € était le symptôme de la synchro Square
   arrêtée, pas un bug d'affichage.
 
+### Le plafond des 1 000 lignes : le vrai coupable des « ventes manquantes »
+
+C'est le défaut le plus coûteux de toute cette révision, et il s'est révélé par
+un nombre trop rond.
+
+Le diagnostic Square annonçait : *« Square annonce 1 788 commandes pour
+51 970,36 €, la base en contient **1000** pour 33 176,99 € : il manque
+18 793,37 € »*. Une base ne contient pas exactement mille commandes. Un compte
+rond n'est jamais une donnée, c'est une limite.
+
+**Supabase tronque toute réponse de son API REST à 1 000 lignes** (réglage
+« Max rows »), et le fait en silence : `error` reste nul, le tableau est
+parfaitement valide — simplement incomplet. Aucune requête du projet ne paginait.
+
+Conséquences, sur un exercice de 1 788 commandes :
+
+| Indicateur | Effet |
+|---|---|
+| Chiffre d'affaires annuel | **amputé de 44 %** |
+| Food cost, masse salariale, marge | **gonflés d'autant** (le CA est leur dénominateur) |
+| TVA collectée | **minorée** |
+| Module « À faire » | annonçait « des ventes manquantes » — le constat était juste, la cause désignée était fausse |
+
+La reprise d'historique, elle, fonctionnait : les 1 788 commandes étaient bien en
+base. C'est la **lecture** qui était tronquée, pas l'écriture. L'utilisateur
+avait donc relancé plusieurs reprises sans effet, et l'outil continuait à lui
+réclamer la même chose.
+
+Deux fonctions dans `src/lib/supabase/fetch-all.ts` :
+
+- `fetchAllRows` pagine avec `.range()` jusqu'à ce qu'une page revienne
+  incomplète, et **jette** si une page échoue — une lecture partielle qui se tait
+  est exactement le défaut qu'on corrige ;
+- `fetchAllRowsIn` découpe **en plus** les listes de `in(...)`. Ce n'est pas du
+  zèle : 1 788 UUID dans une URL font 66 Ko, au-delà de ce que les passerelles
+  HTTP acceptent, et la requête échouerait en bloc.
+
+Appliquées partout où le volume dépend d'une période : TVA, P&L, tableau de bord,
+interventions, ventes, banque, menu engineering, liste de courses, contexte de
+Fuego, diagnostic Square, réattribution des catégories, et le **contrôle
+anti-doublon de l'import bancaire** — celui-là décidant de ce qui est un doublon,
+sa troncature aurait ré-importé des écritures déjà présentes.
+
+Un piège au passage : `.limit(2000)` **ne fonctionne pas**. Le serveur en rend
+1 000 sans broncher. La page Liste de courses le demandait et n'obtenait que la
+moitié de son catalogue.
+
+Enfin, le faux client Supabase de `npm run verify:compta` applique désormais le
+même plafond. C'était l'angle mort : sans lui, aucun test ne pouvait voir le
+défaut. Les contrôles travaillent maintenant sur 1 788 commandes et 2 500
+dépenses — au-dessus du plafond, délibérément — et l'un d'eux vérifie qu'aucun
+compte ne retombe sur 1 000 pile.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 **Signalées et non corrigées** — le module « À faire » les remonte déjà, la
