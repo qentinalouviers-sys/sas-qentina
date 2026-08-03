@@ -90,6 +90,21 @@ Pour remonter plus loin, *Réglages → Historique Square* permet une reprise po
 sur 3, 6 ou 12 mois. L'opération est rejouable : l'upsert sur `square_order_id`
 ne crée jamais de doublon.
 
+### Diagnostiquer un chiffre d'affaires incomplet
+
+Le bouton *Diagnostiquer l'écart* (même écran) interroge Square et compare, sur la
+même fenêtre, ce que la caisse contient et ce que la base contient. Il répond à la
+question que la reprise ne résout pas :
+
+| Cause | Reprise utile ? |
+|---|---|
+| Commandes non importées sur la boutique configurée | **oui** |
+| Une deuxième boutique Square active, jamais lue | **non** — l'import ne connaît qu'un `SQUARE_LOCATION_ID` |
+| Commandes payées restées `OPEN` côté Square | **non** — l'import ne prend que `COMPLETED` |
+
+Les deux derniers cas ne se rattrapent pas : ils se corrigent dans Square ou dans la
+configuration. Relancer une reprise à l'aveugle donne l'illusion d'avoir agi.
+
 **`CRON_SECRET` est obligatoire.** Vercel ajoute l'en-tête
 `Authorization: Bearer $CRON_SECRET` à ses appels dès que la variable existe. Sans
 elle, la route refuse de travailler (503) au lieu de rester ouverte — elle écrit en

@@ -245,15 +245,18 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
           `La banque a reçu ${eur(f.squarePayoutsTtc)} de versements Square ` +
           `(${f.squarePayoutsCount} virements) alors que seulement ` +
           `${eur(f.caSquareTtc)} de ventes sont enregistrés. Un versement Square ` +
-          `ne contient que les paiements par carte, commission déjà déduite : le ` +
+          `ne contient que les paiements par CARTE, commission déjà déduite : le ` +
           `CA devrait donc être PLUS élevé que les versements, jamais moins. ` +
-          `L'écart réel est supérieur à ce montant. Un CA amputé gonfle ` +
-          `mécaniquement le food cost et minore la TVA collectée.`,
+          `Les ventes en espèces n'expliquent pas cet écart — elles ne passent ` +
+          `pas par ces virements, donc elles le creusent encore. Le manque réel ` +
+          `dépasse le montant affiché. Un CA amputé gonfle mécaniquement le food ` +
+          `cost et minore la TVA collectée.`,
         action:
-          'Lance une reprise de l\'historique Square sur 12 mois, puis reviens ' +
-          'vérifier que cette alerte a disparu.',
+          'Lance le diagnostic dans Réglages : il compare boutique par boutique ' +
+          'ce que Square contient et ce que la base contient, et dit si une ' +
+          'reprise suffit ou si une boutique n\'est pas importée du tout.',
         href: '/reglages',
-        hrefLabel: 'Réglages → Historique Square',
+        hrefLabel: 'Réglages → Diagnostiquer l’écart',
         amount: gap,
       });
     }
