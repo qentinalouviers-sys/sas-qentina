@@ -195,17 +195,58 @@ export default function VentesPage() {
     setItems(data || []);
   };
 
+  /**
+   * Synchronise Square jusqu'au bout.
+   *
+   * La route s'arrête avant d'être coupée par la plateforme et renvoie son
+   * curseur : sans cette reprise, une partie des commandes resterait dehors et
+   * le chiffre d'affaires serait minoré en annonçant un succès. La caisse étant
+   * la référence comptable, c'est l'exhaustivité qui compte, pas la rapidité.
+   */
   const handleSync = async () => {
     setSyncing(true);
     try {
-      const res = await fetch('/api/square/sync', { method: 'POST' });
-      const data = await res.json();
-      if (data.success) {
-        alert(`Synchronisation réussie : ${data.synced.orders} commandes, ${data.synced.items} articles`);
-        loadData();
-      } else {
-        alert('Erreur : ' + (data.error || 'Inconnu'));
+      let cursor: string | undefined;
+      let orders = 0;
+      let items = 0;
+      let zero = 0;
+      let passes = 0;
+
+      // Garde-fou : 40 reprises couvrent largement une année de commandes.
+      while (passes < 40) {
+        const res = await fetch('/api/square/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(cursor ? { cursor } : {}),
+        });
+        const data = await res.json();
+
+        if (!data.success) {
+          alert('Erreur : ' + (data.error || 'Inconnu'));
+          break;
+        }
+
+        orders += data.synced?.orders || 0;
+        items += data.synced?.items || 0;
+        zero += data.synced?.zeroAmountOrders || 0;
+        passes++;
+
+        if (data.complete) {
+          const alerte = zero > 0
+            ? `\n\nAttention : ${zero} commande(s) sans montant exploitable côté Square.`
+            : '';
+          alert(`Synchronisation terminée : ${orders} commandes, ${items} articles.${alerte}`);
+          break;
+        }
+
+        cursor = data.cursor;
+        if (!cursor) break;
       }
+
+      if (passes >= 40) {
+        alert(`Synchronisation interrompue après ${orders} commandes (trop de reprises). Relance-la.`);
+      }
+      loadData();
     } catch {
       alert('Erreur de synchronisation');
     }

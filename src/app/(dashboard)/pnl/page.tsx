@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatPercent, getDateRange, toISODate, formatDate } from '@/lib/utils';
+import { isFinancialFlow } from '@/lib/accounting';
 import {
   TrendingUp,
   DollarSign,
@@ -68,10 +69,15 @@ export default function PnlPage() {
   const [maskedIds, setMaskedIds] = useState<string[]>([]);
   const [showMaskedInModal, setShowMaskedInModal] = useState(false);
   const [data, setData] = useState({
-    // CA
+    // CA — la caisse Square est la référence
     caSquare: 0,
     caBank: 0,
     totalCA: 0,
+
+    // Hors exploitation : prêts, apports, compte courant, trésorerie
+    fluxFinanciersTotal: 0,
+    fluxFinanciersCount: 0,
+    fluxFinanciersList: [] as any[],
 
     // Achats (Coûts Variables)
     purchasesAlim: 0,
@@ -207,11 +213,25 @@ export default function PnlPage() {
       const activeOrders = ordersList.filter((o: any) => !loadedMaskedIds.includes(String(o.id)));
       const caSquare = activeOrders.reduce((s: number, o: any) => s + getHtAmount(o), 0);
 
-      // CA Banque (Recettes)
-      const bankRecettesList = bankRecettes || [];
+      // ── Flux financiers : ni recette, ni charge ──────────────────────────
+      // Un prêt, un apport, un mouvement de compte courant ou un virement de
+      // trésorerie n'a rien à faire dans un compte de résultat d'exploitation.
+      // Comptés à part, ils expliquent l'écart entre les encaissements du compte
+      // et le chiffre d'affaires réel — écart qui gonflait auparavant à la fois
+      // les « recettes » et le poste fourre-tout des charges.
+      const estFlux = (t: any) => isFinancialFlow(t.description || '', t.category);
+      const horsExploitation: any[] = [];
+      const sansFlux = (list: any[]) => list.filter((t: any) => {
+        if (!estFlux(t)) return true;
+        horsExploitation.push(t);
+        return false;
+      });
+
+      // Encaissements bancaires (indicatif — le CA vient de Square)
+      const bankRecettesList = sansFlux(bankRecettes || []);
       const activeBankRecettes = bankRecettesList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
       const caBank = activeBankRecettes.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
-      const totalCA = caSquare; // Ventes d'exploitation comme CA primaire
+      const totalCA = caSquare; // La caisse Square est la référence du CA
 
       // 2. Lignes de factures (dépend des factures récupérées ci-dessus)
       const invoiceIds = invoices?.map((i: any) => i.id) || [];
@@ -244,7 +264,7 @@ export default function PnlPage() {
       }
 
       // Achats Fournisseurs non lettrés (dans banque directement, non lié à facture)
-      const bankSuppliersUnreconciledList = bankSuppliers || [];
+      const bankSuppliersUnreconciledList = sansFlux(bankSuppliers || []);
       const activeBankSuppliers = bankSuppliersUnreconciledList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
       const bankSuppliersUnreconciled = activeBankSuppliers.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
       const totalCogs = purchasesAlim + purchasesBoisson + purchasesEmballage + bankSuppliersUnreconciled;
@@ -256,7 +276,7 @@ export default function PnlPage() {
       const laborTimecards = activeTimecards.reduce((s: number, t: any) => s + (t.hours_worked || 0) * (t.hourly_rate || 0), 0);
 
       // Banque Salaires & Charges
-      const bankSalariesList = bankSalaries || [];
+      const bankSalariesList = sansFlux(bankSalaries || []);
       const activeBankSalaries = bankSalariesList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
       const laborBank = activeBankSalaries.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
 
@@ -265,7 +285,7 @@ export default function PnlPage() {
       const activeLabor = useBankLabor ? laborBank : laborTimecards;
 
       // 4. Charges Fixes (Banque)
-      const fixedTxList = fixedTx || [];
+      const fixedTxList = sansFlux(fixedTx || []);
       const activeFixedTx = fixedTxList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
       
       let chargesLoyer = 0;
@@ -292,10 +312,17 @@ export default function PnlPage() {
       const ebitda = margeBrute - activeLabor - totalFixedCharges;
       const ebitdaPercent = totalCA > 0 ? (ebitda / totalCA) * 100 : 0;
 
+      const fluxFinanciersTotal = horsExploitation.reduce(
+        (s: number, t: any) => s + Math.abs(t.amount || 0), 0
+      );
+
       setData({
         caSquare,
         caBank,
         totalCA,
+        fluxFinanciersTotal,
+        fluxFinanciersCount: horsExploitation.length,
+        fluxFinanciersList: horsExploitation,
         purchasesAlim,
         purchasesBoisson,
         purchasesEmballage,
@@ -435,10 +462,17 @@ export default function PnlPage() {
         break;
 
       case 'ca_bank':
-        title = 'Détail des Recettes Bancaires';
+        title = 'Encaissements bancaires — indicatif, le CA vient de Square';
         headers = ['Date Opération', 'Libellé de l\'opération', 'Montant'];
         rawItemsList = data.bankRecettesList;
         formatRowFunction = makeBankRowFormatter('var(--green)');
+        break;
+
+      case 'flux_financiers':
+        title = 'Flux financiers — exclus du compte de résultat';
+        headers = ['Date Opération', 'Libellé de l\'opération', 'Montant'];
+        rawItemsList = data.fluxFinanciersList;
+        formatRowFunction = makeBankRowFormatter('var(--text-muted)');
         break;
 
       case 'purchases_alim':
@@ -908,13 +942,23 @@ export default function PnlPage() {
                       onClick={() => openDetail('ca_square')}
                     />
                     <PnlRow
-                      label="Recettes Bancaires validées (hors total)"
+                      label="Encaissements bancaires (hors total)"
                       value={data.caBank}
                       ratio={calculateRatio(data.caBank)}
                       color="var(--teal)"
-                      note="Dépôts identifiés (cliquer pour voir/exclure)"
+                      note="Indicatif — le CA vient de la caisse Square"
                       onClick={() => openDetail('ca_bank')}
                     />
+                    {data.fluxFinanciersCount > 0 && (
+                      <PnlRow
+                        label="Flux financiers exclus du résultat"
+                        value={data.fluxFinanciersTotal}
+                        ratio={calculateRatio(data.fluxFinanciersTotal)}
+                        color="var(--text-muted)"
+                        note={`${data.fluxFinanciersCount} mouvement(s) : prêts, apports, compte courant, trésorerie, retraits`}
+                        onClick={() => openDetail('flux_financiers')}
+                      />
+                    )}
 
                     {/* SECTION 2: COUT MATIERES */}
                     <tr style={{ background: 'var(--cream-light)', fontWeight: 700 }}>
