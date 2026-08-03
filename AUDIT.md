@@ -295,12 +295,24 @@ L'index anti-doublon des trajets était partiel (`WHERE dedupe_key IS NOT NULL`)
 simple. Ça ne change rien à la protection recherchée, les NULL étant distincts entre eux par défaut
 en PostgreSQL — les saisies manuelles peuvent donc rester nombreuses.
 
-**Le même piège existe sur `idx_bank_transactions_unique`**, qui est un index d'expression
+**Le même piège existait sur `idx_bank_transactions_unique`**, un index d'expression
 (`lower(trim(regexp_replace(description…)))`) visé par un `ON CONFLICT (date, description, amount)`.
-L'import bancaire **fonctionne quand même** : la route `api/bank/extract` a un repli qui insère
-ligne à ligne et laisse l'index rejeter les doublons. Ce n'est donc pas une panne, mais l'import
-passe systématiquement par le chemin lent (un aller-retour par ligne au lieu d'un seul). À reprendre
-quand l'occasion se présentera.
+
+Je l'avais d'abord jugé bénin : la route `api/bank/extract` avait un repli ligne à ligne, donc
+« lent mais pas cassé ». **C'était faux.** L'insertion groupée échouant systématiquement, chaque
+import repartait sur un aller-retour par ligne — 177 requêtes séquentielles pour un relevé de deux
+mois. Assez lent pour que la fonction soit interrompue en cours de route : sur un import réel, les
+78 lignes de juin sont passées et les 99 de juillet ont disparu, sans le moindre message d'erreur.
+La moitié d'un relevé manquait et l'écran annonçait un succès.
+
+Correction : plus de `onConflict` du tout. Un `INSERT` simple n'a besoin d'aucune inférence et
+fonctionne avec cet index ; les doublons connus sont déjà retirés en amont par la comparaison avec
+la base. L'insertion se fait par lots de 50 — **4 requêtes au lieu de 177** — et seul un lot
+réellement en conflit est rejoué ligne à ligne. Enfin, si des lignes manquent à l'arrivée, la
+réponse le dit au lieu d'annoncer un import complet.
+
+La leçon vaut d'être notée : un repli qui « rattrape » une erreur peut la transformer en panne plus
+discrète. Ici, il changeait un échec franc en perte silencieuse de données.
 
 ### Réponses IA tronquées : le bug le plus dangereux trouvé
 
