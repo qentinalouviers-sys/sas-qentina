@@ -763,6 +763,38 @@ défaut. Les contrôles travaillent maintenant sur 1 788 commandes et 2 500
 dépenses — au-dessus du plafond, délibérément — et l'un d'eux vérifie qu'aucun
 compte ne retombe sur 1 000 pile.
 
+### « Sur les factures Metro, tu prends bien que la nourriture ? »
+
+Question de l'exploitant, et la réponse honnête est **non, pas toujours** — le
+comportement dépend d'un détail que rien n'affichait.
+
+| Origine de la dépense | Le matériel est-il exclu ? |
+|---|---|
+| **Facture scannée** | **Oui.** Ventilée ligne à ligne : `alimentaire`, `boisson`, `emballage` au coût matières ; `materiel` aux charges. Un bac gastro Metro n'est pas du food cost. |
+| **Virement bancaire non rapproché** | **Non.** Aucun détail : le virement entre en entier. Produits d'entretien, film alimentaire, petit matériel — tout compte comme de la nourriture. |
+
+Avec 151 mouvements non lettrés, c'est le second cas qui dominait. **Le food
+cost affiché n'était donc pas une mesure, c'était un majorant** — et rien ne le
+disait.
+
+Plutôt que de choisir entre un chiffre exact mais incomplet (factures seules) et
+un chiffre complet mais gonflé (tout compris), l'outil affiche désormais les
+**deux bornes** et la part non détaillée :
+
+- le coût matières total, comme avant, qui reste le plafond ;
+- le coût **réellement ventilé** sur factures, qui est le plancher ;
+- le pourcentage venant de virements sans facture, affiché dès qu'il dépasse
+  10 %.
+
+L'écart entre les deux bornes est exactement ce que le scan des factures ferait
+gagner en précision : c'est la meilleure justification possible du travail à
+faire, et elle est chiffrée.
+
+Une intervention se déclenche au-delà de 40 % non détaillé, **avant** l'alerte
+« food cost hors norme » dont elle est souvent la cause. Reprocher un ratio trop
+haut à quelqu'un dont on ne sait pas mesurer le ratio, c'est l'envoyer chercher
+un problème de gestion qui n'existe peut-être pas.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 **Signalées et non corrigées** — le module « À faire » les remonte déjà, la

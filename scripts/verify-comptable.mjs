@@ -229,6 +229,7 @@ const faits = (o = {}) => ({
   uncategorizedDebits: { count: 0, amount: 0 },
   tva: TVA_SAINE,
   foodCostPercent: 30,
+  foodCostBankSharePercent: 5,
   suspectDateInvoices: { count: 0, sample: [] },
   mojibakeSuppliers: [],
   ccaBalances: [{ associe: 'yohan', balance: 1200 }],
@@ -289,6 +290,29 @@ verifie('… classée critique au-delà de 1 000 €',
 declenche('dépenses sans catégorie', { uncategorizedDebits: { count: 12, amount: 2557 } }, 'depenses-non-categorisees');
 silence('une seule petite dépense non classée', { uncategorizedDebits: { count: 1, amount: 42 } }, 'depenses-non-categorisees');
 
+// Fiabilité du food cost. Une facture scannée est ventilée ligne à ligne et
+// sort le matériel du calcul ; un virement fournisseur sans facture entre en
+// entier, produits d'entretien compris. Au-delà d'un certain seuil, le ratio
+// n'est plus une mesure mais un majorant — et il faut le dire avant de
+// reprocher un food cost trop haut.
+declenche('coût matières à 78 % sans facture',
+  { foodCostBankSharePercent: 78 }, 'food-cost-non-mesure');
+silence('presque tout est facturé', { foodCostBankSharePercent: 5 }, 'food-cost-non-mesure');
+silence('part inconnue : pas d\'alerte',
+  { foodCostBankSharePercent: null }, 'food-cost-non-mesure');
+silence('sans CA, le ratio n\'a pas de sens',
+  { foodCostBankSharePercent: 78, caSquareHt: 0 }, 'food-cost-non-mesure');
+verifie('la fiabilité est annoncée en clair',
+  detectInterventions(faits({ foodCostBankSharePercent: 78 }))
+    .find(i => i.id === 'food-cost-non-mesure').title,
+  'Food cost fiable à 22 % seulement');
+
+// La cause avant la conséquence : la fiabilité passe avant « food cost haut ».
+const fc = detectInterventions(faits({ foodCostPercent: 62, foodCostBankSharePercent: 78 }))
+  .map(i => i.id);
+verifie('fiabilité annoncée avant le food cost hors norme',
+  fc.indexOf('food-cost-non-mesure') < fc.indexOf('food-cost-trop-haut'), true);
+
 // Food cost — ne se déclenche que s'il y a du CA, sinon c'est une conséquence
 declenche('food cost à 62 %', { foodCostPercent: 62 }, 'food-cost-trop-haut');
 declenche('food cost à 9 %', { foodCostPercent: 9 }, 'food-cost-trop-bas');
@@ -336,7 +360,8 @@ const factsBase = await collectInterventionFacts(fakeSupabase({
     { associe: 'justine', sens: 'apport', montant: 300 },
   ],
   mileage_trips: [{ id: 't1', cca_movement_id: null }, { id: 't2', cca_movement_id: 'm1' }],
-}), { start: '2026-06-01', end: '2026-06-30', today: '2026-07-05', foodCostPercent: 41 });
+}), { start: '2026-06-01', end: '2026-06-30', today: '2026-07-05',
+      foodCostPercent: 41, foodCostBankSharePercent: 88 });
 
 verifie('CA Square TTC lu', factsBase.caSquareTtc, 330);
 verifie('CA Square HT (taxes déduites)', factsBase.caSquareHt, 300);
@@ -351,6 +376,7 @@ verifie('fournisseur mal encodé repéré', factsBase.mojibakeSuppliers.length, 
 verifie('compte courant yohan débiteur', factsBase.ccaBalances.find(b => b.associe === 'yohan').balance, -400);
 verifie('compte courant justine créditeur', factsBase.ccaBalances.find(b => b.associe === 'justine').balance, 300);
 verifie('trajets hors compte courant', factsBase.tripsNotInCca.count, 1);
+verifie('part non facturée transmise', factsBase.foodCostBankSharePercent, 88);
 verifie('dernier service synchronisé', factsBase.lastSyncedService === '2026-06-10', true);
 
 const vues = detectInterventions(factsBase).map(i => i.id);

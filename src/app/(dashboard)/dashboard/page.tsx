@@ -111,6 +111,9 @@ export default function DashboardPage() {
     ticketMoyen: 0,
     foodCost: 0,
     foodCostAmt: 0,
+    cogsFactures: 0,
+    cogsBanque: 0,
+    foodCostBanquePercent: 0,
     ratioSalariale: 0,
     totalLabor: 0,
     totalFixedCharges: 0,
@@ -308,8 +311,16 @@ export default function DashboardPage() {
       .filter((t: any) => !matcher.alreadyInvoiced(t))
       .reduce((s: number, t: any) => s + bankAmountHt(t, 'variable_fournisseur'), 0);
 
-    const foodCostAmt = purchasesAlim + purchasesBoisson + purchasesEmballage + bankSuppliersUnreconciled;
+    // Deux origines, deux fiabilités. Une facture scannée est ventilée ligne à
+    // ligne (le matériel Metro en sort) ; un paiement bancaire non rapproché
+    // entre en entier, entretien et petit matériel compris. Le second est donc
+    // un MAJORANT — d'où la part suivie séparément, pour pouvoir le dire.
+    const cogsFactures = purchasesAlim + purchasesBoisson + purchasesEmballage;
+    const foodCostAmt = cogsFactures + bankSuppliersUnreconciled;
     const foodCost = caHt > 0 ? (foodCostAmt / caHt) * 100 : 0;
+    const foodCostBanquePercent = foodCostAmt > 0
+      ? (bankSuppliersUnreconciled / foodCostAmt) * 100
+      : 0;
 
     // ── 4. Masse salariale ───────────────────────────────────────────────────
     const laborTimecards = timecardsRows
@@ -399,6 +410,7 @@ export default function DashboardPage() {
     setKpis({
       caTotal, caHt, nbCommandes, ticketMoyen,
       foodCost, foodCostAmt,
+      cogsFactures, cogsBanque: bankSuppliersUnreconciled, foodCostBanquePercent,
       ratioSalariale, totalLabor,
       totalFixedCharges,
       stockValorise, margeNette, margeNetteAmt,
@@ -419,6 +431,7 @@ export default function DashboardPage() {
         end: endStr,
         today: toISODate(new Date()),
         foodCostPercent: caHt > 0 ? foodCost : null,
+        foodCostBankSharePercent: caHt > 0 ? foodCostBanquePercent : null,
       });
       setInterventions(detectInterventions(facts));
     } catch {
@@ -617,7 +630,11 @@ export default function DashboardPage() {
               <KpiCard
                 label="Food Cost"
                 value={formatPercent(displayFoodRatioToUse)}
-                subValue={`${formatCurrency(displayFoodAmtToUse)} matières / ${formatCurrency(kpis.caHt)} CA HT`}
+                subValue={
+                  kpis.foodCostBanquePercent >= 10
+                    ? `${formatCurrency(displayFoodAmtToUse)} / ${formatCurrency(kpis.caHt)} CA HT — dont ${kpis.foodCostBanquePercent.toFixed(0)}% sans facture (majorant)`
+                    : `${formatCurrency(displayFoodAmtToUse)} matières / ${formatCurrency(kpis.caHt)} CA HT`
+                }
                 icon={<Target size={20} />}
                 accentColor={fcBad ? '#D94F4F' : '#2D8F5E'}
                 badge={{

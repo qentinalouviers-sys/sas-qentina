@@ -86,6 +86,9 @@ export default function PnlPage() {
     purchasesAutreInvoices: 0,
     bankSuppliersUnreconciled: 0,
     totalCogs: 0, // Cost of Goods Sold (Matières)
+    cogsFactures: 0,   // ventilé ligne à ligne : exact
+    cogsBanque: 0,     // paiements sans détail : majorant
+    partBanquePercent: 0,
     
     // Personnel
     laborTimecards: 0,
@@ -292,7 +295,23 @@ export default function PnlPage() {
       const bankSuppliersUnreconciled = activeBankSuppliers.reduce(
         (s: number, t: any) => s + bankAmountHt(t, 'variable_fournisseur'), 0
       );
-      const totalCogs = purchasesAlim + purchasesBoisson + purchasesEmballage + bankSuppliersUnreconciled;
+      // ── Deux food cost, et il faut les distinguer ─────────────────────────
+      //
+      // Une facture SCANNÉE est ventilée ligne à ligne : le bac gastro et le
+      // produit d'entretien achetés chez Metro partent en « matériel », hors
+      // coût matières. C'est exact.
+      //
+      // Un PAIEMENT BANCAIRE non rapproché n'a aucun détail : le virement Metro
+      // entre en entier, entretien et petit matériel compris. C'est donc un
+      // MAJORANT, pas une mesure.
+      //
+      // Tant que la part bancaire domine, le food cost affiché est un plafond.
+      // On garde les deux pour pouvoir le dire — un ratio dont on ignore la
+      // fiabilité ne vaut pas mieux qu'une absence de ratio.
+      const cogsFactures = purchasesAlim + purchasesBoisson + purchasesEmballage;
+      const cogsBanque = bankSuppliersUnreconciled;
+      const totalCogs = cogsFactures + cogsBanque;
+      const partBanquePercent = totalCogs > 0 ? (cogsBanque / totalCogs) * 100 : 0;
 
       // 3. Masse Salariale
       // Timecards (Salaires théoriques)
@@ -367,6 +386,9 @@ export default function PnlPage() {
         purchasesAutreInvoices,
         bankSuppliersUnreconciled,
         totalCogs,
+        cogsFactures,
+        cogsBanque,
+        partBanquePercent,
         laborTimecards,
         laborBank,
         activeLabor,
@@ -859,6 +881,11 @@ export default function PnlPage() {
                 </div>
                 <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
                   Food Cost % : <strong>{formatPercent(calculateRatio(data.totalCogs))}</strong>
+                  {data.partBanquePercent >= 10 && (
+                    <div style={{ marginTop: 3, color: 'var(--orange)' }}>
+                      dont {formatPercent(data.partBanquePercent)} sans détail — majorant
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1050,9 +1077,35 @@ export default function PnlPage() {
                       value={data.bankSuppliersUnreconciled}
                       ratio={calculateRatio(data.bankSuppliersUnreconciled)}
                       color="var(--orange)"
-                      note="Dépenses banque sans facture, ramenées en HT (cliquer pour voir/exclure)"
+                      note="Sans facture : contenu inconnu, matériel compris (cliquer pour voir)"
                       onClick={() => openDetail('bank_suppliers_unreconciled')}
                     />
+
+                    {/* Le food cost ne vaut que ce que vaut son détail. Tant
+                        qu'une part vient de virements bruts, c'est un plafond,
+                        pas une mesure — et l'écart entre les deux est
+                        exactement ce que le scan des factures ferait gagner. */}
+                    {data.partBanquePercent >= 10 && (
+                      <tr>
+                        <td colSpan={4} style={{ padding: '10px 16px 10px 32px', background: 'var(--orange-light)' }}>
+                          <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 12.5, color: '#9A6B1F', lineHeight: 1.5 }}>
+                            <AlertCircle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+                            <span>
+                              <strong>Ce food cost est un maximum, pas une mesure.</strong>{' '}
+                              {formatPercent(data.partBanquePercent)} vient de virements fournisseurs
+                              sans facture ({formatCurrency(data.cogsBanque)}) : leur contenu est
+                              inconnu, donc les produits d&apos;entretien, le film alimentaire et le
+                              petit matériel achetés chez Metro y sont comptés comme de la nourriture.
+                              Une facture scannée, elle, est ventilée ligne à ligne et sort le matériel
+                              du calcul — le food cost réellement mesuré sur factures est de{' '}
+                              <strong>{formatCurrency(data.cogsFactures)}</strong>, soit{' '}
+                              <strong>{formatPercent(calculateRatio(data.cogsFactures))}</strong> du CA.
+                              Le vrai chiffre est entre les deux.
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
 
                     {/* SECTION 3: MARGE BRUTE */}
                     <tr style={{ background: '#E6F5ED', fontWeight: 800 }}>
