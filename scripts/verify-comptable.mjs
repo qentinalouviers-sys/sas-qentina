@@ -230,6 +230,9 @@ const faits = (o = {}) => ({
   tva: TVA_SAINE,
   foodCostPercent: 30,
   foodCostBankSharePercent: 5,
+  laborPercent: 31,
+  laborAmount: 14500,
+  bankCoverage: { firstDate: '2026-06-01', lastDate: '2026-06-30' },
   suspectDateInvoices: { count: 0, sample: [] },
   mojibakeSuppliers: [],
   ccaBalances: [{ associe: 'yohan', balance: 1200 }],
@@ -313,6 +316,47 @@ const fc = detectInterventions(faits({ foodCostPercent: 62, foodCostBankSharePer
 verifie('fiabilité annoncée avant le food cost hors norme',
   fc.indexOf('food-cost-non-mesure') < fc.indexOf('food-cost-trop-haut'), true);
 
+// Couverture bancaire. Le CA vient de la caisse et couvre toujours la période
+// entière ; les achats viennent des relevés importés, qui peuvent n'en couvrir
+// qu'un morceau. Diviser huit mois de ventes par deux mois d'achats ne donne
+// pas un food cost — ça ne donne rien du tout. Cas réel : 46 855 € de CA sur
+// huit mois face à un seul relevé de juin-juillet.
+declenche('relevés sur 2 mois, ventes sur 8',
+  { start: '2026-01-01', end: '2026-12-31', today: '2026-08-03',
+    bankCoverage: { firstDate: '2026-06-01', lastDate: '2026-08-01' } },
+  'banque-periode-incomplete');
+silence('relevés couvrant toute la période',
+  { start: '2026-06-01', end: '2026-08-31', today: '2026-08-31',
+    bankCoverage: { firstDate: '2026-06-01', lastDate: '2026-08-30' } },
+  'banque-periode-incomplete');
+silence('période trop courte pour conclure',
+  { start: '2026-08-01', end: '2026-08-31', today: '2026-08-10',
+    bankCoverage: { firstDate: '2026-08-01', lastDate: '2026-08-02' } },
+  'banque-periode-incomplete');
+silence('aucun relevé importé : autre alerte s\'en charge',
+  { bankCoverage: { firstDate: null, lastDate: null } },
+  'banque-periode-incomplete');
+verifie('la fenêtre s\'arrête à aujourd\'hui, pas à fin décembre',
+  detectInterventions(faits({
+    start: '2026-01-01', end: '2026-12-31', today: '2026-08-03',
+    bankCoverage: { firstDate: '2026-06-01', lastDate: '2026-08-01' },
+  })).find(i => i.id === 'banque-periode-incomplete').title,
+  'Achats connus sur 62 jours, ventes sur 215');
+
+// Masse salariale. Un restaurant sans salaires n'est pas impossible — deux
+// associés non rémunérés au démarrage — mais ça change la lecture de tous les
+// autres ratios, donc ça doit être un choix affiché et non un oubli.
+declenche('1 370 € de salaires pour 1 627 commandes',
+  { laborPercent: 2.9, laborAmount: 1370, ordersCount: 1627 },
+  'masse-salariale-invraisemblable');
+silence('masse salariale normale à 31 %', {}, 'masse-salariale-invraisemblable');
+silence('trop peu de commandes pour conclure',
+  { laborPercent: 2.9, laborAmount: 1370, ordersCount: 40 },
+  'masse-salariale-invraisemblable');
+silence('masse salariale inconnue',
+  { laborPercent: null, ordersCount: 1627 },
+  'masse-salariale-invraisemblable');
+
 // Food cost — ne se déclenche que s'il y a du CA, sinon c'est une conséquence
 declenche('food cost à 62 %', { foodCostPercent: 62 }, 'food-cost-trop-haut');
 declenche('food cost à 9 %', { foodCostPercent: 9 }, 'food-cost-trop-bas');
@@ -377,6 +421,8 @@ verifie('compte courant yohan débiteur', factsBase.ccaBalances.find(b => b.asso
 verifie('compte courant justine créditeur', factsBase.ccaBalances.find(b => b.associe === 'justine').balance, 300);
 verifie('trajets hors compte courant', factsBase.tripsNotInCca.count, 1);
 verifie('part non facturée transmise', factsBase.foodCostBankSharePercent, 88);
+verifie('première date de relevé lue', factsBase.bankCoverage.firstDate === '2026-06-11', true);
+verifie('dernière date de relevé lue', factsBase.bankCoverage.lastDate === '2026-06-23', true);
 verifie('dernier service synchronisé', factsBase.lastSyncedService === '2026-06-10', true);
 
 const vues = detectInterventions(factsBase).map(i => i.id);

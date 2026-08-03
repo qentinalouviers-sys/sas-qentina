@@ -795,6 +795,30 @@ Une intervention se déclenche au-delà de 40 % non détaillé, **avant** l'aler
 haut à quelqu'un dont on ne sait pas mesurer le ratio, c'est l'envoyer chercher
 un problème de gestion qui n'existe peut-être pas.
 
+### Deux ratios qu'on ne peut pas lire, et qui ne le disaient pas
+
+Une fois le chiffre d'affaires vérifié — **46 854,91 € HT contre 46 790 € annoncés
+par l'application Square, soit 0,14 % d'écart** — le tableau de bord affichait
+encore deux ratios impossibles à interpréter.
+
+**Les achats ne couvrent pas la même période que les ventes.** Le chiffre
+d'affaires vient de la caisse : il couvre toujours la fenêtre entière. Les achats
+viennent des relevés bancaires importés, qui peuvent n'en couvrir qu'un morceau.
+Diviser huit mois de ventes par deux mois d'achats ne donne pas un food cost —
+ça ne donne rien du tout, ni dans un sens ni dans l'autre. L'intervention compare
+donc les bornes réelles des relevés à la période analysée, en arrêtant celle-ci à
+aujourd'hui : sur le mois en cours, la fin de période est dans le futur et
+n'appelle aucun relevé.
+
+**Une masse salariale à 2,9 % pour 1 627 commandes servies.** Ce n'est pas
+impossible — deux associés non rémunérés au démarrage, c'est fréquent — mais ça
+change la lecture de tous les autres ratios, et l'alerte le dit dans les deux
+sens : soit les salaires ne sont pas enregistrés et le résultat affiché est très
+surévalué, soit ils ne sont pas versés et la marge ne tient pas compte du travail
+fourni. Dans les deux cas c'est au restaurateur de trancher, pas à l'outil de
+supposer. Classée « à vérifier » pour cette raison, et déclenchée seulement
+au-delà de 200 commandes — en dessous, l'échantillon ne prouve rien.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 **Signalées et non corrigées** — le module « À faire » les remonte déjà, la

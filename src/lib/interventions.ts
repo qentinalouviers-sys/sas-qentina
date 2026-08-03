@@ -84,6 +84,17 @@ export interface InterventionFacts {
 
   /** Dépenses bancaires de la période, hors flux financiers. */
   debitsCount: number;
+  /**
+   * Période réellement couverte par les relevés bancaires importés, à
+   * l'intérieur de la fenêtre analysée.
+   *
+   * Un ratio n'a de sens que si son numérateur et son dénominateur couvrent la
+   * même durée. Le chiffre d'affaires vient de la caisse et couvre toujours la
+   * période entière ; les achats viennent des relevés importés, qui peuvent
+   * n'en couvrir qu'une fraction. Comparer les deux produit un food cost qui ne
+   * veut rien dire, sans que rien ne l'indique.
+   */
+  bankCoverage: { firstDate: string | null; lastDate: string | null };
   /** Dépenses sans catégorie exploitable — elles finissent en « autres ». */
   uncategorizedDebits: { count: number; amount: number };
 
@@ -92,6 +103,9 @@ export interface InterventionFacts {
 
   /** Coût matières en % du CA HT, tel que le P&L le calcule. */
   foodCostPercent: number | null;
+  /** Masse salariale en % du CA HT, et son montant. */
+  laborPercent: number | null;
+  laborAmount: number | null;
   /**
    * Part du coût matières provenant de virements fournisseurs SANS facture,
    * en pourcentage. Au-delà d'un certain seuil, le food cost n'est plus une
@@ -351,7 +365,37 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     });
   }
 
-  // ── 7. Le food cost n'est pas mesuré, il est majoré ──────────────────────
+  // ── 7. Les achats ne couvrent pas la même période que les ventes ─────────
+  // Le CA vient de la caisse : il couvre toujours la fenêtre entière. Les
+  // achats viennent des relevés importés, qui peuvent n'en couvrir qu'un
+  // morceau. Diviser huit mois de ventes par deux mois d'achats ne donne pas
+  // un food cost — ça ne donne rien du tout.
+  if (f.bankCoverage.firstDate && f.bankCoverage.lastDate) {
+    const horizon = f.end < f.today ? f.end : f.today;
+    const attendu = daysBetween(f.start, horizon) + 1;
+    const couvert = daysBetween(f.bankCoverage.firstDate, f.bankCoverage.lastDate) + 1;
+    if (attendu > 45 && couvert < attendu * 0.7) {
+      out.push({
+        id: 'banque-periode-incomplete',
+        severity: 'critique',
+        title: `Achats connus sur ${couvert} jours, ventes sur ${attendu}`,
+        impact:
+          `Les relevés importés ne couvrent que du ${jour(f.bankCoverage.firstDate)} ` +
+          `au ${jour(f.bankCoverage.lastDate)}, alors que le chiffre d'affaires ` +
+          `couvre toute la période. Le food cost et les charges divisent donc ` +
+          `${couvert} jours de dépenses par ${attendu} jours de ventes : le ratio ` +
+          `ne veut rien dire, ni dans un sens ni dans l'autre. C'est le premier ` +
+          `chiffre à réparer, avant même de s'interroger sur le niveau du food cost.`,
+        action:
+          'Importe les relevés bancaires des mois manquants, ou compare sur une ' +
+          'période que tes relevés couvrent entièrement.',
+        href: '/banque',
+        hrefLabel: 'Banque → importer un relevé',
+      });
+    }
+  }
+
+  // ── 8. Le food cost n'est pas mesuré, il est majoré ──────────────────────
   // Une facture scannée est ventilée ligne à ligne : le matériel en sort. Un
   // virement fournisseur sans facture entre en entier — produits d'entretien
   // et petit matériel comptés comme de la nourriture. Placée AVANT l'alerte
@@ -377,7 +421,7 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     });
   }
 
-  // ── 8. Food cost hors de tout intervalle plausible ───────────────────────
+  // ── 9. Food cost hors de tout intervalle plausible ───────────────────────
   // Ne se déclenche qu'une fois qu'il y a du CA ET des achats : sinon c'est
   // une conséquence des alertes précédentes, pas un problème en soi.
   if (f.foodCostPercent !== null && f.caSquareHt > 0) {
@@ -417,7 +461,32 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     }
   }
 
-  // ── 9. Compte courant d'associé débiteur ─────────────────────────────────
+  // ── 10. Masse salariale invraisemblable ──────────────────────────────────
+  // Un restaurant qui sert des milliers de couverts sans masse salariale, ce
+  // n'est pas impossible — deux associés non rémunérés, c'est fréquent au
+  // démarrage — mais ça change la lecture de tous les autres ratios. Il faut
+  // donc que ce soit un choix affiché, pas un oubli silencieux.
+  if (f.laborPercent !== null && f.caSquareHt > 0 && f.ordersCount > 200 && f.laborPercent < 15) {
+    out.push({
+      id: 'masse-salariale-invraisemblable',
+      severity: 'a_verifier',
+      title: `Masse salariale à ${pct(f.laborPercent)} du chiffre d'affaires`,
+      impact:
+        `${eur(f.laborAmount || 0)} de salaires pour ${f.ordersCount} commandes ` +
+        `servies. Un restaurant tourne entre 30 et 35 %. Deux cas, et ils ne se ` +
+        `pilotent pas pareil : soit les salaires ne sont pas enregistrés — le ` +
+        `résultat affiché est alors très surévalué —, soit les associés ne se ` +
+        `rémunèrent pas encore, et il faut le savoir en lisant la marge, parce ` +
+        `qu'elle ne tient pas compte du travail fourni.`,
+      action:
+        'Vérifie que les virements de salaires et les charges URSSAF sont bien ' +
+        'catégorisés « Salaires » dans la page Banque.',
+      href: '/banque',
+      hrefLabel: 'Banque → vérifier les salaires',
+    });
+  }
+
+  // ── 11. Compte courant d'associé débiteur ────────────────────────────────
   // Un solde négatif signifie que la société a avancé de l'argent à l'associé.
   // Pour un gérant de SAS, l'article L.225-43 du code de commerce l'interdit,
   // et le risque est qualifié d'abus de biens sociaux.
@@ -441,7 +510,7 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     }
   }
 
-  // ── 10. Factures à date de repli (01/01) ──────────────────────────────────
+  // ── 12. Factures à date de repli (01/01) ──────────────────────────────────
   if (f.suspectDateInvoices.count > 0) {
     out.push({
       id: 'factures-date-suspecte',
@@ -457,7 +526,7 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     });
   }
 
-  // ── 11. Fournisseurs dupliqués par un encodage cassé ─────────────────────
+  // ── 13. Fournisseurs dupliqués par un encodage cassé ─────────────────────
   if (f.mojibakeSuppliers.length > 0) {
     out.push({
       id: 'fournisseurs-mojibake',
@@ -474,7 +543,7 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     });
   }
 
-  // ── 12. Trajets non portés au compte courant ─────────────────────────────
+  // ── 14. Trajets non portés au compte courant ─────────────────────────────
   if (f.tripsNotInCca.count > 0) {
     out.push({
       id: 'trajets-hors-cca',
@@ -520,6 +589,9 @@ export async function collectInterventionFacts(
     foodCostPercent?: number | null;
     /** Part du coût matières issue de virements sans facture, en %. */
     foodCostBankSharePercent?: number | null;
+    /** Masse salariale en % du CA HT, et son montant. */
+    laborPercent?: number | null;
+    laborAmount?: number | null;
   },
 ): Promise<InterventionFacts> {
   const { start, end, today } = opts;
@@ -617,6 +689,13 @@ export async function collectInterventionFacts(
 
   const tripsNotInCca = trips.filter((t: any) => !t.cca_movement_id).length;
 
+  // Bornes réelles des relevés importés à l'intérieur de la fenêtre. Sert à
+  // dire si les achats couvrent la même durée que les ventes.
+  const bankDates = bank
+    .map((t: any) => String(t.date || ''))
+    .filter(Boolean)
+    .sort();
+
   return {
     start, end, today,
     caSquareTtc: round2(caSquareTtc),
@@ -629,10 +708,16 @@ export async function collectInterventionFacts(
     squarePayoutsTtc: round2(squarePayoutsTtc),
     squarePayoutsCount,
     debitsCount,
+    bankCoverage: {
+      firstDate: bankDates[0] || null,
+      lastDate: bankDates[bankDates.length - 1] || null,
+    },
     uncategorizedDebits: { count: uncatCount, amount: round2(uncatAmount) },
     tva,
     foodCostPercent: opts.foodCostPercent ?? null,
     foodCostBankSharePercent: opts.foodCostBankSharePercent ?? null,
+    laborPercent: opts.laborPercent ?? null,
+    laborAmount: opts.laborAmount ?? null,
     suspectDateInvoices: {
       count: suspect.length,
       sample: suspect.slice(0, 5).map(i => String(i.date)),
