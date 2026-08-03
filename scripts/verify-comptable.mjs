@@ -50,8 +50,18 @@ function fakeSupabase(tables) {
 let echecs = 0;
 const cents = v => Math.round(v * 100);
 
+/**
+ * Compare une valeur à son attendu.
+ *
+ * La comparaison était purement numérique : deux chaînes égales donnaient
+ * `NaN < 0.005` — donc un échec — et deux chaînes différentes aussi. Un test
+ * de chaîne ne pouvait pas passer, et rien ne le disait clairement. Les nombres
+ * gardent leur tolérance au centime ; tout le reste se compare strictement.
+ */
 function verifie(nom, reel, attendu) {
-  const ok = Math.abs(reel - attendu) < 0.005;
+  const ok = (typeof reel === 'number' && typeof attendu === 'number')
+    ? Math.abs(reel - attendu) < 0.005
+    : reel === attendu;
   if (!ok) echecs++;
   console.log(`  ${ok ? '✓' : '✗'} ${nom.padEnd(56)} ${String(reel).padStart(10)}${ok ? '' : `  attendu ${attendu}`}`);
 }
@@ -367,7 +377,8 @@ verifie('facture à 0 € jamais appariée',
 // de ce relevé.
 console.log('\n11. Catégorisation — le libellé décide du poste');
 
-const attendu = (label, cat) => verifie(label.slice(0, 52), categoryFromRules(label) === cat, true);
+const attendu = (label, cat, montant) =>
+  verifie(label.slice(0, 52), categoryFromRules(label, montant) === cat, true);
 
 // Achats revendus : ils appartiennent au coût matières.
 attendu('PRLV SEPA VALLEE DE SEINE BOISS', 'variable_fournisseur');
@@ -381,6 +392,18 @@ attendu('CB42METRO FRANCE 04/06/26', 'variable_fournisseur');
 
 // Le libellé d'un administrateur de biens ne contient jamais « loyer ».
 attendu('VIR INST OBJECTIF PIERRE GESTI', 'fixe_loyer');
+
+// « VIREMENT PERMANENT » est le loyer chez ce restaurant, mais le libellé seul
+// ne le dit pas : la règle exige le montant. Un futur virement permanent
+// (emprunt, épargne) resterait ainsi non classé — visible — au lieu d'être
+// silencieusement compté en loyer.
+attendu('VIREMENT PERMANENT', 'fixe_loyer', -1332.65);
+verifie('virement permanent d\'un autre montant : non classé',
+  categoryFromRules('VIREMENT PERMANENT', -450) === null, true);
+verifie('… ni classé sans montant connu',
+  categoryFromRules('VIREMENT PERMANENT') === null, true);
+verifie('tolérance de 1 € sur le loyer (centimes de révision)',
+  categoryFromRules('VIREMENT PERMANENT', -1333.10), 'fixe_loyer');
 
 // Droits musicaux et logiciels : charges fixes, pas des achats.
 attendu('PRLV SEPA SACEM-SOC AUTEUR COMP', 'fixe_abonnement');

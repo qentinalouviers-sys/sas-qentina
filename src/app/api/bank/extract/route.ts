@@ -74,7 +74,7 @@ async function categorizeLabels(
 function toTransactions(rows: ParsedBankRow[], categories: Record<string, string> | null) {
   const allowed = new Set<string>(CATEGORIES);
   return rows.map(r => {
-    const byRule = categoryFromRules(r.categoryKey);
+    const byRule = categoryFromRules(r.categoryKey, r.amount);
     const byAi = categories?.[r.categoryKey];
     const category = byRule
       ?? (byAi && allowed.has(byAi) ? byAi : null)
@@ -202,7 +202,11 @@ export async function POST(request: NextRequest) {
       if (rows.length > 0) {
         // Les règles locales couvrent la majorité des libellés sans rien
         // coûter ; on ne soumet à l'IA que ceux qu'elles ne reconnaissent pas.
-        const unknown = distinctCategoryKeys(rows).filter(k => !categoryFromRules(k));
+        // Un libellé n'est « inconnu » que si AUCUNE de ses lignes n'est
+        // reconnue : une règle à montant peut n'en couvrir qu'une partie.
+        const unknown = distinctCategoryKeys(rows).filter(
+          k => !rows.some(r => r.categoryKey === k && categoryFromRules(k, r.amount))
+        );
         const categories = await categorizeLabels(anthropic, unknown);
         csvDegraded = categories === null && unknown.length > 0;
         csvExtracted = { transactions: toTransactions(rows, categories) };

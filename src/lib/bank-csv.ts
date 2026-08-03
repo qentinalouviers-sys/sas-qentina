@@ -109,7 +109,25 @@ export function parseBankCsv(text: string): BankCsvResult {
  * L'ordre compte : le premier motif trouvé gagne, du plus spécifique au plus
  * général.
  */
-const RULES: { category: string; terms: string[] }[] = [
+interface Rule {
+  category: string;
+  terms: string[];
+  /**
+   * Montant attendu, à 1 € près. Réserve la règle aux libellés dont le sens
+   * dépend du montant.
+   *
+   * Le cas qui l'a rendue nécessaire : « VIREMENT PERMANENT » est le loyer chez
+   * ce restaurant, mais le libellé ne dit rien de sa destination. Un futur
+   * virement permanent — remboursement d'emprunt, épargne — serait rangé en
+   * loyer sans que rien ne le signale. En exigeant le montant, une évolution
+   * (révision de loyer) fait retomber la ligne en « non classée » : elle
+   * réapparaît dans le bandeau de la page Banque au lieu d'être silencieusement
+   * fausse. Un échec visible vaut mieux qu'un succès douteux.
+   */
+  amountAbout?: number;
+}
+
+const RULES: Rule[] = [
   { category: 'recette', terms: [
     'squareup', 'square', 'stripe', 'ubereats', 'uber eats', 'deliveroo',
     'just eat', 'remise cheque', 'remise de cheque', 'rem chq', 'remise chq',
@@ -132,6 +150,10 @@ const RULES: { category: string; terms: string[] }[] = [
     // Abonnements logiciels de l'établissement.
     'apple', 'anthropic', 'ia claude', 'openai', 'canva', 'shopify', 'wix', 'squarespace',
   ]},
+  // Le loyer réglé par virement permanent : le montant fait partie de la règle
+  // (voir `amountAbout`). Placé avant la règle générale pour être évalué en
+  // premier, l'ordre de la table étant significatif.
+  { category: 'fixe_loyer', terms: ['virement permanent'], amountAbout: 1332.65 },
   { category: 'fixe_loyer', terms: [
     'loyer', 'sci ', 'bail',
     // Administrateurs de biens : le libellé ne contient jamais le mot « loyer ».
@@ -164,12 +186,21 @@ function fold(s: string): string {
 /**
  * Catégorie déduite d'un libellé, ou `null` si aucune règle ne s'applique.
  * Ce sont des valeurs par défaut : elles se corrigent dans l'écran Banque.
+ *
+ * @param amount montant du mouvement. Facultatif, mais les règles portant un
+ *   `amountAbout` ne peuvent pas s'appliquer sans lui — elles sont alors
+ *   ignorées, ce qui laisse la ligne non classée plutôt que mal classée.
  */
-export function categoryFromRules(label: string): string | null {
+export function categoryFromRules(label: string, amount?: number | null): string | null {
   const l = fold(label);
   if (!l) return null;
   for (const rule of RULES) {
-    if (rule.terms.some(t => l.includes(t))) return rule.category;
+    if (!rule.terms.some(t => l.includes(t))) continue;
+    if (rule.amountAbout !== undefined) {
+      if (amount === undefined || amount === null) continue;
+      if (Math.abs(Math.abs(amount) - rule.amountAbout) > 1) continue;
+    }
+    return rule.category;
   }
   return null;
 }

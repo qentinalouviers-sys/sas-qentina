@@ -590,10 +590,27 @@ Trois mesures, dans cet ordre :
 3. **Bandeau permanent sur la page Banque** dès qu'une dépense reste sans
    catégorie, avec le montant en jeu et ce que ça fausse.
 
-Ce qui reste en `autre` après correction (11 609 €) est en grande partie
+Une règle peut aussi porter sur le **montant** (`amountAbout`), et une seule le
+fait : le loyer réglé par « VIREMENT PERMANENT ». Ce libellé ne dit rien de sa
+destination — un futur virement permanent, remboursement d'emprunt ou épargne,
+serait rangé en loyer sans que rien ne le signale. En exigeant le montant, une
+révision de loyer fait retomber la ligne en « non classée » : elle réapparaît
+dans le bandeau au lieu d'être silencieusement fausse. Un échec visible vaut
+mieux qu'un succès douteux.
+
+Ce qui reste en `autre` après correction (10 276 €) est en grande partie
 légitime : 3 948 € de mouvements de compte courant — déjà exclus du résultat par
 `isFinancialFlow` — et des travaux d'aménagement. Le reste attend une décision
 humaine, et le module « À faire » le réclame.
+
+Bilan sur les deux mois réels, décaissements par poste :
+
+| Poste | Avant | Après |
+|---|---:|---:|
+| Achats (coût matières) | 14 539 € | **16 438 €** |
+| Loyer | 0 € | **2 665 €** |
+| Abonnements | 987 € | **1 490 €** |
+| Non classé | 15 343 € | **10 276 €** |
 
 ### « 250,91 € de factures manquantes » : deux sommes qui s'annulent
 

@@ -55,7 +55,7 @@ export async function POST(request: NextRequest) {
   const proposals: Proposal[] = [];
 
   for (const t of rows) {
-    const next = categoryFromRules(t.description || '');
+    const next = categoryFromRules(t.description || '', t.amount);
     if (!next || next === t.category) continue;
 
     // Une règle « recette » ne doit jamais requalifier un débit, ni
