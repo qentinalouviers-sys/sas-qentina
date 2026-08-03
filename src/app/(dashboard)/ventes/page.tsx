@@ -5,7 +5,6 @@ import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate, downloadCSV, toISODate, getParisHour } from '@/lib/utils';
 import { 
   ShoppingCart, 
-  RefreshCw, 
   Download, 
   TrendingUp, 
   Flame, 
@@ -104,7 +103,6 @@ export default function VentesPage() {
   const [topItems, setTopItems] = useState<{ name: string; qty: number; ca: number }[]>([]);
   const [selectedOrder, setSelectedOrder] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
   const [fuegoInsight, setFuegoInsight] = useState<string | null>(null);
   const [loadingInsight, setLoadingInsight] = useState(false);
   
@@ -195,63 +193,6 @@ export default function VentesPage() {
     setItems(data || []);
   };
 
-  /**
-   * Synchronise Square jusqu'au bout.
-   *
-   * La route s'arrête avant d'être coupée par la plateforme et renvoie son
-   * curseur : sans cette reprise, une partie des commandes resterait dehors et
-   * le chiffre d'affaires serait minoré en annonçant un succès. La caisse étant
-   * la référence comptable, c'est l'exhaustivité qui compte, pas la rapidité.
-   */
-  const handleSync = async () => {
-    setSyncing(true);
-    try {
-      let cursor: string | undefined;
-      let orders = 0;
-      let items = 0;
-      let zero = 0;
-      let passes = 0;
-
-      // Garde-fou : 40 reprises couvrent largement une année de commandes.
-      while (passes < 40) {
-        const res = await fetch('/api/square/sync', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(cursor ? { cursor } : {}),
-        });
-        const data = await res.json();
-
-        if (!data.success) {
-          alert('Erreur : ' + (data.error || 'Inconnu'));
-          break;
-        }
-
-        orders += data.synced?.orders || 0;
-        items += data.synced?.items || 0;
-        zero += data.synced?.zeroAmountOrders || 0;
-        passes++;
-
-        if (data.complete) {
-          const alerte = zero > 0
-            ? `\n\nAttention : ${zero} commande(s) sans montant exploitable côté Square.`
-            : '';
-          alert(`Synchronisation terminée : ${orders} commandes, ${items} articles.${alerte}`);
-          break;
-        }
-
-        cursor = data.cursor;
-        if (!cursor) break;
-      }
-
-      if (passes >= 40) {
-        alert(`Synchronisation interrompue après ${orders} commandes (trop de reprises). Relance-la.`);
-      }
-      loadData();
-    } catch {
-      alert('Erreur de synchronisation');
-    }
-    setSyncing(false);
-  };
 
   // Helper to compute HT Net amount from raw_data (excludes VAT)
   const getHtAmount = (o: any) => {
@@ -448,9 +389,6 @@ export default function VentesPage() {
             <Flame size={18} className={loadingInsight ? 'spinning' : ''} /> {loadingInsight ? 'Analyse en cours...' : 'Fuego Insights'}
           </button>
           <button className="btn btn-secondary btn-sm" onClick={exportCSV}><Download size={16} /> CSV</button>
-          <button className="btn btn-primary" onClick={handleSync} disabled={syncing}>
-            <RefreshCw size={18} className={syncing ? 'spinning' : ''} /> {syncing ? 'Synchro...' : 'Synchroniser'}
-          </button>
         </div>
       </div>
       

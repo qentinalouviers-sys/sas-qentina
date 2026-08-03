@@ -9,9 +9,13 @@ import { NextResponse, type NextRequest } from 'next/server';
  *  3. Restreindre le rôle "comptable" aux pages Finance & Compta.
  */
 
-// Routes accessibles sans authentification.
-// Le webhook Square est protégé par sa signature HMAC (voir la route).
-const PUBLIC_PATHS = ['/login', '/api/square/webhook'];
+// Routes accessibles sans session utilisateur.
+// Elles ne sont pas pour autant ouvertes : le webhook Square valide sa
+// signature HMAC, et les travaux planifiés vérifient CRON_SECRET (et refusent
+// de s'exécuter si la variable est absente). Sans cette exemption, l'appel de
+// Vercel Cron — qui n'a évidemment pas de session — serait redirigé vers la
+// page de connexion et la synchronisation nocturne ne tournerait jamais.
+const PUBLIC_PATHS = ['/login', '/api/square/webhook', '/api/cron/'];
 
 // Préfixes autorisés pour le rôle "comptable" (pages + API correspondantes)
 const COMPTABLE_PATHS = [

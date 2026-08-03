@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { Plus, Trash2, Save, Settings, Flame } from 'lucide-react';
+import { Plus, Trash2, Save, Settings, Flame, RefreshCw } from 'lucide-react';
 import { UNITS } from '@/lib/recipes';
 import type { Supplier, Ingredient } from '@/lib/types';
 
@@ -24,8 +24,70 @@ export default function ReglagesPage() {
   const [savingContext, setSavingContext] = useState(false);
   const [openingHours, setOpeningHours] = useState<Record<string, { Midi: boolean; Soir: boolean }>>({ ...DEFAULT_OPENING_HOURS });
   const [savingHours, setSavingHours] = useState(false);
+  const [syncDays, setSyncDays] = useState(365);
+  const [syncing, setSyncing] = useState(false);
+  const [syncReport, setSyncReport] = useState<string | null>(null);
 
   const supabase = createClient();
+
+  /**
+   * Reprise de l'historique Square.
+   *
+   * La route rend la main avant que la plateforme ne la coupe et renvoie son
+   * curseur : on la relance jusqu'à ce qu'elle annonce avoir fini. Sans cette
+   * boucle, une partie des commandes resterait dehors et le chiffre d'affaires
+   * serait minoré en affichant un succès.
+   */
+  const runHistorySync = async () => {
+    setSyncing(true);
+    setSyncReport(null);
+    try {
+      let cursor: string | undefined;
+      let orders = 0;
+      let items = 0;
+      let zero = 0;
+      let passes = 0;
+
+      while (passes < 40) {
+        const res = await fetch('/api/square/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(cursor ? { cursor, days: syncDays } : { days: syncDays }),
+        });
+        const data = await res.json();
+
+        if (!data.success) {
+          setSyncReport(`Erreur : ${data.error || 'cause inconnue'}`);
+          return;
+        }
+
+        orders += data.synced?.orders || 0;
+        items += data.synced?.items || 0;
+        zero += data.synced?.zeroAmountOrders || 0;
+        passes++;
+
+        if (data.complete) {
+          setSyncReport(
+            `${orders} commandes et ${items} articles reprises sur les ${syncDays} derniers jours.`
+            + (zero > 0
+              ? ` Attention : ${zero} commande(s) sans montant exploitable côté Square.`
+              : '')
+          );
+          return;
+        }
+        cursor = data.cursor;
+        if (!cursor) break;
+      }
+      setSyncReport(
+        `Reprise interrompue après ${orders} commandes (trop de reprises successives). `
+        + `Relance pour continuer — aucun doublon ne sera créé.`
+      );
+    } catch {
+      setSyncReport('Erreur : la reprise a échoué. Vérifie ta connexion.');
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   const loadSuppliers = useCallback(async () => {
     const { data } = await supabase.from('suppliers').select('*').order('name');
@@ -264,6 +326,61 @@ export default function ReglagesPage() {
             </div>
           </div>
         )}
+
+        {/* ── Rattrapage de l'historique Square ─────────────────────────────
+            La synchronisation courante tourne chaque nuit et couvre les 45
+            derniers jours. Cette action-ci sert au cas ponctuel : reprendre un
+            historique plus profond. Elle n'a pas sa place dans le geste
+            quotidien, d'où sa présence ici et non sur la page Ventes. */}
+        <div className="card" style={{ marginTop: 20 }}>
+          <div className="card-header">
+            <div>
+              <div className="card-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <RefreshCw size={20} color="var(--teal)" />
+                Historique Square
+              </div>
+              <div className="card-subtitle">
+                La caisse se synchronise automatiquement chaque nuit sur les 45 derniers
+                jours — rien à faire au quotidien. Ce bouton sert uniquement à remonter
+                plus loin, par exemple pour compléter un exercice.
+              </div>
+            </div>
+          </div>
+          <div style={{ padding: '16px 0 0' }}>
+            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12, flexWrap: 'wrap' }}>
+              <div className="form-group" style={{ marginBottom: 0 }}>
+                <label className="form-label">Profondeur à reprendre</label>
+                <select
+                  className="form-select"
+                  value={syncDays}
+                  onChange={e => setSyncDays(Number(e.target.value))}
+                  style={{ minWidth: 180 }}
+                >
+                  <option value={90}>3 derniers mois</option>
+                  <option value={180}>6 derniers mois</option>
+                  <option value={365}>12 derniers mois</option>
+                </select>
+              </div>
+              <button className="btn btn-primary" onClick={runHistorySync} disabled={syncing}>
+                <RefreshCw size={18} className={syncing ? 'spinning' : ''} />
+                {syncing ? 'Reprise en cours…' : 'Reprendre l’historique'}
+              </button>
+            </div>
+            {syncReport && (
+              <div
+                className={`alert ${syncReport.startsWith('Erreur') ? 'alert-warning' : 'alert-success'}`}
+                style={{ marginTop: 16 }}
+              >
+                <span>{syncReport}</span>
+              </div>
+            )}
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 12 }}>
+              L&apos;opération est rejouable sans risque : une commande déjà importée n&apos;est
+              jamais dupliquée. Si elle ne va pas au bout d&apos;un coup, elle reprend d&apos;elle-même
+              là où elle s&apos;est arrêtée.
+            </div>
+          </div>
+        </div>
         </>
         )}
       </div>
