@@ -66,10 +66,25 @@ export interface VehicleConfig {
   registrationType: string;
 }
 
+/**
+ * D'où la détection tire les trajets.
+ *
+ * Un achat laisse deux traces : une facture et une ligne bancaire. Ce sont
+ * deux vues du MÊME déplacement — les cumuler compterait chaque trajet deux
+ * fois. On en choisit donc une, et une seule.
+ *
+ *  - « banque »   : plus complet, toute dépense laisse une ligne, et ça
+ *                   fonctionne sans scanner de facture.
+ *  - « factures » : la pièce justificative qu'un contrôleur demandera, mais
+ *                   seulement pour les factures effectivement scannées.
+ */
+export type DetectionSource = 'banque' | 'factures';
+
 export interface MileageConfig {
   cv: CvBracket;
   electric: boolean;
   defaultDriver: 'justine' | 'yohan';
+  detectionSource: DetectionSource;
   vehicle: VehicleConfig;
   bareme: Record<CvBracket, BaremeRow>;
   /** Année de référence du barème, affichée sur la note de frais. */
@@ -96,6 +111,7 @@ export const DEFAULT_CONFIG: MileageConfig = {
   cv: '7+',
   electric: false,
   defaultDriver: 'justine',
+  detectionSource: 'banque',
   vehicle: {
     model: 'Pössl Summit 600',
     plate: 'GA-175-LB',
@@ -136,6 +152,49 @@ export function cvLabel(cv: CvBracket): string {
 /** Prénom affichable d'un associé. */
 export function driverLabel(driver: string): string {
   return driver === 'justine' ? 'Justine' : 'Yohan';
+}
+
+/**
+ * Date du déplacement déduite d'un libellé bancaire.
+ *
+ * La banque date l'ÉCRITURE, pas l'achat : « CB42METRO FRANCE 04/06/26 » est
+ * débité le 05/06. Pire, un règlement à terme peut arriver des mois après —
+ * une ligne « Metro 27/03 » a été débitée le 1ᵉʳ juin. Sur une note de frais,
+ * c'est le jour où l'on était au magasin qui compte, pas celui du paiement.
+ *
+ * On récupère donc la date collée au libellé quand il y en a une :
+ *  - « … 04/06/26 » → jour/mois/année sur deux chiffres ;
+ *  - « … 27/03 »    → jour/mois, l'année venant de l'écriture (et l'année
+ *                     précédente si cela placerait l'achat dans le futur).
+ *
+ * @returns la date ISO du déplacement, et `exact` à false quand on a dû se
+ *          rabattre sur la date d'écriture.
+ */
+export function tripDateFromLabel(
+  label: string,
+  bankDateIso: string
+): { date: string; exact: boolean } {
+  const l = (label || '').trim();
+
+  const withYear = l.match(/(\d{2})\/(\d{2})\/(\d{2})(?!\d)/);
+  if (withYear) {
+    const [, dd, mm, yy] = withYear;
+    return { date: `20${yy}-${mm}-${dd}`, exact: true };
+  }
+
+  const dayMonth = l.match(/(\d{2})\/(\d{2})(?!\/|\d)/);
+  if (dayMonth && /^\d{4}-\d{2}-\d{2}$/.test(bankDateIso)) {
+    const [, dd, mm] = dayMonth;
+    const year = Number(bankDateIso.slice(0, 4));
+    const candidate = `${year}-${mm}-${dd}`;
+    // Un achat ne peut pas être postérieur à son propre paiement : si c'est le
+    // cas, le libellé référence l'année précédente (paiement à cheval sur
+    // le 1ᵉʳ janvier).
+    const resolved = candidate > bankDateIso ? `${year - 1}-${mm}-${dd}` : candidate;
+    return { date: resolved, exact: true };
+  }
+
+  return { date: bankDateIso, exact: false };
 }
 
 /** Retire les accents et met en minuscules, pour comparer des noms de fournisseurs. */
@@ -276,13 +335,20 @@ export function matchDestination(
 ): DestinationConfig | null {
   const name = normalize(supplierName);
   if (!name) return null;
+  // La banque n'écrit pas les raisons sociales comme les factures :
+  // « EURO CIBUS » sur un relevé, « Eurocibus » sur une facture. On compare
+  // donc aussi en ignorant les espaces, sinon dix prélèvements passent à la
+  // trappe sans que rien ne le signale.
+  const tight = name.replace(/\s+/g, '');
 
   for (const dest of destinations) {
     const terms = dest.supplierMatch
       .split(',')
       .map(t => normalize(t))
       .filter(Boolean);
-    if (terms.some(term => name.includes(term))) return dest;
+    if (terms.some(term => name.includes(term) || tight.includes(term.replace(/\s+/g, '')))) {
+      return dest;
+    }
   }
   return null;
 }

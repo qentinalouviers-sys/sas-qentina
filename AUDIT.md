@@ -211,7 +211,23 @@ format PDF » produit un vrai fichier PDF. Aucune bibliothèque supplémentaire 
 document est mis en page en CSS (`@media print`), avec en-tête, détail des déplacements, barème
 appliqué et emplacements de signature. Les en-têtes de tableau se répètent sur chaque page.
 
-**Tout est paramétrable** (bouton « Réglages » de la page) : identification du véhicule, distances,
+**La détection lit le relevé bancaire ou les factures — jamais les deux.** Un achat laisse deux
+traces qui décrivent le *même* déplacement : les cumuler compterait chaque trajet en double. La
+source se choisit dans les réglages, et le relevé est la valeur par défaut : toute dépense y figure,
+alors qu'une facture n'existe que si elle a été scannée.
+
+Une subtilité qui change les dates : **la banque date l'écriture, pas l'achat**. Un paiement par
+carte est débité un à trois jours après le passage en caisse, et un règlement à terme peut arriver
+des mois plus tard — sur un relevé réel, une ligne « Metro 27/03 » a été débitée le 1ᵉʳ juin. La
+détection récupère donc la date collée au libellé quand il y en a une (`CB42METRO FRANCE 04/06/26`),
+et signale les trajets pour lesquels elle a dû se rabattre sur la date de paiement.
+
+Au passage, la reconnaissance des fournisseurs ignore désormais les espaces : la banque écrit
+« EURO CIBUS » là où la facture porte « Eurocibus ». Sans cela, dix prélèvements passaient à la
+trappe en silence.
+
+**Tout est paramétrable** (bouton « Réglages » de la page) : source de détection, identification du
+véhicule, distances,
 péages, puissance fiscale, motorisation, termes reconnus par fournisseur, et les taux du barème — ce
 dernier étant révisé chaque année par l'administration, le figer dans le code aurait créé un piège de
 maintenance.
