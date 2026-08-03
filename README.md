@@ -96,14 +96,17 @@ base et consomme l'API Square.
 npm run verify:compta
 ```
 
-90 contrôles de non-régression sur les calculs de TVA, la classification des
-écritures et la détection des anomalies. **À lancer après toute modification
-touchant `src/lib/tva.ts`, `src/lib/accounting.ts`, `src/lib/interventions.ts`,
+120 contrôles de non-régression sur les calculs de TVA, la classification des
+écritures, le lettrage et la détection des anomalies. **À lancer après toute
+modification touchant `src/lib/tva.ts`, `src/lib/accounting.ts`,
+`src/lib/bank-csv.ts`, `src/lib/interventions.ts`, `src/lib/reconciliation.ts`,
 le P&L ou le tableau de bord.** Chaque contrôle correspond à une erreur qui a
 réellement été commise : TVA déduite sans facture, ventilation par taux ne
 réconciliant pas avec son total, taux à 7 % classé en 5,5 %, encaissement traité
-comme un achat, coût matières HT divisé par un chiffre d'affaires TTC. Les
-données sont synthétiques, aucune base n'est requise.
+comme un achat, coût matières HT divisé par un chiffre d'affaires TTC, dépenses
+et encaissements se compensant dans un même compteur, encaissement Square
+proposé en lettrage d'une facture EDF, « 28 jours sans vente » comptés le 3 du
+mois. Les données sont synthétiques, aucune base n'est requise.
 
 Trois règles structurent la comptabilité de l'outil, et ne doivent pas être
 contournées :
@@ -158,7 +161,7 @@ src/
 │   │   ├── square/           # sync (rattrapage), webhook (signé HMAC), import-catalog
 │   │   ├── scanner/          # Analyse (étape 1) + confirm (étape 2) + health
 │   │   ├── invoices/extract  # Import direct (analyse + enregistrement en 1 appel)
-│   │   ├── bank/extract      # Relevé bancaire (PDF/CSV) → transactions
+│   │   ├── bank/             # extract (relevé → transactions), recategorize (réapplique les règles)
 │   │   ├── cron/             # Travaux planifiés (synchro Square nocturne, CRON_SECRET)
 │   │   ├── ai/               # Insights ventes, audit stock, réponses aux avis
 │   │   ├── chat/             # Fuego (contexte chiffré du mois injecté)
@@ -175,6 +178,8 @@ src/
     ├── ai/                   # Prompt OCR unique, parseur JSON robuste
     ├── accounting.ts         # Flux financiers, taux indicatifs, conversions HT
     ├── interventions.ts      # Ce qui empêche les chiffres d'être justes (fonction pure)
+    ├── reconciliation.ts     # Lettrage facture ↔ paiement + total des débits
+    ├── bank-csv.ts           # Lecture du relevé + règles de catégorisation
     ├── tva.ts                # Calcul TVA (source de vérité unique)
     ├── square-sync.ts        # Import des commandes (cron + rattrapage manuel)
     ├── recipes.ts            # Coût des recettes + conversion d'unités (anti-cycle)

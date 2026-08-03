@@ -138,15 +138,25 @@ function addDays(iso: string, n: number): string {
 }
 
 /**
- * Plus longue série de jours consécutifs sans aucune vente, en ignorant les
- * deux derniers jours de la fenêtre : la synchro nocturne n'a pas encore
- * tourné pour eux, leur absence de ventes ne prouve rien.
+ * Plus longue série de jours consécutifs sans aucune vente.
+ *
+ * La fenêtre examinée s'arrête deux jours avant **le plus proche** de la fin de
+ * période et d'aujourd'hui. Les deux bornes comptent, et pour deux raisons
+ * différentes :
+ *
+ *  - la fin de période, parce que la synchro nocturne n'a pas encore tourné
+ *    pour les tout derniers jours ;
+ *  - **aujourd'hui**, parce que la période sélectionnée est le plus souvent le
+ *    mois en cours : sa fin est dans le futur. Sans cette borne, l'outil
+ *    annonçait « 28 jours consécutifs sans aucune vente » le 3 du mois — en
+ *    comptant des jours qui n'ont pas encore eu lieu.
  */
 function longestSalesGap(
-  start: string, end: string, daysWithSales: string[],
+  start: string, end: string, daysWithSales: string[], today: string,
 ): { length: number; from: string; to: string } | null {
   const sold = new Set(daysWithSales);
-  const lastMeaningful = addDays(end, -2);
+  const horizon = end < today ? end : today;
+  const lastMeaningful = addDays(horizon, -2);
   const span = daysBetween(start, lastMeaningful);
   if (span < 0) return null;
 
@@ -250,7 +260,7 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
   }
 
   // ── 3. Trous dans l'historique des ventes ────────────────────────────────
-  const gap = longestSalesGap(f.start, f.end, f.daysWithSales);
+  const gap = longestSalesGap(f.start, f.end, f.daysWithSales, f.today);
   if (gap && gap.length >= 3) {
     out.push({
       id: 'trou-historique-ventes',

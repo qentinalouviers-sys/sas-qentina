@@ -553,7 +553,130 @@ d'affaires est incomplet envoie chercher une cause qui n'existe pas.
 
 `npm run verify:compta` compte désormais **90 contrôles**.
 
+### Le P&L n'ignorait pas les achats : il ne les reconnaissait pas
+
+Un audit externe a conclu que « le P&L ignore les achats ». Le diagnostic était
+faux, mais le symptôme réel. Rejoué sur le relevé bancaire de juin-juillet 2026,
+la chaîne de calcul du P&L donne :
+
+| Catégorie attribuée | Lignes | Montant |
+|---|---:|---:|
+| **`autre`** | **57** | **15 342,99 €** |
+| `variable_fournisseur` | 50 | 14 539,43 € |
+| abonnements / assurance / impôts | 16 | 1 341,16 € |
+
+**49 % des décaissements tombaient en `autre`** — et `autre` part dans les
+charges fixes, pas dans le coût matières. Aucun bug de calcul, aucun flux
+financier écarté à tort (0 ligne) : la table de règles ne reconnaissait
+simplement pas la moitié des fournisseurs. Un grossiste en boissons, un
+traiteur, un torréfacteur, le bois du four et l'administrateur de biens qui
+encaisse le loyer n'y figuraient pas.
+
+Trois mesures, dans cet ordre :
+
+1. **Règles étendues** — boissons, traiteurs, producteurs, café, bois de four,
+   administrateurs de biens, droits musicaux (SACEM, SPRE), abonnements
+   logiciels. Vérifié libellé par libellé sur le relevé réel : les achats
+   passent de 14 539 € à 16 438 €, le loyer est trouvé, et **aucune règle ne se
+   déclenche à tort** — les 10 libellés réellement inconnus restent non classés.
+   Une règle trop large est pire qu'une règle absente : elle range au hasard
+   sans le dire.
+2. **Réapplication aux lignes déjà importées** (`POST /api/bank/recategorize`).
+   Sans elle, une règle ajoutée ne vaut que pour les relevés à venir et les
+   mouvements en base restent faux indéfiniment. La route ne touche **que** les
+   lignes en `autre` ou sans catégorie, refuse de requalifier un débit en
+   recette (le signe est un fait), et s'appelle d'abord en simulation : la page
+   Banque montre le détail par catégorie avant d'écrire quoi que ce soit.
+3. **Bandeau permanent sur la page Banque** dès qu'une dépense reste sans
+   catégorie, avec le montant en jeu et ce que ça fausse.
+
+Ce qui reste en `autre` après correction (11 609 €) est en grande partie
+légitime : 3 948 € de mouvements de compte courant — déjà exclus du résultat par
+`isFinancialFlow` — et des travaux d'aménagement. Le reste attend une décision
+humaine, et le module « À faire » le réclame.
+
+### « 250,91 € de factures manquantes » : deux sommes qui s'annulent
+
+`banque/page.tsx` sommait les montants **signés** des mouvements en attente, puis
+affichait la valeur absolue du résultat. Les versements Square annulaient donc
+les achats fournisseurs : **21 024 € de dépenses sans facture s'affichaient
+« 250,91 € »**, soit 1 % du réel.
+
+Les trois compteurs de la page parlent de factures fournisseurs : ils ne
+comptent plus que les **débits**, en valeur absolue et en centimes entiers
+(`sumDebits`). Deux précautions au lieu d'une — filtrer les crédits *et*
+additionner des valeurs absolues — parce qu'une somme de dépenses ne doit jamais
+pouvoir se compenser, quelle que soit l'erreur en amont.
+
+### Un encaissement Square proposé en règlement d'une facture EDF
+
+Le moteur de suggestions comparait `Math.abs(tx.amount)` au TTC des factures :
+un virement **reçu** pouvait donc être proposé comme paiement d'une facture
+d'achat. Et la proximité de date valait 30 points — exactement le seuil
+d'acceptation : deux écritures de la même semaine étaient appariées **sans le
+moindre autre point commun**.
+
+`lib/reconciliation.ts` (extrait de la page pour être testable) impose deux
+règles : un crédit ne reçoit aucune suggestion, et il faut au moins un lien de
+**montant** ou de **nom** pour qu'une facture soit proposée. La date corrobore,
+elle ne prouve plus rien seule.
+
+### Compte courant d'associé : le solde à la bonne date
+
+Un remboursement de 1 000 € daté du 1er avril passait le contrôle sans alerte
+parce que le garde-fou testait le solde **total**, apports postérieurs inclus.
+On ne rembourse pas aujourd'hui avec l'argent apporté en juin : le contrôle porte
+maintenant sur le solde **à la date du mouvement**, et l'avertissement affiche
+les trois chiffres (solde avant, remboursement, solde après) plus l'article
+L.225-43 du code de commerce.
+
+Symétriquement, le solde courant affiché classait les mouvements d'une même
+journée par ordre de **saisie** : un remboursement enregistré avant l'apport du
+même jour affichait un débiteur de −4,65 € qui n'existait pas. À l'intérieur
+d'une journée, les apports passent désormais avant les remboursements — une
+journée comptable n'a pas de chronologie interne, et présenter l'inverse est une
+erreur de lecture, pas un fait à signaler.
+
+### Le compteur « jours sans vente » comptait des jours à venir
+
+Défaut introduit avec le module « À faire » : la fenêtre d'analyse s'arrêtait
+deux jours avant la fin de la **période sélectionnée**. Or la période par défaut
+est le mois en cours, dont la fin est dans le futur — le 3 août, l'outil
+annonçait « 28 jours consécutifs sans aucune vente » en comptant 25 jours qui
+n'avaient pas eu lieu. La fenêtre est maintenant bornée au plus proche de la fin
+de période et d'**aujourd'hui**.
+
+### Ce qui a été vérifié et jugé correct
+
+Deux points signalés par l'audit externe n'étaient pas des défauts :
+
+- **L'arrondi des frais kilométriques.** 2 408 km × 0,697 = 1 678,376 € arrondi
+  à 1 678,38 €, ce qui est l'arrondi commercial correct. La ventilation par
+  trajet (`allocateShares`) travaille en centimes entiers avec la méthode du
+  plus fort reste : la somme des lignes égale le total **exactement**, par
+  construction.
+- **La page Ventes à 0 €.** Elle s'ouvre sur la semaine en cours ; un lundi,
+  cela fait une seule journée. Le 0 € était le symptôme de la synchro Square
+  arrêtée, pas un bug d'affichage.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
+
+**Signalées et non corrigées** — le module « À faire » les remonte déjà, la
+correction attend :
+- **Fournisseur dupliqué par un encodage cassé** (« MÃ©tro » face à « Métro ») :
+  les achats se répartissent entre deux fiches, aucun des deux totaux n'est
+  exploitable. Il manque une fusion de fiches fournisseur.
+- **Factures datées d'un 1er janvier** : l'OCR invente cette date quand il ne
+  sait pas lire celle du document. Le prompt lui interdit déjà d'inventer, sans
+  garantie ; il faudrait bloquer l'enregistrement et faire confirmer la date.
+- **Facture sans numéro ni TVA** (Eurocibus) : l'article 242 nonies A du CGI
+  impose le numéro. Sans lui, la déduction est contestable — à signaler à
+  l'import, pas seulement à la lecture.
+- **Carburant et barème kilométrique** : l'un exclut l'autre. Un plein Esso et
+  une indemnité kilométrique sur le même mois est une double déduction, à
+  détecter.
+
+**Chantiers de fond :**
 - Stock : les achats et ventes sont cumulés **depuis toujours** — un vrai calcul d'écart devrait
   repartir du dernier inventaire. C'est un chantier métier à part entière.
 - Rapprochement produit↔ingrédient par « le nom contient » : fonctionne mais fragile
