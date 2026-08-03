@@ -8,6 +8,13 @@ import {
 } from '@/lib/utils';
 import { computeTva } from '@/lib/tva';
 import {
+  isFinancialFlow, orderHtAmount, bankAmountHt, makeInvoiceMatcher,
+} from '@/lib/accounting';
+import {
+  collectInterventionFacts, detectInterventions, type Intervention,
+} from '@/lib/interventions';
+import { InterventionsCard } from '@/components/Interventions';
+import {
   TrendingUp, TrendingDown, DollarSign, ShoppingCart,
   Users, Package, Target, Percent, AlertTriangle,
   Activity, Zap, BarChart2, CreditCard, Clock, Star,
@@ -93,8 +100,12 @@ export default function DashboardPage() {
   const [chargesDetails, setChargesDetails] = useState<any[]>([]);
   const [showChargesModal, setShowChargesModal] = useState(false);
 
+  const [interventions, setInterventions] = useState<Intervention[]>([]);
+
   const [kpis, setKpis] = useState({
     caTotal: 0,
+    caHt: 0,
+    paiementsDejaFactures: 0,
     nbCommandes: 0,
     ticketMoyen: 0,
     foodCost: 0,
@@ -150,7 +161,7 @@ export default function DashboardPage() {
         .select('id, total_ht, total_ttc, supplier:suppliers(name)')
         .gte('date', startStr).lte('date', endStr),
       supabase.from('bank_transactions')
-        .select('id, amount')
+        .select('id, amount, description, category')
         .eq('category', 'variable_fournisseur')
         .is('invoice_id', null)
         .gte('date', startStr).lte('date', endStr),
@@ -158,7 +169,7 @@ export default function DashboardPage() {
         .select('id, hours_worked, hourly_rate')
         .gte('start_at', start.toISOString()).lte('start_at', end.toISOString()),
       supabase.from('bank_transactions')
-        .select('id, amount')
+        .select('id, amount, description, category')
         .eq('category', 'variable_salaire')
         .gte('date', startStr).lte('date', endStr),
       supabase.from('bank_transactions')
@@ -176,9 +187,18 @@ export default function DashboardPage() {
       : [];
     const notMasked = (row: { id?: string | number }) => !maskedIds.includes(String(row.id));
 
+    // Prêts, apports, mouvements de compte courant : ni charge, ni recette.
+    // Le même filtre qu'en P&L, sans quoi les deux écrans divergent.
+    const sansFlux = (rows: any[]) =>
+      rows.filter(t => !isFinancialFlow(t.description || '', t.category));
+
     // ── 1. Ventes Square ─────────────────────────────────────────────────────
+    // Deux montants, et jamais l'un pour l'autre : le TTC est ce que le client
+    // a payé (c'est le chiffre de la caisse), le HT est la seule base sur
+    // laquelle un ratio de gestion se calcule.
     const activeOrders = (ordersRes.data || []).filter(notMasked);
     const caTotal = activeOrders.reduce((s: number, o: any) => s + (o.net_amount || 0), 0);
+    const caHt = activeOrders.reduce((s: number, o: any) => s + orderHtAmount(o), 0);
     const validOrders = activeOrders.filter((o: any) => (o.net_amount || 0) > 0);
     const nbCommandes = validOrders.length;
     const ticketMoyen = nbCommandes > 0 ? caTotal / nbCommandes : 0;
@@ -269,27 +289,36 @@ export default function DashboardPage() {
     }
 
     // ── 3. Dépenses fournisseurs non rapprochées (banque) ───────────────────
-    const bankSuppliersUnreconciled = (bankSuppliersRes.data || [])
+    // Deux précautions, identiques au P&L :
+    //  - un paiement égal au centime au TTC d'une facture de la période est
+    //    déjà compté par cette facture (sinon l'achat compte double) ;
+    //  - les montants bancaires sont TTC, les lignes de facture HT : on ramène
+    //    les premiers en HT pour que le ratio veuille dire quelque chose.
+    const matcher = makeInvoiceMatcher(invoices as any[]);
+    const bankSuppliersUnreconciled = sansFlux(bankSuppliersRes.data || [])
       .filter(notMasked)
-      .reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
+      .filter((t: any) => !matcher.alreadyInvoiced(t))
+      .reduce((s: number, t: any) => s + bankAmountHt(t, 'variable_fournisseur'), 0);
 
     const foodCostAmt = purchasesAlim + purchasesBoisson + purchasesEmballage + bankSuppliersUnreconciled;
-    const foodCost = caTotal > 0 ? (foodCostAmt / caTotal) * 100 : 0;
+    const foodCost = caHt > 0 ? (foodCostAmt / caHt) * 100 : 0;
 
     // ── 4. Masse salariale ───────────────────────────────────────────────────
     const laborTimecards = (timecardsRes.data || [])
       .filter(notMasked)
       .reduce((s: number, t: any) => s + (t.hours_worked || 0) * (t.hourly_rate || 0), 0);
-    const laborBank = (bankSalariesRes.data || [])
+    const laborBank = sansFlux(bankSalariesRes.data || [])
       .filter(notMasked)
       .reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
 
     const totalLabor = laborBank > 0 ? laborBank : laborTimecards;
-    const ratioSalariale = caTotal > 0 ? (totalLabor / caTotal) * 100 : 0;
+    const ratioSalariale = caHt > 0 ? (totalLabor / caHt) * 100 : 0;
 
     // ── 5. Charges fixes ─────────────────────────────────────────────────────
-    const activeFixedTx = (fixedTxRes.data || []).filter(notMasked);
-    const fixedFromBank = activeFixedTx.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
+    const activeFixedTx = sansFlux(fixedTxRes.data || [])
+      .filter(notMasked)
+      .filter((t: any) => !matcher.alreadyInvoiced(t));
+    const fixedFromBank = activeFixedTx.reduce((s: number, t: any) => s + bankAmountHt(t), 0);
     const totalFixedCharges = fixedFromBank + purchasesMateriel + purchasesAutreInvoices;
 
     // Détails pour la modale
@@ -354,11 +383,12 @@ export default function DashboardPage() {
     }).sort((a, b) => b.marge - a.marge);
 
     // ── 9. EBE ───────────────────────────────────────────────────────────────
-    const margeNetteAmt = caTotal - foodCostAmt - totalLabor - totalFixedCharges;
-    const margeNette = caTotal > 0 ? (margeNetteAmt / caTotal) * 100 : 0;
+    // Sur base HT : la TVA collectée n'est pas un revenu, elle est due à l'État.
+    const margeNetteAmt = caHt - foodCostAmt - totalLabor - totalFixedCharges;
+    const margeNette = caHt > 0 ? (margeNetteAmt / caHt) * 100 : 0;
 
     setKpis({
-      caTotal, nbCommandes, ticketMoyen,
+      caTotal, caHt, nbCommandes, ticketMoyen,
       foodCost, foodCostAmt,
       ratioSalariale, totalLabor,
       totalFixedCharges,
@@ -367,8 +397,25 @@ export default function DashboardPage() {
       caEvolution, caSparkData,
       topProduits, achatsParCategorie, achatsParFournisseur,
       margeParRecette, caByDayService,
+      paiementsDejaFactures: matcher.count(),
     });
     setLoading(false);
+
+    // ── 10. Interventions ────────────────────────────────────────────────────
+    // Lancé APRÈS l'affichage : le module dit ce qui empêche les chiffres
+    // d'être justes, mais il ne doit pas retarder les chiffres eux-mêmes.
+    try {
+      const facts = await collectInterventionFacts(supabase, {
+        start: startStr,
+        end: endStr,
+        today: toISODate(new Date()),
+        foodCostPercent: caHt > 0 ? foodCost : null,
+      });
+      setInterventions(detectInterventions(facts));
+    } catch {
+      // Une base incomplète (table absente) ne doit pas casser l'accueil.
+      setInterventions([]);
+    }
   }, [period]);
 
   useEffect(() => { loadKPIs(); }, [loadKPIs]);
@@ -396,8 +443,8 @@ export default function DashboardPage() {
   const realValues: Record<SimKey, { percent: number; euro: number }> = {
     labor: { percent: kpis.ratioSalariale, euro: kpis.totalLabor },
     food: { percent: kpis.foodCost, euro: kpis.foodCostAmt },
-    fixed: { percent: kpis.caTotal > 0 ? (kpis.totalFixedCharges / kpis.caTotal) * 100 : 0, euro: kpis.totalFixedCharges },
-    stock: { percent: kpis.caTotal > 0 ? (kpis.stockValorise / kpis.caTotal) * 100 : 0, euro: kpis.stockValorise },
+    fixed: { percent: kpis.caHt > 0 ? (kpis.totalFixedCharges / kpis.caHt) * 100 : 0, euro: kpis.totalFixedCharges },
+    stock: { percent: kpis.caHt > 0 ? (kpis.stockValorise / kpis.caHt) * 100 : 0, euro: kpis.stockValorise },
   };
 
   const setSimValue = (key: SimKey, value: string) =>
@@ -412,8 +459,8 @@ export default function DashboardPage() {
       const parsed = parseFloat(cur.value);
       if (cur.value !== '' && !isNaN(parsed)) {
         value = mode === 'euro'
-          ? ((parsed * kpis.caTotal) / 100).toFixed(0)
-          : (kpis.caTotal > 0 ? (parsed / kpis.caTotal) * 100 : 0).toFixed(1);
+          ? ((parsed * kpis.caHt) / 100).toFixed(0)
+          : (kpis.caHt > 0 ? (parsed / kpis.caHt) * 100 : 0).toFixed(1);
       }
       return { ...prev, [key]: { value, mode } };
     });
@@ -423,9 +470,9 @@ export default function DashboardPage() {
     const parsed = parseFloat(sim[key].value);
     if (sim[key].value === '' || isNaN(parsed)) return null;
     if (sim[key].mode === 'percent') {
-      return { percent: parsed, euro: (kpis.caTotal * parsed) / 100 };
+      return { percent: parsed, euro: (kpis.caHt * parsed) / 100 };
     }
-    return { percent: kpis.caTotal > 0 ? (parsed / kpis.caTotal) * 100 : 0, euro: parsed };
+    return { percent: kpis.caHt > 0 ? (parsed / kpis.caHt) * 100 : 0, euro: parsed };
   };
 
   const simLabor = simulated('labor');
@@ -444,17 +491,21 @@ export default function DashboardPage() {
   // Un stock simulé plus haut = moins de matière consommée → food cost plus bas
   const stockChange = displayStockAmt - kpis.stockValorise;
   const adjustedFoodAmt = baseFoodAmt - stockChange;
-  const adjustedFoodRatio = kpis.caTotal > 0 ? (adjustedFoodAmt / kpis.caTotal) * 100 : 0;
+  const adjustedFoodRatio = kpis.caHt > 0 ? (adjustedFoodAmt / kpis.caHt) * 100 : 0;
 
   const displayFoodRatioToUse = (simFood || simStock) ? adjustedFoodRatio : kpis.foodCost;
   const displayFoodAmtToUse = (simFood || simStock) ? adjustedFoodAmt : kpis.foodCostAmt;
 
   const displayPrimeCost = displayFoodRatioToUse + displayLaborRatio;
-  const displayMargeNetteAmt = kpis.caTotal - (adjustedFoodAmt + displayLaborAmt + displayFixedAmt);
-  const displayMargeNetteRatio = kpis.caTotal > 0 ? (displayMargeNetteAmt / kpis.caTotal) * 100 : 0;
+  const displayMargeNetteAmt = kpis.caHt - (adjustedFoodAmt + displayLaborAmt + displayFixedAmt);
+  const displayMargeNetteRatio = kpis.caHt > 0 ? (displayMargeNetteAmt / kpis.caHt) * 100 : 0;
 
   const fcBad = displayFoodRatioToUse > FOOD_COST_TARGET;
   const tvaBad = kpis.tvaNette > 0;
+
+  const chiffresFiables = !interventions.some(i => i.severity === 'critique');
+  const { start: periodStart, end: periodEnd } = getDateRange(period);
+  const periodLabel = `${formatDate(toISODate(periodStart))} → ${formatDate(toISODate(periodEnd))}`;
 
   const CAT_COLORS = ['#2A7D7B', '#E89B3E', '#7C3AED', '#2D8F5E', '#D94F4F', '#1A5AA0'];
   const ORDERED_DAYS = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche'];
@@ -480,15 +531,22 @@ export default function DashboardPage() {
           <LoadingPage text="Chargement du tableau de bord…" />
         ) : (
           <>
-            {/* ── Alertes critiques ────────────────────────────────────────── */}
-            {(fcBad || tvaBad) && (
+            {/* ── À faire : ce qui empêche les chiffres d'être justes ──────── */}
+            <InterventionsCard items={interventions} periodLabel={periodLabel} />
+
+            {/* ── Alertes de pilotage ──────────────────────────────────────
+                Masquées tant qu'une intervention critique est ouverte :
+                annoncer un food cost « au-dessus de la cible » alors que le
+                chiffre d'affaires est incomplet envoie chercher un problème
+                de gestion qui n'existe pas. */}
+            {chiffresFiables && (fcBad || tvaBad) && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 20 }}>
                 {fcBad && (
                   <div className="alert alert-danger" style={{ gap: 10 }}>
                     <AlertTriangle size={16} />
                     <span>
                       Food cost à <strong>{formatPercent(kpis.foodCost)}</strong> — dépasse l&apos;objectif de {FOOD_COST_TARGET}%.
-                      {kpis.caTotal > 0 && ` Soit ${formatCurrency(kpis.foodCostAmt)} sur ${formatCurrency(kpis.caTotal)} de CA.`}
+                      {kpis.caHt > 0 && ` Soit ${formatCurrency(kpis.foodCostAmt)} sur ${formatCurrency(kpis.caHt)} de CA HT.`}
                     </span>
                   </div>
                 )}
@@ -508,9 +566,9 @@ export default function DashboardPage() {
             <SectionHeader title="Performance commerciale" subtitle="Ventes & activité" icon={<TrendingUp size={18} />} />
             <div className="kpi-grid-auto">
               <KpiCard
-                label="Chiffre d'affaires"
+                label="Chiffre d'affaires TTC"
                 value={formatCurrency(kpis.caTotal)}
-                subValue={`${kpis.nbCommandes} commandes`}
+                subValue={`${formatCurrency(kpis.caHt)} HT · ${kpis.nbCommandes} commandes`}
                 icon={<DollarSign size={20} />}
                 accentColor="#2A7D7B"
                 spark={kpis.caSparkData}
@@ -550,7 +608,7 @@ export default function DashboardPage() {
               <KpiCard
                 label="Food Cost"
                 value={formatPercent(displayFoodRatioToUse)}
-                subValue={`${formatCurrency(displayFoodAmtToUse)} matières / ${formatCurrency(kpis.caTotal)} CA`}
+                subValue={`${formatCurrency(displayFoodAmtToUse)} matières / ${formatCurrency(kpis.caHt)} CA HT`}
                 icon={<Target size={20} />}
                 accentColor={fcBad ? '#D94F4F' : '#2D8F5E'}
                 badge={{
@@ -580,7 +638,7 @@ export default function DashboardPage() {
               <KpiCard
                 label="Charges Fixes & Ops"
                 value={formatCurrency(displayFixedAmt)}
-                subValue={kpis.caTotal > 0 ? `${displayFixedRatio.toFixed(1)}% du CA` : '0% du CA'}
+                subValue={kpis.caHt > 0 ? `${displayFixedRatio.toFixed(1)}% du CA HT` : '0% du CA HT'}
                 icon={<CreditCard size={20} />}
                 accentColor="#7C3AED"
                 badge={simFixed ? { text: '🧪 Simulé', type: 'neutral' } : undefined}
@@ -769,7 +827,7 @@ export default function DashboardPage() {
               <KpiCard
                 label="TVA Collectée (Ventes)"
                 value={formatCurrency(kpis.tvaCollectee)}
-                subValue={`${kpis.caTotal > 0 ? ((kpis.tvaCollectee / kpis.caTotal) * 100).toFixed(1) : '0'}% du CA`}
+                subValue={`${kpis.caHt > 0 ? ((kpis.tvaCollectee / kpis.caHt) * 100).toFixed(1) : '0'}% du CA HT`}
                 icon={<CreditCard size={20} />}
                 accentColor="#2A7D7B"
               />

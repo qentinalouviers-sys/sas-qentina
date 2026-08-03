@@ -128,3 +128,88 @@ export function invoiceVat(inv: {
 export function round2(n: number): number {
   return Math.round((n + Number.EPSILON) * 100) / 100;
 }
+
+// ─── Bases de calcul : tout ramener en HT ────────────────────────────────────
+//
+// Les trois fonctions suivantes existent parce que le P&L et le tableau de bord
+// affichaient deux food cost différents pour le même mois. La cause n'était pas
+// une erreur de calcul mais un mélange de bases : les lignes de facture sont en
+// HT, les mouvements bancaires en TTC, et le chiffre d'affaires Square en TTC.
+// Un ratio qui divise des HT par des TTC ne vaut rien — et ne peut surtout pas
+// être comparé aux références du métier (28-32 % de food cost, calculés HT
+// sur HT).
+
+/**
+ * Chiffre d'affaires HT d'une commande Square telle qu'elle est stockée.
+ *
+ * `net_amount` est le TTC net de remboursements. La taxe se lit dans les
+ * données brutes de Square, jamais reconstituée par un taux supposé.
+ */
+export function orderHtAmount(o: {
+  net_amount?: number | null;
+  raw_data?: any;
+}): number {
+  const raw = o.raw_data || {};
+  const taxCents =
+    raw.total_tax_money?.amount ?? raw.net_amounts?.tax_money?.amount ?? 0;
+  return (o.net_amount || 0) - taxCents / 100;
+}
+
+/**
+ * Montant HT d'un mouvement bancaire, au taux **indicatif** de sa catégorie.
+ *
+ * Approximation assumée, et bornée : elle ne sert qu'à rendre un ratio de
+ * gestion comparable. Elle ne produit aucune TVA déductible — celle-ci vient
+ * exclusivement des factures (art. 271 CGI, cf. `lib/tva.ts`). Une catégorie
+ * inconnue renvoie le TTC tel quel : mieux vaut un ratio légèrement majoré
+ * qu'une déduction inventée.
+ */
+export function bankAmountHt(
+  t: { amount?: number | null; category?: string | null },
+  fallbackCategory?: string,
+): number {
+  const ttc = Math.abs(t.amount || 0);
+  const rate = estimatedVatRate(t.category ?? fallbackCategory);
+  return rate > 0 ? ttc / (1 + rate) : ttc;
+}
+
+/**
+ * Apparieur souple facture ↔ paiement bancaire.
+ *
+ * Le rapprochement bancaire n'est pas fait : `invoice_id` est vide sur la
+ * plupart des mouvements. Compter à la fois les lignes d'une facture scannée
+ * ET son paiement bancaire compte l'achat deux fois — c'est ce qui gonflait le
+ * coût matières sans que rien ne le signale.
+ *
+ * L'appariement se fait sur l'égalité **au centime** entre le montant payé et
+ * le TTC d'une facture de la période. La règle est volontairement stricte :
+ * elle n'écarte que des doublons évidents, et chaque facture ne peut servir
+ * qu'une fois — sans quoi dix paiements identiques seraient tous absorbés par
+ * une seule facture.
+ *
+ * Ce n'est pas un substitut au rapprochement : c'est un garde-fou en attendant
+ * qu'il soit fait. `count()` sert à le dire à l'utilisateur.
+ */
+export function makeInvoiceMatcher(
+  invoices: { total_ttc?: number | null }[],
+): { alreadyInvoiced(t: { amount?: number | null }): boolean; count(): number } {
+  const pool = new Map<number, number>();
+  for (const inv of invoices) {
+    const c = Math.round((inv.total_ttc || 0) * 100);
+    if (c > 0) pool.set(c, (pool.get(c) || 0) + 1);
+  }
+  let matched = 0;
+  return {
+    alreadyInvoiced(t) {
+      const c = Math.round(Math.abs(t.amount || 0) * 100);
+      const n = pool.get(c);
+      if (n && n > 0) {
+        pool.set(c, n - 1);
+        matched++;
+        return true;
+      }
+      return false;
+    },
+    count: () => matched,
+  };
+}
