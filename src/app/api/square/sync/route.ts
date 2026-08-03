@@ -1,26 +1,57 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { requireUser } from '@/lib/supabase/api-auth';
 import { squareFetch, toOrderRow, toItemRows } from '@/lib/square';
 
 /**
- * Synchronisation manuelle Square — importe les commandes COMPLETED
- * des 365 derniers jours (par lots de 500, curseur de pagination).
+ * Synchronisation Square — importe les commandes COMPLETED.
+ *
+ * La caisse Square est la référence du chiffre d'affaires : cette route est
+ * donc celle dont l'exhaustivité compte le plus. Deux précautions en
+ * découlent.
+ *
+ * 1. **Elle s'arrête d'elle-même avant que la plateforme ne la coupe**, et
+ *    renvoie son curseur pour être reprise. Une fonction interrompue en cours
+ *    de pagination laissait une partie des commandes de côté en annonçant un
+ *    succès — c'est le même défaut qui avait tronqué l'import bancaire.
+ *
+ * 2. **Elle dit toujours si elle a fini** (`complete`). Un chiffre d'affaires
+ *    partiel sans avertissement fausse la TVA, le P&L et le food cost.
+ *
+ * L'upsert sur `square_order_id` rend l'opération rejouable sans doublon.
  */
-export async function POST() {
+export const maxDuration = 60;
+
+/** Marge de sécurité : on rend la main avant la limite de la plateforme. */
+const BUDGET_MS = 45_000;
+
+export async function POST(request: NextRequest) {
   const auth = await requireUser();
   if (auth.error) return auth.error;
+
+  const startedAt = Date.now();
 
   try {
     const supabase = createServiceRoleClient();
     const locationId = process.env.SQUARE_LOCATION_ID;
 
+    // Reprise et fenêtre de dates optionnelles : permettent de rattraper un
+    // mois précis sans rejouer une année entière.
+    let body: { cursor?: string; days?: number; startAt?: string } = {};
+    try { body = await request.json(); } catch { /* corps vide = valeurs par défaut */ }
+
     const startDate = new Date();
-    startDate.setDate(startDate.getDate() - 365);
+    if (body.startAt && /^\d{4}-\d{2}-\d{2}/.test(body.startAt)) {
+      startDate.setTime(Date.parse(body.startAt));
+    } else {
+      startDate.setDate(startDate.getDate() - (body.days && body.days > 0 ? body.days : 365));
+    }
 
     let syncedOrders = 0;
     let syncedItems = 0;
-    let cursor: string | undefined = undefined;
+    let batches = 0;
+    let zeroAmountOrders = 0;
+    let cursor: string | undefined = body.cursor;
 
     do {
       const ordersBody: Record<string, unknown> = {
@@ -86,17 +117,48 @@ export async function POST() {
         }
 
         syncedOrders += orders.length;
+
+        // Une commande à zéro trahit une donnée Square incomplète : on la
+        // compte pour que le chiffre d'affaires ne soit pas silencieusement
+        // minoré (c'est ce que produisait l'absence de repli sur total_money).
+        zeroAmountOrders += orders.filter(
+          o => !(o.net_amounts?.total_money?.amount ?? o.total_money?.amount)
+        ).length;
       }
 
       cursor = ordersRes.cursor;
+      batches++;
+
+      // On rend la main avant d'être coupé, en conservant le curseur.
+      if (cursor && Date.now() - startedAt > BUDGET_MS) {
+        return NextResponse.json({
+          success: true,
+          complete: false,
+          cursor,
+          synced: { orders: syncedOrders, items: syncedItems, batches, zeroAmountOrders },
+          message:
+            `${syncedOrders} commandes importées, mais il en reste. Relance la `
+            + `synchronisation pour continuer — aucun doublon ne sera créé.`,
+        });
+      }
     } while (cursor);
 
     return NextResponse.json({
       success: true,
-      synced: { orders: syncedOrders, items: syncedItems, timecards: 0 },
+      complete: true,
+      synced: { orders: syncedOrders, items: syncedItems, batches, zeroAmountOrders, timecards: 0 },
+      message: zeroAmountOrders > 0
+        ? `${syncedOrders} commandes importées, dont ${zeroAmountOrders} sans montant `
+          + `exploitable côté Square — à vérifier dans la caisse.`
+        : undefined,
     });
-  } catch (error) {
+  } catch (error: any) {
     console.error('Square sync error:', error);
-    return NextResponse.json({ error: 'Erreur synchronisation Square' }, { status: 500 });
+    // On renvoie la cause : « Erreur synchronisation Square » seul ne permet
+    // pas de distinguer un jeton expiré d'une panne de base.
+    return NextResponse.json(
+      { error: `Erreur synchronisation Square : ${error?.message || 'cause inconnue'}` },
+      { status: 500 }
+    );
   }
 }

@@ -25,7 +25,10 @@ export async function squareFetch(path: string, options: RequestInit = {}) {
 interface SquareApiOrder {
   id: string;
   created_at?: string;
+  closed_at?: string;
+  state?: string;
   total_money?: { amount?: number };
+  total_tax_money?: { amount?: number };
   net_amounts?: { total_money?: { amount?: number } };
   total_discount_money?: { amount?: number };
   line_items?: {
@@ -37,12 +40,24 @@ interface SquareApiOrder {
   }[];
 }
 
-/** Convertit une commande Square (API) en ligne square_orders. */
+/**
+ * Convertit une commande Square (API) en ligne square_orders.
+ *
+ * `net_amounts` n'est pas systématiquement renvoyé par l'API Square. Sans
+ * repli, ces commandes entraient avec un montant de **zéro** : le chiffre
+ * d'affaires s'en trouvait minoré sans qu'aucune erreur ne le signale. Le
+ * repli sur `total_money` est équivalent en l'absence de remboursement, qui
+ * est le seul cas où les deux diffèrent.
+ */
 export function toOrderRow(order: SquareApiOrder) {
+  const netCents = order.net_amounts?.total_money?.amount
+    ?? order.total_money?.amount
+    ?? 0;
+
   return {
     square_order_id: order.id,
     total_money: (order.total_money?.amount || 0) / 100,
-    net_amount: (order.net_amounts?.total_money?.amount || 0) / 100,
+    net_amount: netCents / 100,
     discount_amount: (order.total_discount_money?.amount || 0) / 100,
     service: order.created_at?.substring(0, 10),
     created_at: order.created_at,

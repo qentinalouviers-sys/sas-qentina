@@ -421,6 +421,44 @@ Corrections annexes trouvées en route :
 
 `npm run verify:compta` verrouille ces 27 comportements.
 
+### ⚠️ Le chiffre d'affaires enregistré est incomplet — priorité absolue
+
+Vérification faite sur le relevé bancaire réel de juin-juillet 2026 :
+
+| | |
+|---|---|
+| Versements Square encaissés sur **deux mois** | 29 829,49 € (47 virements, nets de commission) |
+| Soit, reconstitué en HT | ≈ 27 600 € |
+| CA Square enregistré dans l'outil pour **toute l'année 2026** | 24 655,06 € HT |
+
+**Deux mois de versements dépassent le chiffre d'affaires annuel enregistré.** La table
+`square_orders` est donc très incomplète — de l'ordre d'un tiers des commandes présentes.
+
+C'est la véritable cause du food cost à 106 % et de l'EBE à −41 k€ : **ce n'est pas le coût matières
+qui est gonflé, c'est le chiffre d'affaires qui manque.** La revue fiscale externe attribuait ces
+ratios à des flux financiers mal classés ; ceux-ci jouent, mais le facteur dominant est ailleurs.
+
+Deux correctifs apportés à la synchronisation :
+
+1. **Une commande sans `net_amounts` entrait avec un montant de zéro.** L'API Square ne renvoie pas
+   toujours cet objet ; sans repli sur `total_money`, ces ventes comptaient pour rien. Le repli est
+   en place, et les commandes restées sans montant exploitable sont désormais comptées et signalées.
+2. **La synchronisation pouvait être coupée en cours de pagination**, laissant une partie des
+   commandes dehors tout en annonçant un succès — le même défaut que l'import bancaire. Elle rend
+   maintenant la main avant la limite de la plateforme, renvoie son curseur, et le bouton de la page
+   Ventes reprend jusqu'à épuisement. Elle dit toujours si elle a fini (`complete`).
+
+**À faire côté utilisateur :** relancer la synchronisation Square, puis vérifier que le CA d'un mois
+donné correspond aux versements Square du relevé. C'est le contrôle le plus simple, et la banque
+fournit la référence.
+
+### Le P&L n'intègre plus les flux financiers
+
+Le CA vient de la caisse Square, jamais des encaissements bancaires. Les prêts, apports, mouvements
+de compte courant, virements de trésorerie et retraits sont écartés des recettes **comme** des
+charges, et affichés sur une ligne dédiée « Flux financiers exclus du résultat » — visibles,
+détaillables, mais hors résultat d'exploitation.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 - **Réconcilier le CA du Dashboard (TTC) et du P&L (HT)** : les deux pages affichent un « CA »
