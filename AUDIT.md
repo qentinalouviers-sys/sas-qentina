@@ -379,6 +379,48 @@ la totalité des encaissements Square. Les 57 restantes arrivent en « autre » 
 signale. Un outil de gestion qui s'arrête net parce qu'un service tiers est indisponible est un
 outil fragile ; celui-ci se contente de perdre en confort.
 
+### Le crédit de TVA était fictif
+
+Une revue fiscale externe a relevé que la TVA déductible affichée (7 295 €) provenait presque
+entièrement de **flux financiers non soumis à TVA** : prêts, apports, mouvements de compte courant,
+trésorerie de holding, retraits d'espèces. Le constat était exact, et la cause tenait à une ligne :
+
+```ts
+if (category === 'fixe_loyer' || category === 'fixe_abonnement' || category === 'autre') return 0.20;
+```
+
+`autre` est précisément la catégorie où tombe tout ce que l'outil n'a pas su classer — donc les
+prêts et les retraits. Chacun se voyait attribuer 20 % de TVA déductible. Sur le seul relevé de
+juin-juillet 2026, cela représentait **4 043 € de TVA déduite sans qu'une seule facture soit
+rattachée**, dont 2 557 € issus de la catégorie « autre ».
+
+Deux règles ont été posées, dans `src/lib/accounting.ts` et `src/lib/tva.ts` :
+
+1. **Le chiffre d'affaires vient de Square.** Un encaissement bancaire n'est pas une vente.
+2. **La TVA déductible vient des factures.** Sans facture, aucune déduction (art. 271 CGI).
+
+Ce que l'outil estimait est conservé, mais renommé et déplacé : `recoverableIfInvoiced` chiffre ce
+qui *deviendrait* récupérable si les factures étaient rattachées. C'est un indicateur de pilotage —
+il mesure l'intérêt de finir le rapprochement bancaire — jamais un montant déclarable.
+
+Corrections annexes trouvées en route :
+
+- **Un encaissement pouvait être compté comme un achat.** La requête de la page TVA ne filtrait pas
+  le signe du montant : un apport classé « autre » apparaissait dans les achats avec de la TVA.
+- **Une TVA à 7 % était classée en 5,5 %.** Le taux était deviné en divisant les montants, avec une
+  fourchette trop large. Il est désormais **lu** dans les données Square (`taxes[].percentage`, ou
+  la taxe de niveau commande via `applied_taxes`), le calcul par ratio ne servant que de dernier
+  recours.
+- **La ventilation ne réconciliait pas** avec son propre total (écart de 145 €). Les cumuls se font
+  maintenant en centimes entiers et le total **est** la somme des tranches. Ce qui n'est pas
+  attribuable à un taux connu apparaît sous « taux non déterminé » plutôt que d'être réparti au
+  hasard : sur une déclaration, mieux vaut un montant à instruire qu'un montant deviné.
+- **La page TVA n'utilisait pas `lib/tva.ts`** malgré le commentaire « source de vérité unique » :
+  elle avait sa propre copie du calcul. C'était la cause des écarts entre écrans. La copie est
+  supprimée.
+
+`npm run verify:compta` verrouille ces 27 comportements.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 - **Réconcilier le CA du Dashboard (TTC) et du P&L (HT)** : les deux pages affichent un « CA »

@@ -61,6 +61,29 @@ chercher le problème dans le code.
 Les variables d'environnement vivent dans *Settings → Environments* et sont indépendantes de la
 liaison Git : les reconnecter ne les efface pas.
 
+## Contrôles comptables
+
+```bash
+npm run verify:compta
+```
+
+27 contrôles de non-régression sur les calculs de TVA et la classification des
+écritures. **À lancer après toute modification touchant `src/lib/tva.ts`,
+`src/lib/accounting.ts` ou le P&L.** Chaque contrôle correspond à une erreur qui
+a réellement été commise : TVA déduite sans facture, ventilation par taux ne
+réconciliant pas avec son total, taux à 7 % classé en 5,5 %, encaissement traité
+comme un achat. Les données sont synthétiques, aucune base n'est requise.
+
+Deux règles structurent la comptabilité de l'outil, et ne doivent pas être
+contournées :
+
+1. **Le chiffre d'affaires vient de Square.** Un encaissement bancaire n'est pas
+   une vente : prêts, apports et virements de trésorerie arrivent sur le même
+   compte.
+2. **La TVA déductible vient des factures.** L'article 271 du CGI subordonne la
+   déduction à une facture. Estimer la TVA depuis un libellé bancaire fabrique un
+   droit à déduction qui n'existe pas.
+
 ## Architecture
 
 ```

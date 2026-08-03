@@ -3,7 +3,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, getDateRange, toISODate, formatDate, CATEGORY_LABELS } from '@/lib/utils';
-import { getVatRate } from '@/lib/tva';
+import { computeTva, getVatRate } from '@/lib/tva';
+import { isFinancialFlow, round2 } from '@/lib/accounting';
 import { 
   Percent, 
   TrendingUp, 
@@ -26,16 +27,21 @@ export default function TvaPage() {
   const supabase = createClient();
   
   const [data, setData] = useState({
+    // Montants déclarables — calculés par lib/tva.ts, source unique
     collectedTva: 0,
-    collectedTvaBreakdown: {
-      '5.5%': 0,
-      '10%': 0,
-      '20%': 0,
-      'autre': 0
-    },
+    collectedTvaBreakdown: { '5.5%': 0, '10%': 0, '20%': 0, nonVentile: 0 },
     deductibleTva: 0,
-    netTva: 0, // collectedTva - deductibleTva
-    
+    netTva: 0,
+
+    // Indicateurs de pilotage, non déclarables
+    recoverableIfInvoiced: 0,
+    unInvoicedCount: 0,
+    unInvoicedAmount: 0,
+    financialFlowAmount: 0,
+    financialFlowCount: 0,
+    estimatedOrdersCount: 0,
+    invoiceCount: 0,
+
     // Lists for tables
     salesList: [] as any[],
     purchasesList: [] as any[],
@@ -74,11 +80,18 @@ export default function TvaPage() {
           .select('id, date, invoice_number, total_ht, total_ttc, tva_recoverable, type_document, company_name_present, supplier:suppliers(name)')
           .gte('date', startStr)
           .lte('date', endStr),
-        // 3. Fetch Bank Transactions in period (expenses)
+        // 3. Dépenses bancaires de la période.
+        // `amount < 0` est indispensable : sans ce filtre, un ENCAISSEMENT
+        // classé « autre » (un apport, par exemple) apparaissait dans les
+        // achats et se voyait attribuer de la TVA déductible.
         supabase
           .from('bank_transactions')
           .select('id, date, description, amount, category, invoice_id')
-          .in('category', ['variable_fournisseur', 'fixe_loyer', 'fixe_abonnement', 'fixe_assurance', 'autre'])
+          .lt('amount', 0)
+          .in('category', [
+            'variable_fournisseur', 'fixe_loyer', 'fixe_abonnement',
+            'fixe_assurance', 'autre', 'flux_financier',
+          ])
           .gte('date', startStr)
           .lte('date', endStr),
       ]);
@@ -91,54 +104,10 @@ export default function TvaPage() {
 
       const salesList = orders || [];
       
-      let collectedTva = 0;
-      const collectedTvaBreakdown = {
-        '5.5%': 0,
-        '10%': 0,
-        '20%': 0,
-        'autre': 0
-      };
-
-      salesList.forEach((order: any) => {
-        const orderTax = order.raw_data?.total_tax_money?.amount;
-        if (orderTax !== undefined) {
-          const orderTaxEuro = orderTax / 100;
-          collectedTva += orderTaxEuro;
-
-          // Compute breakdown per item if line_items exist
-          if (order.raw_data.line_items && Array.isArray(order.raw_data.line_items)) {
-            order.raw_data.line_items.forEach((item: any) => {
-              const itemTax = (item.total_tax_money?.amount || 0) / 100;
-              const itemTotal = (item.total_money?.amount || 0) / 100;
-              
-              if (itemTax > 0) {
-                const itemHt = itemTotal - itemTax;
-                if (itemHt > 0) {
-                  const rate = itemTax / itemHt;
-                  if (rate >= 0.18 && rate <= 0.22) {
-                    collectedTvaBreakdown['20%'] += itemTax;
-                  } else if (rate >= 0.08 && rate <= 0.12) {
-                    collectedTvaBreakdown['10%'] += itemTax;
-                  } else if (rate >= 0.04 && rate <= 0.07) {
-                    collectedTvaBreakdown['5.5%'] += itemTax;
-                  } else {
-                    collectedTvaBreakdown['autre'] += itemTax;
-                  }
-                } else {
-                  collectedTvaBreakdown['autre'] += itemTax;
-                }
-              }
-            });
-          } else {
-            collectedTvaBreakdown['10%'] += orderTaxEuro;
-          }
-        } else {
-          const netAmt = order.net_amount || 0;
-          const estimatedTax = netAmt * (0.10 / 1.10);
-          collectedTva += estimatedTax;
-          collectedTvaBreakdown['10%'] += estimatedTax;
-        }
-      });
+      // ── Les montants déclarables viennent de lib/tva.ts, et de nulle part
+      // ailleurs. Cette page recalculait tout de son côté : c'est ce qui
+      // faisait diverger ses chiffres de ceux du tableau de bord.
+      const totals = await computeTva(supabase, startStr, endStr);
 
       const invoicesList = invoices || [];
       const bankTxList = bankTx || [];
@@ -159,54 +128,50 @@ export default function TvaPage() {
       }
 
       const consolidatedPurchases: any[] = [];
-      let deductibleTva = 0;
       const supplierMap: Record<string, { name: string; ht: number; ttc: number; tva: number; count: number }> = {};
 
-      // A. Process paid items from Bank Transactions (boucle synchrone, aucune requête)
+      // A. Dépenses bancaires.
+      //
+      // `tva` ne contient QUE de la TVA justifiée par une facture. Ce qui n'est
+      // qu'estimé depuis un libellé va dans `tvaPotentielle` — un montant à
+      // aller chercher, pas un montant déductible. Les totaux de la page
+      // viennent de computeTva ; cette boucle ne fait que présenter les lignes.
       for (const tx of bankTxList) {
         const amt = Math.abs(tx.amount || 0);
-        let tva = 0;
+        const supName = tx.description || 'Inconnu';
+        const isMasked = loadedMaskedSuppliers.includes(supName);
+        const isFlux = isFinancialFlow(supName, tx.category);
+
+        let tva = 0;             // déductible : facture à l'appui
+        let tvaPotentielle = 0;  // estimée : à justifier
         let ht = amt;
         let isLinked = false;
         let invoiceNum = '-';
         let isTvaRec = true;
         let typeDoc = null;
         let isCompanyPresent = null;
+        let statusLabel: string;
 
-        if (tx.invoice_id) {
-          const inv = invoicesById.get(tx.invoice_id);
+        const inv = tx.invoice_id ? invoicesById.get(tx.invoice_id) : null;
 
-          if (inv) {
-            const ttc = inv.total_ttc || amt;
-            typeDoc = inv.type_document;
-            isCompanyPresent = inv.company_name_present;
-            isTvaRec = inv.tva_recoverable !== false;
-            
-            if (isTvaRec) {
-              ht = inv.total_ht || amt;
-              tva = Math.max(0, ttc - ht);
-            } else {
-              ht = ttc;
-              tva = 0;
-            }
-            isLinked = true;
-            invoiceNum = inv.invoice_number || 'Facture liée';
-          } else {
-            const rate = getVatRate(tx.category);
-            tva = amt * (rate / (1 + rate));
-            ht = amt - tva;
-          }
+        if (isFlux) {
+          // Prêt, apport, compte courant, retrait : hors champ de la TVA.
+          statusLabel = 'Flux financier — hors TVA';
+        } else if (inv) {
+          typeDoc = inv.type_document;
+          isCompanyPresent = inv.company_name_present;
+          isTvaRec = inv.tva_recoverable !== false;
+          const ttc = inv.total_ttc || amt;
+          ht = isTvaRec ? (inv.total_ht ?? amt) : ttc;
+          tva = isTvaRec ? Math.max(0, round2(ttc - ht)) : 0;
+          isLinked = true;
+          invoiceNum = inv.invoice_number || 'Facture liée';
+          statusLabel = isTvaRec ? 'Déductible (facture)' : 'Facture sans TVA récupérable';
         } else {
           const rate = getVatRate(tx.category);
-          tva = amt * (rate / (1 + rate));
-          ht = amt - tva;
-        }
-
-        const supName = tx.description || 'Inconnu';
-        const isMasked = loadedMaskedSuppliers.includes(supName);
-
-        if (!isMasked) {
-          deductibleTva += tva;
+          tvaPotentielle = round2(amt * (rate / (1 + rate)));
+          ht = round2(amt - tvaPotentielle);
+          statusLabel = 'Sans facture — non déductible';
         }
 
         consolidatedPurchases.push({
@@ -219,13 +184,19 @@ export default function TvaPage() {
           ht,
           ttc: amt,
           tva,
-          statusLabel: isLinked ? 'Comptabilisé (Facture liée)' : 'Validé (Relevé bancaire)',
+          tvaPotentielle,
+          statusLabel,
           isLinked,
+          isFinancialFlow: isFlux,
           tva_recoverable: isTvaRec,
           type_document: typeDoc,
           company_name_present: isCompanyPresent,
         });
 
+        // Le récapitulatif par fournisseur ne cumule que du déductible, pour
+        // qu'il réconcilie avec le montant déclaré. Les flux financiers et les
+        // fournisseurs masqués n'y figurent pas.
+        if (isFlux || isMasked) continue;
         if (!supplierMap[supName]) {
           supplierMap[supName] = { name: supName, ht: 0, ttc: 0, tva: 0, count: 0 };
         }
@@ -254,10 +225,6 @@ export default function TvaPage() {
         const supName = inv.supplier?.name || 'Inconnu';
         const isMasked = loadedMaskedSuppliers.includes(supName);
 
-        if (!isMasked) {
-          deductibleTva += tva;
-        }
-
         consolidatedPurchases.push({
           id: inv.id,
           invoiceId: inv.id,
@@ -268,13 +235,18 @@ export default function TvaPage() {
           ht,
           ttc,
           tva,
-          statusLabel: 'En attente de paiement (Facture)',
+          tvaPotentielle: 0,
+          statusLabel: isTvaRec
+            ? 'Déductible (facture, non encore payée)'
+            : 'Facture sans TVA récupérable',
           isLinked: true,
+          isFinancialFlow: false,
           tva_recoverable: isTvaRec,
           type_document: inv.type_document,
           company_name_present: inv.company_name_present,
         });
 
+        if (isMasked) continue;
         if (!supplierMap[supName]) {
           supplierMap[supName] = { name: supName, ht: 0, ttc: 0, tva: 0, count: 0 };
         }
@@ -288,16 +260,12 @@ export default function TvaPage() {
       consolidatedPurchases.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
       
       const suppliersTvaList = Object.values(supplierMap).sort((a, b) => b.tva - a.tva);
-      const netTva = collectedTva - deductibleTva;
 
       setData({
-        collectedTva,
-        collectedTvaBreakdown,
-        deductibleTva,
-        netTva,
+        ...totals,
         salesList,
         purchasesList: consolidatedPurchases,
-        suppliersTvaList
+        suppliersTvaList,
       });
 
     } catch (e) {
@@ -458,21 +426,66 @@ export default function TvaPage() {
                     <span>Taux 20% (Alcools) :</span>
                     <strong>{formatCurrency(data.collectedTvaBreakdown['20%'])}</strong>
                   </div>
+                  {data.collectedTvaBreakdown.nonVentile !== 0 && (
+                    <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 4, color: 'var(--orange)' }}>
+                      <span>Taux non déterminé :</span>
+                      <strong>{formatCurrency(data.collectedTvaBreakdown.nonVentile)}</strong>
+                    </div>
+                  )}
+                  <div style={{ borderTop: '1px solid var(--border-light)', marginTop: 4, paddingTop: 4, display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Total ventilé :</span>
+                    <strong>{formatCurrency(data.collectedTva)}</strong>
+                  </div>
+                  {data.estimatedOrdersCount > 0 && (
+                    <div style={{ color: 'var(--orange)' }}>
+                      {data.estimatedOrdersCount} commande{data.estimatedOrdersCount > 1 ? 's' : ''} sans
+                      détail de taxe Square — TVA estimée à 10 %
+                    </div>
+                  )}
                 </div>
               </div>
 
-              {/* Card 3: Deductible VAT */}
+              {/* Card 3: Deductible VAT — factures uniquement */}
               <div className="kpi-card">
                 <div className="kpi-label">
-                  <Receipt size={16} style={{ color: 'var(--orange)' }} /> TVA Déductible (Achats & Dépenses)
+                  <Receipt size={16} style={{ color: 'var(--orange)' }} /> TVA Déductible (sur factures)
                 </div>
                 <div className="kpi-value" style={{ color: 'var(--text-primary)' }}>
                   {formatCurrency(data.deductibleTva)}
                 </div>
-                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-                  Calculé sur l&apos;ensemble de vos factures et écritures bancaires de dépenses
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                  <div>
+                    {data.invoiceCount} facture{data.invoiceCount > 1 ? 's' : ''} avec TVA récupérable.
+                    Une dépense sans facture n&apos;ouvre aucun droit à déduction.
+                  </div>
+                  {data.recoverableIfInvoiced > 0 && (
+                    <div style={{ color: 'var(--orange)' }}>
+                      + {formatCurrency(data.recoverableIfInvoiced)} récupérables si tu rattaches les
+                      factures de {data.unInvoicedCount} dépense{data.unInvoicedCount > 1 ? 's' : ''}
+                      {' '}({formatCurrency(data.unInvoicedAmount)} TTC)
+                    </div>
+                  )}
+                  {data.financialFlowCount > 0 && (
+                    <div>
+                      {data.financialFlowCount} flux financier{data.financialFlowCount > 1 ? 's' : ''} écarté
+                      {data.financialFlowCount > 1 ? 's' : ''} ({formatCurrency(data.financialFlowAmount)}) :
+                      prêts, apports, compte courant, retraits — hors champ de la TVA.
+                    </div>
+                  )}
                 </div>
               </div>
+            </div>
+
+            {/* Rappel de méthode — ces chiffres ont changé de définition */}
+            <div className="alert alert-warning no-print" style={{ marginBottom: 24 }}>
+              <Receipt size={16} />
+              <span>
+                <strong>La TVA déductible ne compte que les factures.</strong> L&apos;outil estimait
+                auparavant la TVA à partir des libellés bancaires, y compris sur des prêts, des apports
+                et des retraits d&apos;espèces — ce qui fabriquait un crédit de TVA qui n&apos;existait pas.
+                Le montant affiché est désormais celui que tu peux justifier. Pour l&apos;augmenter, il
+                faut rattacher les factures, pas changer un réglage.
+              </span>
             </div>
 
             {/* Restaurant Industry Specific Fiscal Tips */}
