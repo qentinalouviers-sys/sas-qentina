@@ -23,6 +23,8 @@ import {
   orderHtAmount, bankAmountHt, makeInvoiceMatcher, round2,
 } from '../src/lib/accounting.ts';
 import { detectInterventions, collectInterventionFacts } from '../src/lib/interventions.ts';
+import { categoryFromRules } from '../src/lib/bank-csv.ts';
+import { suggestInvoicesForTransaction, sumDebits } from '../src/lib/reconciliation.ts';
 
 // ── Faux client Supabase, qui applique réellement les filtres utilisés ──────
 function fakeSupabase(tables) {
@@ -358,6 +360,118 @@ verifie('paiement de 240 apparié', m.alreadyInvoiced({ amount: -240 }), true);
 verifie('nombre d\'appariements annoncé', m.count(), 3);
 verifie('facture à 0 € jamais appariée',
   makeInvoiceMatcher([{ total_ttc: 0 }]).alreadyInvoiced({ amount: 0 }), false);
+
+// ═══ 11. Catégorisation des dépenses ═════════════════════════════════════
+// 49 % des décaissements d'un relevé réel tombaient en « autre » — donc dans
+// les charges fixes au lieu du coût matières. Chaque libellé ci-dessous vient
+// de ce relevé.
+console.log('\n11. Catégorisation — le libellé décide du poste');
+
+const attendu = (label, cat) => verifie(label.slice(0, 52), categoryFromRules(label) === cat, true);
+
+// Achats revendus : ils appartiennent au coût matières.
+attendu('PRLV SEPA VALLEE DE SEINE BOISS', 'variable_fournisseur');
+attendu('PRLV SEPA LES DELICES DU PALAIS', 'variable_fournisseur');
+attendu('SHOP COFFEE', 'variable_fournisseur');
+attendu('LA FERME DU PLESSIS', 'variable_fournisseur');
+// Le bois de four cuit les pizzas : c'est une matière première, pas une charge.
+attendu('GRUCHY BOIS', 'variable_fournisseur');
+attendu('PRLV SEPA EURO CIBUS', 'variable_fournisseur');
+attendu('CB42METRO FRANCE 04/06/26', 'variable_fournisseur');
+
+// Le libellé d'un administrateur de biens ne contient jamais « loyer ».
+attendu('VIR INST OBJECTIF PIERRE GESTI', 'fixe_loyer');
+
+// Droits musicaux et logiciels : charges fixes, pas des achats.
+attendu('PRLV SEPA SACEM-SOC AUTEUR COMP', 'fixe_abonnement');
+attendu('PRLV SEPA SPRE', 'fixe_abonnement');
+attendu('IA CLAUDE JUILLET', 'fixe_abonnement');
+attendu('APPLE.COM/BI', 'fixe_abonnement');
+
+// Une règle trop large est pire qu'une règle absente : ces libellés doivent
+// rester non reconnus plutôt que d'être rangés au hasard.
+const inconnus = [
+  'VIR INST GUILLAUME TRIPOLI', 'LOCATION CAMION TRAVAUX', 'ELECTRO DEPO',
+  'BRICOMARCHE', 'LEROY MERLIN', 'PRLV SEPA SAS PARTEXIA', 'SIEGE 27',
+  'RESULTAT ARRETE COMPTE 30062026', 'WEST PHONE', 'PAPETERIE DE',
+];
+verifie('libellés inconnus laissés non classés',
+  inconnus.filter(l => categoryFromRules(l) === null).length, inconnus.length);
+
+// Les flux financiers restent reconnus comme tels, quoi qu'en dise la règle.
+verifie('mouvements de compte courant hors exploitation',
+  ['COMPTE ASSOCIE', 'COMPTE ASSOSIE', 'REMBOURSEMENT COMPTE ASSOCIE',
+   'VIR INST DE FARIA PEREIRA'].filter(l => isFinancialFlow(l)).length, 4);
+
+// ═══ 12. Trous de ventes : ne jamais compter demain ══════════════════════
+// Le 3 du mois, l'outil annonçait « 28 jours consécutifs sans aucune vente » :
+// la fenêtre allait jusqu'à la fin du mois en cours, donc dans le futur.
+console.log('\n12. Jours sans vente — la fenêtre s\'arrête à aujourd\'hui');
+
+const moisEnCours = {
+  start: '2026-08-01', end: '2026-08-31', today: '2026-08-03',
+  daysWithSales: ['2026-08-01', '2026-08-02', '2026-08-03'],
+  lastSyncedService: '2026-08-03',
+};
+silence('mois en cours, ventes à jour : aucun trou', moisEnCours, 'trou-historique-ventes');
+verifie('… et aucune intervention du tout', ids(moisEnCours).length, 0);
+
+// La caisse s'est arrêtée le 10 : le trou réel est compté, pas le futur.
+const arret = {
+  start: '2026-08-01', end: '2026-08-31', today: '2026-08-20',
+  daysWithSales: ['2026-08-01', '2026-08-02', '2026-08-03'],
+  lastSyncedService: '2026-08-03',
+};
+declenche('caisse arrêtée le 3, vu le 20 : trou détecté', arret, 'trou-historique-ventes');
+verifie('longueur = jours écoulés (15), pas jours du mois (28)',
+  detectInterventions(faits(arret)).find(i => i.id === 'trou-historique-ventes').title
+    === '15 jours consécutifs sans aucune vente', true);
+
+// ═══ 13. Lettrage et compteurs de la page Banque ═════════════════════════
+console.log('\n13. Lettrage — le signe et le lien avant la date');
+
+const fMetro = { date: '2026-06-10', total_ttc: 110, supplier: { name: 'Metro' } };
+const fEdf   = { date: '2026-06-11', total_ttc: 282, supplier: { name: 'EDF' } };
+const fLot   = { date: '2026-06-12', total_ttc: 476.31, supplier: { name: 'Euro Cibus' } };
+const factsF = [fMetro, fEdf, fLot];
+
+const sug = (tx) => suggestInvoicesForTransaction(tx, factsF);
+
+// Le cas exact rapporté : un encaissement Square proposé face à une facture EDF.
+verifie('encaissement Square : aucune suggestion',
+  sug({ date: '2026-06-11', description: 'VIR SEPA SQUAREUP', amount: 282 }).length, 0);
+verifie('… même au centime près du TTC d\'une facture',
+  sug({ date: '2026-06-11', description: 'VIR SEPA SQUAREUP', amount: 282 }).length, 0);
+
+// Un débit sans aucun lien ne doit rien proposer, même le jour même.
+verifie('débit sans lien de montant ni de nom',
+  sug({ date: '2026-06-11', description: 'PRLV SEPA SAS PARTEXIA', amount: -549.60 }).length, 0);
+
+// Montant exact : la suggestion évidente.
+let s1 = sug({ date: '2026-06-10', description: 'CB42METRO FRANCE', amount: -110 });
+verifie('montant exact + nom + date : proposé', s1.length > 0, true);
+verifie('… et c\'est la bonne facture', s1[0].invoice === fMetro, true);
+
+// Nom seul, montant différent (paiement groupé) : légitime, on propose.
+let s2 = sug({ date: '2026-06-14', description: 'PRLV SEPA EURO CIBUS', amount: -1203.44 });
+verifie('nom reconnu, montant différent : proposé', s2.length > 0, true);
+verifie('… la facture Euro Cibus arrive en tête', s2[0].invoice === fLot, true);
+
+// Montant seul, fournisseur inconnu du libellé : légitime aussi.
+verifie('montant exact, nom absent du libellé : proposé',
+  sug({ date: '2026-06-13', description: 'PRLV SEPA INCONNU', amount: -476.31 }).length > 0, true);
+
+console.log('\n14. Compteurs Banque — rien ne se compense');
+const mouvements = [
+  { amount: -14539.43 }, { amount: -6484.15 },   // décaissements fournisseurs
+  { amount: 20772.67 },                          // versements Square
+  { amount: -0.40 },
+];
+verifie('total des dépenses (était 250,91 par compensation)',
+  sumDebits(mouvements), 21023.98);
+verifie('un encaissement seul ne compte pas', sumDebits([{ amount: 900 }]), 0);
+verifie('liste vide', sumDebits([]), 0);
+verifie('montant absent traité comme zéro', sumDebits([{ amount: null }, { amount: -10 }]), 10);
 
 console.log(`\n${echecs === 0 ? '✓ Tous les contrôles comptables passent.' : `✗ ${echecs} contrôle(s) en échec.`}\n`);
 process.exit(echecs === 0 ? 0 : 1);

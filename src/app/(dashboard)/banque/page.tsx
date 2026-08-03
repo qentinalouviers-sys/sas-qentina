@@ -4,6 +4,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate } from '@/lib/utils';
 import { KpiCard } from '@/components/ui';
+import { suggestInvoicesForTransaction, sumDebits } from '@/lib/reconciliation';
 import { Upload, Landmark, AlertCircle, CheckCircle, Filter, Camera, Scissors, Plus, Trash2 } from 'lucide-react';
 
 const CATEGORIES: Record<string, string> = {
@@ -31,62 +32,6 @@ const ACCOUNTING_CLASSES = [
   { code: 'autre', label: 'Autre classification' }
 ];
 
-// Heuristic scoring helper to match a bank transaction with unlinked invoices
-function getSuggestionsForTransaction(tx: any, unlinkedInvs: any[]) {
-  if (!tx) return [];
-  const txAbsAmount = Math.abs(tx.amount);
-
-  return unlinkedInvs
-    .map(inv => {
-      let score = 0;
-      const invTtc = inv.total_ttc;
-
-      // Heuristic 1: Amount match
-      const amountDiff = Math.abs(txAbsAmount - invTtc);
-      if (amountDiff < 0.01) {
-        score += 100;
-      } else if (amountDiff < 1.00) {
-        score += 50;
-      }
-
-      // Heuristic 2: Date proximity
-      const txDate = new Date(tx.date);
-      const invDate = new Date(inv.date);
-      const diffTime = Math.abs(txDate.getTime() - invDate.getTime());
-      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-      if (diffDays <= 3) {
-        score += 30;
-      } else if (diffDays <= 7) {
-        score += 20;
-      } else if (diffDays <= 15) {
-        score += 10;
-      } else if (diffDays <= 30) {
-        score += 5;
-      }
-
-      // Heuristic 3: Text match between supplier name and transaction description
-      const supplierName = inv.supplier?.name?.toLowerCase() || '';
-      const txDesc = tx.description?.toLowerCase() || '';
-      if (supplierName && txDesc) {
-        if (txDesc.includes(supplierName) || supplierName.includes(txDesc)) {
-          score += 40;
-        } else {
-          // Check words
-          const supplierWords = supplierName.split(/\s+/).filter((w: string) => w.length > 2);
-          const matches = supplierWords.filter((w: string) => txDesc.includes(w));
-          if (matches.length > 0) {
-            score += 20 * matches.length;
-          }
-        }
-      }
-
-      return { invoice: inv, score };
-    })
-    .filter(item => item.score >= 30)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 3);
-}
-
 // Ouvre un sélecteur de fichier natif et transmet le fichier choisi
 function pickFile(accept: string, onPick: (file: File) => void, capture?: string) {
   const input = document.createElement('input');
@@ -109,7 +54,15 @@ export default function BanquePage() {
   const [uploading, setUploading] = useState(false);
   const [filterStatus, setFilterStatus] = useState('pending_invoice');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [ccaBalances, setCcaBalances] = useState<{ justine: number; yohan: number }>({ justine: 0, yohan: 0 });
+  const [ccaMovements, setCcaMovements] = useState<any[]>([]);
+  const [recategorizing, setRecategorizing] = useState(false);
+
+  /** Solde du compte courant d'un associé à une date donnée (incluse). */
+  const ccaBalanceAt = useCallback((partner: 'justine' | 'yohan', date: string) =>
+    ccaMovements
+      .filter(m => m.associe === partner && String(m.date) <= date)
+      .reduce((s, m) => s + (m.sens === 'apport' ? Number(m.montant) : -Number(m.montant)), 0),
+  [ccaMovements]);
 
   const supabase = createClient();
 
@@ -133,7 +86,7 @@ export default function BanquePage() {
         .limit(1),
       supabase
         .from('mouvements_cca')
-        .select('associe, sens, montant'),
+        .select('associe, sens, montant, date'),
     ]);
 
     setInvoices(invRes.data || []);
@@ -155,24 +108,72 @@ export default function BanquePage() {
       console.warn('Could not load saved classifications:', e);
     }
 
-    // Soldes CCA par associé
-    let jBal = 0;
-    let yBal = 0;
-    (movementsRes.data || []).forEach((m: any) => {
-      const amt = Number(m.montant);
-      if (m.associe === 'justine') {
-        jBal += m.sens === 'apport' ? amt : -amt;
-      } else {
-        yBal += m.sens === 'apport' ? amt : -amt;
-      }
-    });
-    setCcaBalances({ justine: jBal, yohan: yBal });
+    // Soldes CCA par associé, avec les dates : le bouton de suggestion doit
+    // annoncer le solde À LA DATE du mouvement, pas le solde final — sinon il
+    // affiche « solde suffisant » pour un remboursement d'avril couvert par un
+    // apport de juin.
+    setCcaMovements(movementsRes.data || []);
 
     setTransactions(txList);
     setLoading(false);
   }, [supabase]);
 
   useEffect(() => { loadData(); }, [loadData]);
+
+  /**
+   * Réapplique les règles de reconnaissance aux dépenses restées en « autre ».
+   *
+   * Déroulé en deux temps : la route est d'abord appelée en simulation, on
+   * montre exactement ce qui changerait, et on n'écrit qu'après accord. Une
+   * reclassification en masse touche le food cost et la TVA : elle ne doit
+   * jamais se produire sans que l'utilisateur ait vu le détail.
+   */
+  const handleRecategorize = async () => {
+    setRecategorizing(true);
+    try {
+      const preview = await fetch('/api/bank/recategorize?dryRun=1', { method: 'POST' });
+      const plan = await preview.json();
+      if (!preview.ok) throw new Error(plan.error || 'Analyse impossible');
+
+      if (!plan.proposed) {
+        alert(
+          `Aucune reclassification possible.\n\n`
+          + `${plan.examined} dépense(s) sans catégorie ont été examinées : aucune ne correspond `
+          + `à une règle connue. Il faut les classer à la main — ou me dire de quels `
+          + `fournisseurs il s'agit pour que je les ajoute aux règles.`
+        );
+        return;
+      }
+
+      const detail = Object.entries(plan.byCategory as Record<string, { count: number; amount: number }>)
+        .sort((a, b) => b[1].amount - a[1].amount)
+        .map(([cat, v]) => `  • ${CATEGORIES[cat] || cat} : ${v.count} ligne(s), ${formatCurrency(v.amount)}`)
+        .join('\n');
+
+      const ok = confirm(
+        `${plan.proposed} dépense(s) peuvent être reclassées :\n\n${detail}\n\n`
+        + `Seules les lignes actuellement en « Autre » ou sans catégorie sont touchées — `
+        + `une catégorie que tu as choisie à la main n'est jamais écrasée, et chaque ligne `
+        + `reste modifiable ensuite.\n\nAppliquer ?`
+      );
+      if (!ok) return;
+
+      const res = await fetch('/api/bank/recategorize', { method: 'POST' });
+      const result = await res.json();
+      if (!res.ok) throw new Error(result.error || 'Reclassification impossible');
+
+      alert(
+        `${result.updated} dépense(s) reclassée(s).`
+        + (result.failures ? `\n\nÉchecs :\n${result.failures.join('\n')}` : '')
+        + `\n\nLe coût matières du P&L en tient compte immédiatement.`
+      );
+      await loadData();
+    } catch (e: any) {
+      alert(`Reclassification impossible : ${e.message}`);
+    } finally {
+      setRecategorizing(false);
+    }
+  };
 
   // Lit le stockage clé/valeur app_settings, mute les classifications, puis upsert
   const saveClassificationOverride = async (ids: string[], accountingClass: string) => {
@@ -402,11 +403,18 @@ export default function BanquePage() {
   const handleCreateCcaReimbursementAuto = async (tx: any, partner: 'justine' | 'yohan') => {
     setLoading(true);
     try {
-      // 1. Fetch current movements to calculate balance
+      // 1. Solde de l'associé À LA DATE du mouvement.
+      //
+      // Le contrôle portait sur le solde TOTAL, tous mouvements confondus —
+      // apports postérieurs inclus. Un remboursement daté d'avril passait donc
+      // sans alerte parce qu'un apport de juin le couvrait : le compte était
+      // pourtant débiteur en avril. On ne peut pas rembourser aujourd'hui avec
+      // l'argent apporté demain.
       const { data: movements, error: fetchErr } = await supabase
         .from('mouvements_cca')
-        .select('sens, montant')
-        .eq('associe', partner);
+        .select('sens, montant, date')
+        .eq('associe', partner)
+        .lte('date', tx.date);
 
       if (fetchErr) throw fetchErr;
 
@@ -418,11 +426,19 @@ export default function BanquePage() {
       const reimbursementAmount = Math.abs(tx.amount);
       if (balance - reimbursementAmount < 0) {
         const confirmDebit = confirm(
-          `⚠️ Cette opération rend le compte de ${
+          `⚠️ Au ${formatDate(tx.date)}, cette opération rend le compte de ${
             partner === 'justine' ? 'Justine' : 'Yohan'
-          } débiteur (solde : ${formatCurrency(balance - reimbursementAmount)}).\nUn CCA ne doit pas être débiteur en SAS — à régulariser ou à vérifier avec le comptable.\n\nSouhaitez-vous enregistrer quand même ?`
+          } débiteur.\n\n`
+          + `Solde à cette date : ${formatCurrency(balance)}\n`
+          + `Remboursement : ${formatCurrency(reimbursementAmount)}\n`
+          + `Solde après : ${formatCurrency(balance - reimbursementAmount)}\n\n`
+          + `Un compte courant d'associé débiteur est interdit au dirigeant `
+          + `(art. L.225-43 du code de commerce) et qualifiable d'abus de biens `
+          + `sociaux. Si un apport de la même date le couvre, saisis-le d'abord.\n\n`
+          + `Enregistrer quand même ?`
         );
         if (!confirmDebit) {
+          setLoading(false);
           return;
         }
       }
@@ -548,15 +564,33 @@ export default function BanquePage() {
     setSplitAmounts(['', '']);
   };
 
-  // KPIs calculations
-  const pendingCount = transactions.filter(t => t.status === 'pending_invoice').length;
-  const pendingAmount = transactions.filter(t => t.status === 'pending_invoice').reduce((s, t) => s + (t.amount || 0), 0);
+  // ─── KPIs ─────────────────────────────────────────────────────────────────
+  // Ces trois cartes parlent de FACTURES : seuls les décaissements sont
+  // concernés, un encaissement n'a pas de facture fournisseur à retrouver.
+  //
+  // Elles sommaient auparavant les montants signés, puis affichaient la valeur
+  // absolue du résultat. Les encaissements Square annulaient donc les achats :
+  // 21 000 € de dépenses en attente s'affichaient « 250,91 € ». On additionne
+  // maintenant des valeurs absolues, sur les débits uniquement — rien ne peut
+  // plus se compenser.
+  const debits = transactions.filter(t => (t.amount || 0) < 0);
 
-  const reconciledCount = transactions.filter(t => t.status === 'reconciled').length;
-  const reconciledAmount = transactions.filter(t => t.status === 'reconciled').reduce((s, t) => s + (t.amount || 0), 0);
+  const pendingDebits = debits.filter(t => t.status === 'pending_invoice');
+  const pendingCount = pendingDebits.length;
+  const pendingAmount = sumDebits(pendingDebits);
 
-  const okCount = transactions.filter(t => t.status === 'facture_ok').length;
-  const okAmount = transactions.filter(t => t.status === 'facture_ok').reduce((s, t) => s + (t.amount || 0), 0);
+  const reconciledDebits = debits.filter(t => t.status === 'reconciled');
+  const reconciledCount = reconciledDebits.length;
+  const reconciledAmount = sumDebits(reconciledDebits);
+
+  const okDebits = debits.filter(t => t.status === 'facture_ok');
+  const okCount = okDebits.length;
+  const okAmount = sumDebits(okDebits);
+
+  // Dépenses restées sans catégorie : elles atterrissent dans « autres
+  // charges » et sortent donc du coût matières. Le bouton de réapplication
+  // des règles ne s'affiche que s'il y a quelque chose à réappliquer.
+  const unclassifiedDebits = debits.filter(t => !t.category || t.category === 'autre');
 
   // Filter local data for display
   const filteredTransactions = filterStatus
@@ -585,7 +619,7 @@ export default function BanquePage() {
     if (!isJustine && !isYohan) return null;
     const partner: 'justine' | 'yohan' = isJustine ? 'justine' : 'yohan';
     const partnerName = partner === 'justine' ? 'Justine' : 'Yohan';
-    const balance = ccaBalances[partner];
+    const balance = ccaBalanceAt(partner, t.date);
     const reimbursementAmount = Math.abs(t.amount);
     const hasSufficientBalance = balance >= reimbursementAmount;
     const baseBg = hasSufficientBalance ? 'rgba(99, 102, 241, 0.08)' : 'rgba(217, 119, 6, 0.08)';
@@ -642,7 +676,7 @@ export default function BanquePage() {
 
   const renderInvoiceSuggestions = (t: any) => {
     if (t.status !== 'pending_invoice' && t.status !== 'facture_ok') return null;
-    const suggestions = getSuggestionsForTransaction(t, unlinkedInvoices);
+    const suggestions = suggestInvoicesForTransaction(t, unlinkedInvoices);
     if (suggestions.length === 0) return null;
     return (
       <div style={{ marginTop: 6, display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -970,21 +1004,21 @@ export default function BanquePage() {
         <div className="kpi-grid-auto">
           <KpiCard
             label="Factures Manquantes"
-            value={formatCurrency(Math.abs(pendingAmount))}
-            subValue={`${pendingCount} transaction${pendingCount > 1 ? 's' : ''} à lettrer`}
+            value={formatCurrency(pendingAmount)}
+            subValue={`${pendingCount} dépense${pendingCount > 1 ? 's' : ''} à lettrer`}
             icon={<AlertCircle size={20} />}
             accentColor="#E89B3E"
           />
           <KpiCard
             label="Factures Associées"
-            value={formatCurrency(Math.abs(reconciledAmount))}
+            value={formatCurrency(reconciledAmount)}
             subValue={`${reconciledCount} transaction${reconciledCount > 1 ? 's' : ''} lettrée${reconciledCount > 1 ? 's' : ''}`}
             icon={<CheckCircle size={20} />}
             accentColor="#2D8F5E"
           />
           <KpiCard
             label="Factures Validées (OK)"
-            value={formatCurrency(Math.abs(okAmount))}
+            value={formatCurrency(okAmount)}
             subValue={`${okCount} transaction${okCount > 1 ? 's' : ''} validée${okCount > 1 ? 's' : ''}`}
             icon={<CheckCircle size={20} />}
             accentColor="#2A7D7B"
@@ -1016,6 +1050,37 @@ export default function BanquePage() {
             )}
           </div>
         </div>
+
+        {/* Dépenses non classées : elles quittent le coût matières en silence.
+            La table de règles s'enrichit avec le temps, mais une règle ajoutée
+            ne vaut que pour les imports futurs — d'où cette réapplication. */}
+        {unclassifiedDebits.length > 0 && (
+          <div
+            className="alert alert-warning"
+            style={{ marginBottom: 20, alignItems: 'flex-start', flexWrap: 'wrap' }}
+          >
+            <AlertCircle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+            <div style={{ flex: 1, minWidth: 240 }}>
+              <strong>
+                {unclassifiedDebits.length} dépense{unclassifiedDebits.length > 1 ? 's' : ''} sans
+                catégorie ({formatCurrency(sumDebits(unclassifiedDebits))})
+              </strong>
+              <div style={{ marginTop: 2, fontWeight: 500 }}>
+                Sans catégorie, une dépense atterrit dans « autres charges » : elle sort du coût
+                matières et le food cost s&apos;en trouve faussé. La reconnaissance automatique
+                peut en reclasser une partie.
+              </div>
+            </div>
+            <button
+              className="btn btn-sm"
+              onClick={handleRecategorize}
+              disabled={recategorizing}
+              style={{ background: '#9A6B1F', color: 'white', borderColor: '#9A6B1F', flexShrink: 0 }}
+            >
+              {recategorizing ? 'Analyse…' : 'Reclasser automatiquement'}
+            </button>
+          </div>
+        )}
 
         {/* Bulk Actions Banner */}
         {selectedIds.size > 0 && (

@@ -116,7 +116,21 @@ export default function CcaPage() {
     let jBal = 0;
     let yBal = 0;
 
-    const withBalance = movements.map(m => {
+    // À l'intérieur d'une même journée, les apports passent avant les
+    // remboursements. Sans cet ordre, le solde courant suivait l'ordre de
+    // SAISIE : un remboursement de 1 000 € enregistré avant l'apport du même
+    // jour affichait un solde débiteur de −4,65 €, alertant sur un délit qui
+    // n'existait pas. Une journée comptable n'a pas de chronologie interne —
+    // on ne peut donc pas rembourser avant d'avoir reçu, et présenter
+    // l'inverse est une erreur de lecture, pas un fait.
+    const chronological = [...movements].sort((a, b) => {
+      const d = String(a.date).localeCompare(String(b.date));
+      if (d !== 0) return d;
+      const rank = (s: string) => (s === 'apport' ? 0 : 1);
+      return rank(a.sens) - rank(b.sens);
+    });
+
+    const withBalance = chronological.map(m => {
       const amt = Number(m.montant);
       const isApport = m.sens === 'apport';
       if (m.associe === 'justine') {

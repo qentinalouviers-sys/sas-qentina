@@ -126,13 +126,30 @@ const RULES: { category: string; terms: string[] }[] = [
     'verisure', 'abon', 'orange', 'sfr', 'bouygues', 'free ', 'edf', 'engie', 'totalenergies',
     'electricite', 'veolia', 'suez', 'internet', 'telecom', 'spotify', 'adobe',
     'google', 'microsoft',
+    // Droits musicaux : obligatoires dès qu'une salle diffuse de la musique.
+    // Deux organismes distincts prélèvent séparément, d'où deux lignes.
+    'sacem', 'spre',
+    // Abonnements logiciels de l'établissement.
+    'apple', 'anthropic', 'ia claude', 'openai', 'canva', 'shopify', 'wix', 'squarespace',
   ]},
-  { category: 'fixe_loyer', terms: ['loyer', 'sci ', 'bail'] },
+  { category: 'fixe_loyer', terms: [
+    'loyer', 'sci ', 'bail',
+    // Administrateurs de biens : le libellé ne contient jamais le mot « loyer ».
+    'objectif pierre', 'foncia', 'nexity', 'citya', 'orpi', 'gestion immo',
+  ]},
   { category: 'variable_salaire', terms: ['salaire', 'paie', 'acompte', 'remuneration'] },
   { category: 'variable_fournisseur', terms: [
     'metro', 'euro cibus', 'eurocibus', 'mozzalat', 'promocash', 'transgourmet',
     'carrefour', 'intermarche', 'leclerc', 'auchan', 'lidl', 'aldi', 'grand frais',
     'butcher', 'boucherie', 'primeur', 'entrepots', 'brake', 'pomona', 'davigel',
+    // Grossistes en boissons : ce sont des achats revendus, pas des charges.
+    'boiss', 'brasseur', 'cave', 'vin ', 'vins',
+    // Traiteurs, épiceries fines et producteurs : mêmes achats revendus.
+    'delices', 'ferme du', 'ferme de', 'fromager', 'poissonnerie', 'charcuterie',
+    'maraicher', 'moulin', 'coffee', 'torrefact',
+    // Le bois de four est une matière première dans une pizzeria napolitaine :
+    // sans lui, pas de cuisson. Il n'a rien à faire dans les charges fixes.
+    'bois de chauffage', 'buche', 'gruchy bois',
   ]},
 ];
 
