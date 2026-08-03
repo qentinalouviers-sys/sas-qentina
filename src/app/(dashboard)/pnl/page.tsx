@@ -97,6 +97,7 @@ export default function PnlPage() {
     chargesAssurance: 0,
     chargesAbonnement: 0,
     chargesImpot: 0,
+    chargesInvestissement: 0,
     chargesAutreBank: 0,
     totalFixedCharges: 0,
 
@@ -197,7 +198,7 @@ export default function PnlPage() {
         supabase
           .from('bank_transactions')
           .select('id, date, description, amount, category, status')
-          .in('category', ['fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'impot_taxe', 'autre'])
+          .in('category', ['fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'impot_taxe', 'investissement', 'autre'])
           .gte('date', startStr)
           .lte('date', endStr)
           .order('date', { ascending: false }),
@@ -307,6 +308,7 @@ export default function PnlPage() {
       let chargesAssurance = 0;
       let chargesAbonnement = 0;
       let chargesImpot = 0;
+      let chargesInvestissement = 0;
       let chargesAutreBank = 0;
 
       activeFixedTx.forEach((t: any) => {
@@ -315,10 +317,17 @@ export default function PnlPage() {
         else if (t.category === 'fixe_assurance') chargesAssurance += amt;
         else if (t.category === 'fixe_abonnement') chargesAbonnement += amt;
         else if (t.category === 'impot_taxe') chargesImpot += amt;
+        else if (t.category === 'investissement') chargesInvestissement += amt;
         else if (t.category === 'autre') chargesAutreBank += amt;
       });
 
-      // Inclure les factures de "matériel" et "autres factures" (hors alim/boisson/emballage) dans les charges d'exploitation
+      // Inclure les factures de "matériel" et "autres factures" (hors alim/boisson/emballage) dans les charges d'exploitation.
+      //
+      // L'équipement et les travaux (`investissement`) restent DEHORS : ce sont
+      // des dépenses ponctuelles. Les mêler aux charges fixes gonfle le coût de
+      // structure du mois où elles tombent et le fait paraître meilleur les mois
+      // suivants — on ne peut plus lire de tendance. Ils apparaissent sur leur
+      // propre ligne, sous le résultat d'exploitation.
       const totalFixedCharges = chargesLoyer + chargesAssurance + chargesAbonnement + chargesImpot + chargesAutreBank + purchasesMateriel + purchasesAutreInvoices;
 
       // 5. Calculs des Résultats
@@ -354,6 +363,7 @@ export default function PnlPage() {
         chargesAssurance,
         chargesAbonnement,
         chargesImpot,
+        chargesInvestissement,
         chargesAutreBank,
         totalFixedCharges,
         margeBrute,
@@ -563,19 +573,22 @@ export default function PnlPage() {
       case 'charges_assurance':
       case 'charges_abonnement':
       case 'charges_impot':
+      case 'charges_investissement':
       case 'charges_autre_bank':
         const bankCat = activeDetail === 'charges_loyer' ? 'fixe_loyer'
                      : activeDetail === 'charges_assurance' ? 'fixe_assurance'
                      : activeDetail === 'charges_abonnement' ? 'fixe_abonnement'
                      : activeDetail === 'charges_impot' ? 'impot_taxe'
+                     : activeDetail === 'charges_investissement' ? 'investissement'
                      : 'autre';
 
         const categoryLabels: Record<string, string> = {
           fixe_loyer: 'Loyers & Charges locatives',
           fixe_assurance: 'Assurances',
-          fixe_abonnement: 'Abonnements',
+          fixe_abonnement: 'Abonnements & honoraires',
+          investissement: 'Équipement & travaux',
           impot_taxe: 'Impôts & Taxes',
-          autre: 'Frais divers banque'
+          autre: 'Dépenses non classées'
         };
 
         title = `Détail : ${categoryLabels[bankCat]}`;
@@ -1116,10 +1129,10 @@ export default function PnlPage() {
                       onClick={() => openDetail('purchases_materiel')}
                     />
                     <PnlRow
-                      label="Frais divers & Autres charges"
+                      label="Dépenses non classées"
                       value={data.chargesAutreBank + data.purchasesAutreInvoices}
                       ratio={calculateRatio(data.chargesAutreBank + data.purchasesAutreInvoices)}
-                      note="Banque & Factures divers (cliquer pour voir/exclure)"
+                      note="À catégoriser dans Banque (cliquer pour voir/exclure)"
                       onClick={() => openDetail('charges_autre_bank')}
                     />
 
@@ -1148,6 +1161,36 @@ export default function PnlPage() {
                         {data.ebitda >= 0 ? 'Rentable' : 'Déficitaire sur la période'}
                       </td>
                     </tr>
+
+                    {/* Équipement & travaux : sous l'EBE, jamais dedans.
+                        Ce sont des dépenses ponctuelles. Les compter en charges
+                        d'exploitation rendrait l'EBE incomparable d'un mois à
+                        l'autre — alors que c'est justement sa raison d'être. */}
+                    {data.chargesInvestissement > 0 && (
+                      <>
+                        <tr style={{ background: 'var(--cream-light)', fontWeight: 700 }}>
+                          <td style={{ color: 'var(--text-secondary)' }}>
+                            6. ÉQUIPEMENT &amp; TRAVAUX (hors exploitation)
+                          </td>
+                          <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
+                            {formatCurrency(data.chargesInvestissement)}
+                          </td>
+                          <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>
+                            {formatPercent(calculateRatio(data.chargesInvestissement))}
+                          </td>
+                          <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                            Dépenses ponctuelles, exclues de l&apos;EBE
+                          </td>
+                        </tr>
+                        <PnlRow
+                          label="Détail équipement & travaux"
+                          value={data.chargesInvestissement}
+                          ratio={calculateRatio(data.chargesInvestissement)}
+                          note="Achats de matériel, aménagement, réparations"
+                          onClick={() => openDetail('charges_investissement')}
+                        />
+                      </>
+                    )}
                   </tbody>
                 </table>
               </div>

@@ -47,6 +47,11 @@ npm run dev
 3. Créer le bucket Storage **`invoice-files`** (public) pour les fichiers de factures.
 4. Module frais kilométriques : exécuter `db/migration_trajets.sql`.
 
+> ⚠️ La migration consolidée est à **ré-exécuter** après une mise à jour qui
+> ajoute une catégorie bancaire : la contrainte `CHECK` de `bank_transactions`
+> refuse sinon la nouvelle valeur, et la dépense retombe en « non classé » sans
+> message. Les dernières ajoutées sont `investissement` et `flux_financier`.
+
 ## Déploiement
 
 Le projet est hébergé sur **Vercel** (`qentina-saas.vercel.app`), branché sur ce dépôt GitHub :
@@ -96,7 +101,7 @@ base et consomme l'API Square.
 npm run verify:compta
 ```
 
-120 contrôles de non-régression sur les calculs de TVA, la classification des
+138 contrôles de non-régression sur les calculs de TVA, la classification des
 écritures, le lettrage et la détection des anomalies. **À lancer après toute
 modification touchant `src/lib/tva.ts`, `src/lib/accounting.ts`,
 `src/lib/bank-csv.ts`, `src/lib/interventions.ts`, `src/lib/reconciliation.ts`,

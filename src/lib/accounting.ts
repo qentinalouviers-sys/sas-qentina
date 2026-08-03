@@ -107,7 +107,11 @@ export function estimatedVatRate(category: string | null | undefined): number {
     case 'variable_salaire':     return 0;
     case 'impot_taxe':           return 0;
     case 'recette':              return 0;    // ce n'est pas un achat
-    case FINANCIAL_CATEGORY:     return 0;    // hors champ
+    case FINANCIAL_CATEGORY:     return 0;
+    // Un équipement d'occasion acheté à un particulier ne porte aucune TVA,
+    // des travaux en portent 20 % ou 10 %. Rien à supposer : on garde le TTC,
+    // ce qui ne minore jamais la dépense.
+    case 'investissement':       return 0;    // hors champ
     default:                     return 0;    // inconnu → aucune hypothèse
   }
 }

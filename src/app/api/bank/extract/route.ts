@@ -10,7 +10,7 @@ import {
 
 const CATEGORIES = [
   'fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'variable_fournisseur',
-  'variable_salaire', 'impot_taxe', 'recette', 'autre',
+  'variable_salaire', 'impot_taxe', 'recette', 'investissement', 'autre',
 ] as const;
 
 const CATEGORY_PROMPT = `Tu catégorises des libellés d'opérations bancaires pour un restaurant.
@@ -23,7 +23,8 @@ Catégories autorisées : ${CATEGORIES.join(' | ')}
 Règles :
 - fixe_loyer : loyers, charges locatives
 - fixe_assurance : assurances
-- fixe_abonnement : internet, téléphone, électricité, eau, gaz, logiciels, télésurveillance
+- fixe_abonnement : internet, téléphone, électricité, eau, gaz, logiciels, télésurveillance,
+  honoraires (comptable, avocat), impression et communication
 - variable_fournisseur : achats de marchandises (Metro, Mozzalat, Eurocibus, grossistes,
   supermarchés, boucheries, primeurs)
 - variable_salaire : salaires, acomptes
@@ -94,7 +95,7 @@ Format attendu :
       "date": "YYYY-MM-DD",
       "description": "Libellé de l'opération",
       "amount": number, // Négatif pour une dépense, positif pour une recette
-      "category": "fixe_loyer|fixe_assurance|fixe_abonnement|variable_fournisseur|variable_salaire|impot_taxe|recette|autre"
+      "category": "fixe_loyer|fixe_assurance|fixe_abonnement|variable_fournisseur|variable_salaire|impot_taxe|recette|investissement|autre"
     }
   ]
 }
@@ -102,7 +103,9 @@ Format attendu :
 Règles de catégorisation :
 - fixe_loyer : loyers, charges locatives
 - fixe_assurance : assurances responsabilité civile, locaux
-- fixe_abonnement : abonnements internet, téléphone, électricité, eau, gaz, logiciels (Qentina, etc)
+- fixe_abonnement : abonnements internet, téléphone, électricité, eau, gaz, logiciels (Qentina, etc),
+  honoraires du comptable, impression et communication
+- investissement : équipement, travaux d'aménagement, réparations, outillage
 - variable_fournisseur : prélèvements ou virements fournisseurs (Metro, Mozzalat, viandes, boissons...)
 - variable_salaire : virements de salaires, acomptes
 - impot_taxe : URSSAF, impôts, TVA

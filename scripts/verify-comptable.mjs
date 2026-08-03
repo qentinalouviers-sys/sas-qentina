@@ -411,15 +411,43 @@ attendu('PRLV SEPA SPRE', 'fixe_abonnement');
 attendu('IA CLAUDE JUILLET', 'fixe_abonnement');
 attendu('APPLE.COM/BI', 'fixe_abonnement');
 
+// Fournisseurs identifiés par l'exploitant, libellés tronqués par la banque.
+attendu('LAGUETTE PRI', 'variable_fournisseur');
+attendu('VAL DE', 'variable_fournisseur');
+
+// Honoraires : charge de structure récurrente, pas un achat revendu.
+attendu('PRLV SEPA SAS PARTEXIA', 'fixe_abonnement');
+attendu('VIR INST JUKACREA', 'fixe_abonnement');
+attendu('PAPETERIE DE', 'fixe_abonnement');
+
+// Équipement et travaux : hors coût matières ET hors charges fixes. Un four
+// acheté 1 400 € une fois ne fait pas partie du coût de structure mensuel.
+attendu('VIR INST GUILLAUME TRIPOLI', 'investissement');
+attendu('LOCATION CAMION TRAVAUX', 'investissement');
+attendu('VIR INST SEBASTIEN ANTONY DE F', 'investissement');
+attendu('ELECTRO DEPO', 'investissement');
+attendu('BRICOMARCHE', 'investissement');
+attendu('LEROY MERLIN', 'investissement');
+attendu('WEST PHONE', 'investissement');
+verifie('un équipement ne fabrique aucune TVA supposée',
+  estimatedVatRate('investissement'), 0);
+
+// « SEBASTIEN ANTONY DE F » est tronqué : le motif des flux financiers
+// (« de faria ») ne doit pas l'attraper, sinon les travaux disparaissent
+// du résultat au lieu d'y figurer.
+verifie('travaux non pris pour un flux financier',
+  isFinancialFlow('VIR INST SEBASTIEN ANTONY DE F'), false);
+
 // Une règle trop large est pire qu'une règle absente : ces libellés doivent
-// rester non reconnus plutôt que d'être rangés au hasard.
+// rester non reconnus plutôt que d'être rangés au hasard. « SO LOUNGE » est un
+// prélèvement erroné à se faire rembourser, « B&M » une enseigne dont on ignore
+// ce qui y a été acheté : dans les deux cas, seul l'exploitant peut trancher.
 const inconnus = [
-  'VIR INST GUILLAUME TRIPOLI', 'LOCATION CAMION TRAVAUX', 'ELECTRO DEPO',
-  'BRICOMARCHE', 'LEROY MERLIN', 'PRLV SEPA SAS PARTEXIA', 'SIEGE 27',
-  'RESULTAT ARRETE COMPTE 30062026', 'WEST PHONE', 'PAPETERIE DE',
+  'SIEGE 27', 'RESULTAT ARRETE COMPTE 30062026', 'SO LOUNGE', 'B&M',
+  'EVREUX', 'SAS DUBREUIL', 'DEMEURE', 'PHARMACIE LA', 'ESSO31769ROC',
 ];
 verifie('libellés inconnus laissés non classés',
-  inconnus.filter(l => categoryFromRules(l) === null).length, inconnus.length);
+  inconnus.filter(l => categoryFromRules(l, -100) === null).length, inconnus.length);
 
 // Les flux financiers restent reconnus comme tels, quoi qu'en dise la règle.
 verifie('mouvements de compte courant hors exploitation',

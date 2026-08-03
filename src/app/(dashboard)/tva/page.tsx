@@ -90,7 +90,7 @@ export default function TvaPage() {
           .lt('amount', 0)
           .in('category', [
             'variable_fournisseur', 'fixe_loyer', 'fixe_abonnement',
-            'fixe_assurance', 'autre', 'flux_financier',
+            'fixe_assurance', 'investissement', 'autre', 'flux_financier',
           ])
           .gte('date', startStr)
           .lte('date', endStr),

@@ -603,14 +603,48 @@ légitime : 3 948 € de mouvements de compte courant — déjà exclus du résu
 `isFinancialFlow` — et des travaux d'aménagement. Le reste attend une décision
 humaine, et le module « À faire » le réclame.
 
+### Deux catégories manquaient, dont une que le code utilisait déjà
+
+**`investissement`** — équipement, travaux, aménagement, réparations. Ces
+dépenses n'avaient nulle part où aller : ni dans le coût matières (ce ne sont
+pas des achats revendus), ni dans les charges fixes. Un four acheté 1 400 € une
+seule fois, rangé en charge fixe, gonfle le coût de structure du mois où il tombe
+et le fait paraître meilleur les mois suivants — l'EBE devient incomparable d'un
+mois à l'autre, alors que c'est justement sa raison d'être. Le poste apparaît
+donc **sous** l'EBE, sur sa propre ligne.
+
+Son taux de TVA indicatif est **0**, et c'est délibéré : un équipement
+d'occasion acheté à un particulier ne porte aucune TVA, des travaux en portent
+20 % ou 10 %. Supposer 20 % minorerait la dépense de 17 % — la prudence garde
+le TTC.
+
+**`flux_financier`** — le code la gérait déjà (`FINANCIAL_CATEGORY` dans
+`lib/accounting.ts`, requête de la page TVA) mais **la contrainte de la base la
+refusait**. Marquer une écriture hors exploitation à la main échouait donc sans
+que l'interface l'explique. Elle sert notamment aux prélèvements erronés en
+attente de remboursement : sans elle, la dépense gonfle les charges ce mois-ci
+et le remboursement gonfle le chiffre d'affaires le mois suivant.
+
+Enfin `autre` ne veut plus dire qu'une chose — **« pas encore classé »** — et
+s'affiche sous ce nom. Il portait deux sens à la fois, ce qui rendait le bandeau
+d'alerte incapable de distinguer une dépense volontairement à part d'une dépense
+oubliée.
+
 Bilan sur les deux mois réels, décaissements par poste :
 
 | Poste | Avant | Après |
 |---|---:|---:|
-| Achats (coût matières) | 14 539 € | **16 438 €** |
+| Achats (coût matières) | 14 539 € | **16 830 €** |
 | Loyer | 0 € | **2 665 €** |
-| Abonnements | 987 € | **1 490 €** |
-| Non classé | 15 343 € | **10 276 €** |
+| Abonnements & honoraires | 987 € | **3 068 €** |
+| Équipement & travaux | — | **3 394 €** |
+| Non classé | 15 343 € | **4 913 €** |
+
+Sur les 4 913 € restants, 3 948 € sont des mouvements de compte courant déjà
+exclus du résultat. Le vrai reliquat non identifié tient en **620 €** : un
+prélèvement erroné à se faire rembourser, du carburant, des frais bancaires et
+quatre petites lignes que seul l'exploitant peut trancher. Aucune n'est devinée
+— une règle trop large est pire qu'une règle absente.
 
 ### « 250,91 € de factures manquantes » : deux sommes qui s'annulent
 

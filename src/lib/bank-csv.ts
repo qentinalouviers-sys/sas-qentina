@@ -149,6 +149,20 @@ const RULES: Rule[] = [
     'sacem', 'spre',
     // Abonnements logiciels de l'établissement.
     'apple', 'anthropic', 'ia claude', 'openai', 'canva', 'shopify', 'wix', 'squarespace',
+    // Honoraires : le cabinet comptable est une charge de structure récurrente,
+    // au même titre qu'un abonnement — d'où l'intitulé « & honoraires ».
+    'partexia', 'expert comptable', 'comptable', 'avocat', 'notaire', 'huissier',
+    // Communication et impression : cartes, stickers, supports.
+    'jukacrea', 'papeterie', 'imprimerie', 'graphiste',
+  ]},
+  // Équipement, travaux, aménagement, réparations. Hors coût matières (ce ne
+  // sont pas des achats revendus) ET hors charges fixes : un four acheté
+  // 1 400 € une fois ne fait pas partie du coût de structure mensuel.
+  { category: 'investissement', terms: [
+    'leboncoin', 'le bon coin', 'travaux', 'location camion',
+    'electro depo', 'electro depot', 'bricomarche', 'leroy merlin', 'castorama',
+    'bricorama', 'top deco', 'west phone', 'reparation', 'depannage',
+    'guillaume tripoli', 'sebastien antony',
   ]},
   // Le loyer réglé par virement permanent : le montant fait partie de la règle
   // (voir `amountAbout`). Placé avant la règle générale pour être évalué en
@@ -172,6 +186,10 @@ const RULES: Rule[] = [
     // Le bois de four est une matière première dans une pizzeria napolitaine :
     // sans lui, pas de cuisson. Il n'a rien à faire dans les charges fixes.
     'bois de chauffage', 'buche', 'gruchy bois',
+    // Fournisseurs identifiés par l'exploitant, libellés tels que la banque
+    // les tronque (« LAGUETTE PRI » pour un primeur, « VAL DE » pour un
+    // grossiste). Les motifs sont volontairement courts mais spécifiques.
+    'laguette', 'val de',
   ]},
 ];
 

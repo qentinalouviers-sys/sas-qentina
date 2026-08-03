@@ -174,7 +174,7 @@ export default function DashboardPage() {
         .gte('date', startStr).lte('date', endStr),
       supabase.from('bank_transactions')
         .select('id, amount, category, description, date')
-        .in('category', ['fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'impot_taxe', 'autre'])
+        .in('category', ['fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'impot_taxe', 'investissement', 'autre'])
         .gte('date', startStr).lte('date', endStr),
       supabase.from('inventory_counts').select('quantity, unit_price'),
       supabase.from('recipes')
@@ -1238,7 +1238,8 @@ export default function DashboardPage() {
                     const catNames: Record<string, string> = {
                       fixe_loyer: 'Loyer & Charges',
                       fixe_assurance: 'Assurances',
-                      fixe_abonnement: 'Abonnements',
+                      fixe_abonnement: 'Abonnements & honoraires',
+                      investissement: 'Équipement & travaux',
                       impot_taxe: 'Impôts & Taxes',
                       materiel: 'Matériel',
                       autre: 'Autre charge',
