@@ -495,11 +495,65 @@ Vérifié sur un serveur de production réel :
 Et `/dashboard` continue de rediriger vers `/login` : l'exemption ajoutée au proxy ne concerne que
 `/api/cron/`.
 
-## 8. Pistes pour la suite (non faites, à discuter)
+### Le coût matières ne mélange plus les bases, et ne compte plus deux fois
 
-- **Réconcilier le CA du Dashboard (TTC) et du P&L (HT)** : les deux pages affichent un « CA »
-  calculé différemment. C'est comptablement défendable (vision caisse vs vision comptable) mais
-  mérite un libellé explicite ou une harmonisation.
+Deux défauts se cumulaient dans le food cost, et le second était invisible.
+
+**Des bases incompatibles.** Les lignes de facture sont en HT, les mouvements bancaires en TTC. Le
+coût matières additionnait les deux, puis le divisait par un chiffre d'affaires TTC côté tableau de
+bord et HT côté P&L. Un ratio construit ainsi ne peut pas être comparé aux 28-32 % du métier, qui se
+calculent HT sur HT — et les deux écrans affichaient logiquement deux food cost différents pour le
+même mois.
+
+**Un double comptage silencieux.** Le rapprochement bancaire n'étant pas fait, `invoice_id` est vide
+sur la plupart des mouvements. Une facture scannée était donc comptée par ses lignes, **et** son
+paiement bancaire recomptée intégralement.
+
+Trois fonctions dans `lib/accounting.ts` sont désormais le seul passage autorisé d'une base à
+l'autre, partagées par le P&L et le tableau de bord :
+
+| Fonction | Rôle |
+|---|---|
+| `orderHtAmount` | CA HT d'une commande Square — taxe **lue** dans les données Square, jamais reconstituée |
+| `bankAmountHt` | TTC → HT au taux indicatif de la catégorie ; catégorie inconnue = aucune TVA supposée |
+| `makeInvoiceMatcher` | Écarte un paiement égal **au centime** au TTC d'une facture de la période, chaque facture ne servant qu'une fois |
+
+L'appariement au centime n'est pas un substitut au rapprochement bancaire : c'est un garde-fou en
+attendant qu'il soit fait, et le P&L affiche combien de paiements il a écartés pour que ce ne soit
+pas invisible.
+
+Le tableau de bord distingue maintenant explicitement « Chiffre d'affaires TTC » (ce que le client a
+payé, la vision caisse) du CA HT affiché juste en dessous, et **tous** les ratios — food cost, masse
+salariale, charges fixes, marge nette, simulateur — sont calculés sur le HT. C'était la dernière
+divergence entre les deux écrans.
+
+### Module « À faire » : ce qui empêche les chiffres d'être justes
+
+Un food cost à 61 % ne vient presque jamais d'une erreur de calcul : il vient de données manquantes.
+L'accueil s'ouvre donc sur la liste des interventions à mener, classées par gravité puis dans
+l'**ordre causal** — la caisse d'abord, puis le chiffre d'affaires, puis ce qui en découle. Trier par
+montant remonterait des conséquences avant leur cause.
+
+Onze règles, chacune adossée à une inégalité qu'on peut refaire à la main. La plus utile :
+
+> Un versement Square ne contient que les paiements par **carte**, commission **déjà déduite**. Le CA
+> TTC est donc forcément supérieur au total versé sur le compte. S'il est inférieur, il manque des
+> ventes — et l'écart réel est plus grand encore, puisque ni les espèces ni la commission n'entrent
+> dans le calcul. Aucune hypothèse, aucun taux supposé.
+
+Les règles vivent dans `src/lib/interventions.ts`. `detectInterventions` est une **fonction pure** :
+elle reçoit des faits et renvoie des constats, sans toucher ni à la base ni à l'horloge. C'est ce
+qui permet de la tester dans les deux sens — elle se déclenche quand il faut, et elle se **tait**
+quand tout va bien. Une alerte qui se déclenche à tort est pire que pas d'alerte : elle apprend à
+ignorer le module.
+
+Tant qu'une intervention critique est ouverte, les alertes de pilotage (food cost au-dessus de la
+cible, TVA à provisionner) sont masquées. Annoncer un problème de gestion alors que le chiffre
+d'affaires est incomplet envoie chercher une cause qui n'existe pas.
+
+`npm run verify:compta` compte désormais **90 contrôles**.
+
+## 8. Pistes pour la suite (non faites, à discuter)
 - Stock : les achats et ventes sont cumulés **depuis toujours** — un vrai calcul d'écart devrait
   repartir du dernier inventaire. C'est un chantier métier à part entière.
 - Rapprochement produit↔ingrédient par « le nom contient » : fonctionne mais fragile

@@ -96,14 +96,16 @@ base et consomme l'API Square.
 npm run verify:compta
 ```
 
-27 contrôles de non-régression sur les calculs de TVA et la classification des
-écritures. **À lancer après toute modification touchant `src/lib/tva.ts`,
-`src/lib/accounting.ts` ou le P&L.** Chaque contrôle correspond à une erreur qui
-a réellement été commise : TVA déduite sans facture, ventilation par taux ne
+90 contrôles de non-régression sur les calculs de TVA, la classification des
+écritures et la détection des anomalies. **À lancer après toute modification
+touchant `src/lib/tva.ts`, `src/lib/accounting.ts`, `src/lib/interventions.ts`,
+le P&L ou le tableau de bord.** Chaque contrôle correspond à une erreur qui a
+réellement été commise : TVA déduite sans facture, ventilation par taux ne
 réconciliant pas avec son total, taux à 7 % classé en 5,5 %, encaissement traité
-comme un achat. Les données sont synthétiques, aucune base n'est requise.
+comme un achat, coût matières HT divisé par un chiffre d'affaires TTC. Les
+données sont synthétiques, aucune base n'est requise.
 
-Deux règles structurent la comptabilité de l'outil, et ne doivent pas être
+Trois règles structurent la comptabilité de l'outil, et ne doivent pas être
 contournées :
 
 1. **Le chiffre d'affaires vient de Square.** Un encaissement bancaire n'est pas
@@ -112,6 +114,38 @@ contournées :
 2. **La TVA déductible vient des factures.** L'article 271 du CGI subordonne la
    déduction à une facture. Estimer la TVA depuis un libellé bancaire fabrique un
    droit à déduction qui n'existe pas.
+3. **Tout ratio se calcule HT sur HT.** Les lignes de facture sont en HT, les
+   mouvements bancaires en TTC, les commandes Square en TTC. Les trois fonctions
+   de conversion (`orderHtAmount`, `bankAmountHt`, `makeInvoiceMatcher` dans
+   `lib/accounting.ts`) sont le seul passage autorisé d'une base à l'autre — le
+   P&L et le tableau de bord affichaient sinon deux food cost différents pour le
+   même mois.
+
+## Module « À faire » (interventions)
+
+La page d'accueil s'ouvre sur la liste de ce qui **empêche les chiffres d'être
+justes** : caisse désynchronisée, ventes manquantes, dépenses sans facture,
+compte courant d'associé débiteur… Chaque ligne dit ce que le chiffre faux fait
+croire, l'action à mener, et pointe l'écran où la mener.
+
+Les règles vivent dans `src/lib/interventions.ts`. `detectInterventions` est une
+**fonction pure** : elle reçoit des faits et renvoie des constats, sans toucher
+ni à la base ni à l'horloge. C'est ce qui permet de la tester dans les deux sens
+— elle se déclenche quand il faut, et elle se **tait** quand tout va bien.
+
+Deux principes pour ajouter une règle :
+
+- **Aucune intervention sans preuve arithmétique.** Exemple : un versement Square
+  ne contient que les paiements par carte, commission déjà déduite ; le CA TTC
+  est donc forcément supérieur au total versé. S'il est inférieur, il manque des
+  ventes — sans hypothèse, sans taux supposé.
+- **Une alerte qui se déclenche à tort est pire que pas d'alerte.** Ajouter le
+  cas « tout va bien » au fichier de contrôle en même temps que la règle.
+
+Tant qu'une intervention **critique** est ouverte, les alertes de pilotage
+(food cost au-dessus de la cible, TVA à provisionner) sont masquées : annoncer un
+problème de gestion alors que le chiffre d'affaires est incomplet envoie chercher
+une cause qui n'existe pas.
 
 ## Architecture
 
@@ -119,7 +153,7 @@ contournées :
 src/
 ├── proxy.ts                  # Auth globale (pages → redirect, API → 401) + rôle comptable
 ├── app/
-│   ├── (dashboard)/          # Les 15 pages de l'application
+│   ├── (dashboard)/          # Les 15 pages de l'application (accueil = module « À faire »)
 │   ├── api/
 │   │   ├── square/           # sync (rattrapage), webhook (signé HMAC), import-catalog
 │   │   ├── scanner/          # Analyse (étape 1) + confirm (étape 2) + health
@@ -132,13 +166,15 @@ src/
 │   └── globals.css           # Design system (variables, composants, responsive)
 ├── components/
 │   ├── ui.tsx                # KpiCard, Modal, ChartCard, PeriodSelector, etc.
+│   ├── Interventions.tsx     # Module « À faire » de l'accueil (signal d'alerte)
 │   └── Sidebar.tsx           # Navigation desktop + bottom-nav mobile
 └── lib/
     ├── supabase/             # Clients (browser, server, service-role) + requireUser()
     ├── square.ts             # API Square + écriture des commandes (sync ET webhook)
     ├── invoices.ts           # Enregistrement de facture unifié (scanner + import direct)
     ├── ai/                   # Prompt OCR unique, parseur JSON robuste
-    ├── accounting.ts         # Flux financiers, taux indicatifs (règles comptables)
+    ├── accounting.ts         # Flux financiers, taux indicatifs, conversions HT
+    ├── interventions.ts      # Ce qui empêche les chiffres d'être justes (fonction pure)
     ├── tva.ts                # Calcul TVA (source de vérité unique)
     ├── square-sync.ts        # Import des commandes (cron + rattrapage manuel)
     ├── recipes.ts            # Coût des recettes + conversion d'unités (anti-cycle)

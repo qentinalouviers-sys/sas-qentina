@@ -3,7 +3,9 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatPercent, getDateRange, toISODate, formatDate } from '@/lib/utils';
-import { isFinancialFlow } from '@/lib/accounting';
+import {
+  isFinancialFlow, orderHtAmount, bankAmountHt, makeInvoiceMatcher,
+} from '@/lib/accounting';
 import {
   TrendingUp,
   DollarSign,
@@ -20,12 +22,6 @@ import {
 } from 'lucide-react';
 import { BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import type { PeriodFilter } from '@/lib/types';
-
-const getHtAmount = (o: any) => {
-  const raw = o.raw_data || {};
-  const tax = (raw.total_tax_money?.amount || raw.net_amounts?.tax_money?.amount || 0) / 100;
-  return (o.net_amount || 0) - tax;
-};
 
 // Formateur de ligne de modale pour une transaction bancaire (Date / Libellé / Montant),
 // paramétré par la couleur du montant.
@@ -78,6 +74,8 @@ export default function PnlPage() {
     fluxFinanciersTotal: 0,
     fluxFinanciersCount: 0,
     fluxFinanciersList: [] as any[],
+    // Paiements écartés parce que déjà couverts par une facture de la période
+    paiementsDejaFactures: 0,
 
     // Achats (Coûts Variables)
     purchasesAlim: 0,
@@ -162,10 +160,13 @@ export default function PnlPage() {
           .gte('date', startStr)
           .lte('date', endStr)
           .order('date', { ascending: false }),
-        // 2. Factures fournisseurs
+        // 2. Factures fournisseurs.
+        // `total_ttc` sert au rapprochement souple ci-dessous : sans lui, une
+        // facture scannée et son paiement bancaire non lettré sont comptés
+        // deux fois dans le coût matières.
         supabase
           .from('invoices')
-          .select('id')
+          .select('id, date, total_ttc')
           .gte('date', startStr)
           .lte('date', endStr),
         // Achats Fournisseurs non lettrés (dans banque directement, non lié à facture)
@@ -211,7 +212,7 @@ export default function PnlPage() {
       // 1. Chiffre d'Affaires (Square Orders)
       const ordersList = orders || [];
       const activeOrders = ordersList.filter((o: any) => !loadedMaskedIds.includes(String(o.id)));
-      const caSquare = activeOrders.reduce((s: number, o: any) => s + getHtAmount(o), 0);
+      const caSquare = activeOrders.reduce((s: number, o: any) => s + orderHtAmount(o), 0);
 
       // ── Flux financiers : ni recette, ni charge ──────────────────────────
       // Un prêt, un apport, un mouvement de compte courant ou un virement de
@@ -263,10 +264,21 @@ export default function PnlPage() {
         });
       }
 
+      // ── Rapprochement souple facture ↔ paiement ───────────────────────────
+      // Voir `makeInvoiceMatcher` : un paiement égal au centime au TTC d'une
+      // facture de la période est déjà compté par cette facture. Le compter
+      // aussi doublerait l'achat — c'est ce qui gonflait le coût matières.
+      const matcher = makeInvoiceMatcher((invoices || []) as any[]);
+
       // Achats Fournisseurs non lettrés (dans banque directement, non lié à facture)
-      const bankSuppliersUnreconciledList = sansFlux(bankSuppliers || []);
+      const bankSuppliersUnreconciledList = sansFlux(bankSuppliers || [])
+        .filter((t: any) => !matcher.alreadyInvoiced(t));
       const activeBankSuppliers = bankSuppliersUnreconciledList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
-      const bankSuppliersUnreconciled = activeBankSuppliers.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
+      // Les lignes de factures sont en HT, les montants bancaires en TTC :
+      // on ramène ces derniers en HT pour que le ratio reste comparable.
+      const bankSuppliersUnreconciled = activeBankSuppliers.reduce(
+        (s: number, t: any) => s + bankAmountHt(t, 'variable_fournisseur'), 0
+      );
       const totalCogs = purchasesAlim + purchasesBoisson + purchasesEmballage + bankSuppliersUnreconciled;
 
       // 3. Masse Salariale
@@ -284,10 +296,13 @@ export default function PnlPage() {
       const useBankLabor = laborBank > 0;
       const activeLabor = useBankLabor ? laborBank : laborTimecards;
 
-      // 4. Charges Fixes (Banque)
-      const fixedTxList = sansFlux(fixedTx || []);
+      // 4. Charges Fixes (Banque) — mêmes deux précautions que pour les achats :
+      // on écarte les paiements déjà couverts par une facture de la période, et
+      // on ramène les montants en HT.
+      const fixedTxList = sansFlux(fixedTx || [])
+        .filter((t: any) => !matcher.alreadyInvoiced(t));
       const activeFixedTx = fixedTxList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
-      
+
       let chargesLoyer = 0;
       let chargesAssurance = 0;
       let chargesAbonnement = 0;
@@ -295,7 +310,7 @@ export default function PnlPage() {
       let chargesAutreBank = 0;
 
       activeFixedTx.forEach((t: any) => {
-        const amt = Math.abs(t.amount || 0);
+        const amt = bankAmountHt(t);
         if (t.category === 'fixe_loyer') chargesLoyer += amt;
         else if (t.category === 'fixe_assurance') chargesAssurance += amt;
         else if (t.category === 'fixe_abonnement') chargesAbonnement += amt;
@@ -323,6 +338,7 @@ export default function PnlPage() {
         fluxFinanciersTotal,
         fluxFinanciersCount: horsExploitation.length,
         fluxFinanciersList: horsExploitation,
+        paiementsDejaFactures: matcher.count(),
         purchasesAlim,
         purchasesBoisson,
         purchasesEmballage,
@@ -456,7 +472,7 @@ export default function PnlPage() {
           cells: [
             formatDate(o.service),
             <span key="id" style={{ fontFamily: 'monospace', fontSize: 12 }}>{o.square_order_id}</span>,
-            <strong key="amt" style={{ color: 'var(--teal)' }}>{formatCurrency(getHtAmount(o))}</strong>
+            <strong key="amt" style={{ color: 'var(--teal)' }}>{formatCurrency(orderHtAmount(o))}</strong>
           ]
         });
         break;
@@ -609,7 +625,7 @@ export default function PnlPage() {
     } else if (activeDetail.startsWith('purchases_')) {
       consolidatedSum = activeItemsList.reduce((s: number, l: any) => s + (l.total_ht || 0), 0);
     } else if (activeDetail === 'ca_square') {
-      consolidatedSum = activeItemsList.reduce((s: number, o: any) => s + getHtAmount(o), 0);
+      consolidatedSum = activeItemsList.reduce((s: number, o: any) => s + orderHtAmount(o), 0);
     } else {
       consolidatedSum = activeItemsList.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
     }
@@ -832,6 +848,15 @@ export default function PnlPage() {
               </div>
             )}
 
+            {data.paiementsDejaFactures > 0 && (
+              <div className="alert alert-success" style={{ marginBottom: 20, background: 'rgba(42, 125, 123, 0.05)', color: 'var(--teal)', borderColor: 'rgba(42, 125, 123, 0.2)' }}>
+                <Info size={16} />
+                <span>
+                  <strong>{data.paiementsDejaFactures} paiement(s) déjà couvert(s) par une facture :</strong> leur montant correspond au centime au TTC d&apos;une facture scannée de la période. Ils sont écartés du coût matières pour ne pas compter l&apos;achat deux fois. Fais le rapprochement bancaire pour rendre cet appariement définitif.
+                </span>
+              </div>
+            )}
+
             {maskedIds.length > 0 && (
               <div className="alert alert-success" style={{ marginBottom: 20, background: 'rgba(42, 125, 123, 0.05)', color: 'var(--teal)', borderColor: 'rgba(42, 125, 123, 0.2)' }}>
                 <Info size={16} />
@@ -1000,7 +1025,7 @@ export default function PnlPage() {
                       value={data.bankSuppliersUnreconciled}
                       ratio={calculateRatio(data.bankSuppliersUnreconciled)}
                       color="var(--orange)"
-                      note="Dépenses banque sans factures PDF (cliquer pour voir/exclure)"
+                      note="Dépenses banque sans facture, ramenées en HT (cliquer pour voir/exclure)"
                       onClick={() => openDetail('bank_suppliers_unreconciled')}
                     />
 
