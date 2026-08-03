@@ -77,6 +77,19 @@ export interface InterventionFacts {
   daysWithSales: string[];
   /** Dernier jour de service Square enregistré en base, toutes périodes. */
   lastSyncedService: string | null;
+  /**
+   * Première vente jamais enregistrée — en pratique, la date d'ouverture.
+   *
+   * Déduite des ventes plutôt que saisie en réglage : un établissement qui a
+   * vendu ne peut pas avoir ouvert après, et une date déduite ne peut pas être
+   * oubliée à la configuration.
+   *
+   * Sans elle, une période « Année » ouvre le 1er janvier et l'outil raisonne
+   * sur des mois où le restaurant n'existait pas : il réclamait des relevés
+   * bancaires pour janvier et signalait « 113 jours consécutifs sans aucune
+   * vente » pour un local encore en travaux.
+   */
+  firstSaleEver: string | null;
 
   /** Versements Square reçus sur le compte pendant la période (crédits). */
   squarePayoutsTtc: number;
@@ -212,6 +225,10 @@ function longestSalesGap(
 export function detectInterventions(f: InterventionFacts): Intervention[] {
   const out: Intervention[] = [];
 
+  // Début effectif de l'analyse : jamais avant la première vente. Rien de ce
+  // qui précède l'ouverture n'a de sens à reprocher.
+  const debut = f.firstSaleEver && f.firstSaleEver > f.start ? f.firstSaleEver : f.start;
+
   // ── 1. La caisse ne se synchronise plus ──────────────────────────────────
   // Sans synchro, tout le reste est faux : le CA est la base de chaque ratio.
   if (f.lastSyncedService) {
@@ -284,7 +301,7 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
   }
 
   // ── 3. Trous dans l'historique des ventes ────────────────────────────────
-  const gap = longestSalesGap(f.start, f.end, f.daysWithSales, f.today);
+  const gap = longestSalesGap(debut, f.end, f.daysWithSales, f.today);
   if (gap && gap.length >= 3) {
     out.push({
       id: 'trou-historique-ventes',
@@ -372,7 +389,7 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
   // un food cost — ça ne donne rien du tout.
   if (f.bankCoverage.firstDate && f.bankCoverage.lastDate) {
     const horizon = f.end < f.today ? f.end : f.today;
-    const attendu = daysBetween(f.start, horizon) + 1;
+    const attendu = daysBetween(debut, horizon) + 1;
     const couvert = daysBetween(f.bankCoverage.firstDate, f.bankCoverage.lastDate) + 1;
     if (attendu > 45 && couvert < attendu * 0.7) {
       out.push({
@@ -381,11 +398,13 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
         title: `Achats connus sur ${couvert} jours, ventes sur ${attendu}`,
         impact:
           `Les relevés importés ne couvrent que du ${jour(f.bankCoverage.firstDate)} ` +
-          `au ${jour(f.bankCoverage.lastDate)}, alors que le chiffre d'affaires ` +
-          `couvre toute la période. Le food cost et les charges divisent donc ` +
-          `${couvert} jours de dépenses par ${attendu} jours de ventes : le ratio ` +
-          `ne veut rien dire, ni dans un sens ni dans l'autre. C'est le premier ` +
-          `chiffre à réparer, avant même de s'interroger sur le niveau du food cost.`,
+          `au ${jour(f.bankCoverage.lastDate)}, alors que les ventes couvrent ` +
+          `${attendu} jours` +
+          (debut !== f.start ? ` depuis l'ouverture le ${jour(debut)}` : '') + `. ` +
+          `Le food cost et les charges divisent donc ${couvert} jours de dépenses ` +
+          `par ${attendu} jours de ventes : le ratio est MINORÉ, il paraît meilleur ` +
+          `qu'il ne l'est. Importer les relevés manquants le fera monter — c'est ` +
+          `normal, et c'est la seule façon d'obtenir le vrai chiffre.`,
         action:
           'Importe les relevés bancaires des mois manquants, ou compare sur une ' +
           'période que tes relevés couvrent entièrement.',
@@ -426,6 +445,9 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
   // une conséquence des alertes précédentes, pas un problème en soi.
   if (f.foodCostPercent !== null && f.caSquareHt > 0) {
     const fc = f.foodCostPercent;
+    const moisDActivite = f.firstSaleEver
+      ? Math.max(1, Math.round(daysBetween(f.firstSaleEver, f.today) / 30.4))
+      : null;
     if (fc > 45) {
       out.push({
         id: 'food-cost-trop-haut',
@@ -433,9 +455,15 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
         title: `Food cost à ${pct(fc)} — hors norme`,
         impact:
           `Une pizzeria napolitaine tourne entre 28 et 32 %. Au-delà de 45 %, ` +
-          `deux causes seulement : il manque du chiffre d'affaires, ou un achat ` +
-          `est compté deux fois (une facture scannée ET son paiement bancaire non ` +
-          `rapproché).`,
+          `trois causes possibles : il manque du chiffre d'affaires, un achat est ` +
+          `compté deux fois (une facture scannée ET son paiement bancaire non ` +
+          `rapproché), ou les achats et les ventes ne couvrent pas la même période.` +
+          (moisDActivite !== null && moisDActivite < 6
+            ? ` À noter : l'établissement n'a que ${moisDActivite} mois d'activité. ` +
+              `Les premiers mois portent le stock d'ouverture et les sur-commandes ` +
+              `du rodage — la référence 28-32 % ne s'applique pas encore, mais la ` +
+              `tendance mois par mois, si.`
+            : ''),
         action:
           'Traite d\'abord les alertes de chiffre d\'affaires ci-dessus. Puis ouvre ' +
           'le détail du coût matières dans le P&L pour repérer un doublon.',
@@ -600,16 +628,20 @@ export async function collectInterventionFacts(
   // tronque à 1 000 lignes sans le dire. Sur un exercice de 1 788 commandes, ce
   // module comparait les versements bancaires à un CA amputé de 44 % — et
   // annonçait « des ventes manquantes » en désignant la mauvaise cause.
-  const [orders, lastRes, bank, invoices, suppliers, cca, trips, tva] =
+  const [orders, lastRes, firstRes, bank, invoices, suppliers, cca, trips, tva] =
     await Promise.all([
       fetchAllRows<any>((f0, f1) => supabase.from('square_orders')
         .select('service, net_amount, raw_data')
         .gte('service', start).lte('service', end)
         .range(f0, f1)),
-      // Bornée par construction : une seule ligne demandée.
+      // Bornées par construction : une seule ligne demandée de chaque côté.
       supabase.from('square_orders')
         .select('service')
         .order('service', { ascending: false })
+        .limit(1),
+      supabase.from('square_orders')
+        .select('service')
+        .order('service', { ascending: true })
         .limit(1),
       fetchAllRows<any>((f0, f1) => supabase.from('bank_transactions')
         .select('date, description, amount, category, invoice_id')
@@ -704,6 +736,9 @@ export async function collectInterventionFacts(
     daysWithSales: [...daysWithSales].sort(),
     lastSyncedService: lastRes.data?.[0]?.service
       ? String(lastRes.data[0].service).slice(0, 10)
+      : null,
+    firstSaleEver: firstRes.data?.[0]?.service
+      ? String(firstRes.data[0].service).slice(0, 10)
       : null,
     squarePayoutsTtc: round2(squarePayoutsTtc),
     squarePayoutsCount,
