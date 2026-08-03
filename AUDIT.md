@@ -795,6 +795,66 @@ Une intervention se déclenche au-delà de 40 % non détaillé, **avant** l'aler
 haut à quelqu'un dont on ne sait pas mesurer le ratio, c'est l'envoyer chercher
 un problème de gestion qui n'existe peut-être pas.
 
+### Deux ratios qu'on ne peut pas lire, et qui ne le disaient pas
+
+Une fois le chiffre d'affaires vérifié — **46 854,91 € HT contre 46 790 € annoncés
+par l'application Square, soit 0,14 % d'écart** — le tableau de bord affichait
+encore deux ratios impossibles à interpréter.
+
+**Les achats ne couvrent pas la même période que les ventes.** Le chiffre
+d'affaires vient de la caisse : il couvre toujours la fenêtre entière. Les achats
+viennent des relevés bancaires importés, qui peuvent n'en couvrir qu'un morceau.
+Diviser huit mois de ventes par deux mois d'achats ne donne pas un food cost —
+ça ne donne rien du tout, ni dans un sens ni dans l'autre. L'intervention compare
+donc les bornes réelles des relevés à la période analysée, en arrêtant celle-ci à
+aujourd'hui : sur le mois en cours, la fin de période est dans le futur et
+n'appelle aucun relevé.
+
+**Une masse salariale à 2,9 % pour 1 627 commandes servies.** Ce n'est pas
+impossible — deux associés non rémunérés au démarrage, c'est fréquent — mais ça
+change la lecture de tous les autres ratios, et l'alerte le dit dans les deux
+sens : soit les salaires ne sont pas enregistrés et le résultat affiché est très
+surévalué, soit ils ne sont pas versés et la marge ne tient pas compte du travail
+fourni. Dans les deux cas c'est au restaurateur de trancher, pas à l'outil de
+supposer. Classée « à vérifier » pour cette raison, et déclenchée seulement
+au-delà de 200 commandes — en dessous, l'échantillon ne prouve rien.
+
+### L'établissement a ouvert le 24 avril, et l'outil l'ignorait
+
+Information donnée par l'exploitant, et elle renverse la lecture.
+
+Sur la période « Année », l'outil raisonnait depuis le 1er janvier. Il réclamait
+donc des relevés bancaires pour des mois où le local était encore en travaux, et
+signalait **« 113 jours consécutifs sans aucune vente »** — un constat exact et
+parfaitement inutile.
+
+La date d'ouverture est désormais **déduite de la première vente enregistrée**,
+sans réglage à saisir : un établissement qui a vendu ne peut pas avoir ouvert
+après, et une date déduite ne peut pas être oubliée à la configuration. Toutes
+les fenêtres d'analyse démarrent au plus tôt à cette date.
+
+**Le plus important** : l'écart de période minore le food cost, il ne le majore
+pas. Sur les données réelles :
+
+| | |
+|---|---:|
+| Activité | 102 jours (24/04 → 03/08) |
+| Ventes | 46 855 € HT, 1 627 commandes, 459 €/jour |
+| Relevés bancaires importés | 62 jours, soit **61 %** de l'activité |
+| Food cost affiché | 52 % |
+| **Food cost à période identique** | **≈ 66 %** |
+
+Diviser 62 jours d'achats par 102 jours de ventes fait paraître le ratio
+meilleur qu'il ne l'est. Le message le dit maintenant explicitement — importer
+les relevés manquants **fera monter** le food cost, et c'est normal. Sans cette
+précision, l'utilisateur importe des relevés en espérant une amélioration, voit
+le chiffre se dégrader, et conclut que l'outil s'est encore trompé.
+
+Enfin, l'alerte « food cost hors norme » mentionne l'ancienneté quand
+l'établissement a moins de six mois : les premiers mois portent le stock
+d'ouverture et les sur-commandes du rodage, la référence 28-32 % ne s'y applique
+pas encore — mais la tendance mois par mois, si.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 **Signalées et non corrigées** — le module « À faire » les remonte déjà, la

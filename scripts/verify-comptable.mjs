@@ -46,7 +46,17 @@ function fakeSupabase(tables) {
       let end = MAX_ROWS - 1;
       const q = {
         select: () => q,
-        order: () => q,
+        // Le tri est réellement appliqué : plusieurs règles reposent dessus
+        // (première et dernière vente enregistrées). Un `order` neutre rendait
+        // ces contrôles muets — ils passaient quel que soit le code.
+        order(col, opts) {
+          const asc = opts?.ascending !== false;
+          rows = rows.slice().sort((a, b) => {
+            const x = String(a[col] ?? ''), y = String(b[col] ?? '');
+            return asc ? x.localeCompare(y) : y.localeCompare(x);
+          });
+          return q;
+        },
         eq(col, v) { rows = rows.filter(r => r[col] === v); return q; },
         lt(col, v) { rows = rows.filter(r => Number(r[col]) < v); return q; },
         gte(col, v) { rows = rows.filter(r => String(r[col]) >= v); return q; },
@@ -230,6 +240,10 @@ const faits = (o = {}) => ({
   tva: TVA_SAINE,
   foodCostPercent: 30,
   foodCostBankSharePercent: 5,
+  laborPercent: 31,
+  laborAmount: 14500,
+  bankCoverage: { firstDate: '2026-06-01', lastDate: '2026-06-30' },
+  firstSaleEver: '2024-01-15',
   suspectDateInvoices: { count: 0, sample: [] },
   mojibakeSuppliers: [],
   ccaBalances: [{ associe: 'yohan', balance: 1200 }],
@@ -313,6 +327,84 @@ const fc = detectInterventions(faits({ foodCostPercent: 62, foodCostBankSharePer
 verifie('fiabilité annoncée avant le food cost hors norme',
   fc.indexOf('food-cost-non-mesure') < fc.indexOf('food-cost-trop-haut'), true);
 
+// Couverture bancaire. Le CA vient de la caisse et couvre toujours la période
+// entière ; les achats viennent des relevés importés, qui peuvent n'en couvrir
+// qu'un morceau. Diviser huit mois de ventes par deux mois d'achats ne donne
+// pas un food cost — ça ne donne rien du tout. Cas réel : 46 855 € de CA sur
+// huit mois face à un seul relevé de juin-juillet.
+declenche('relevés sur 2 mois, ventes sur 8',
+  { start: '2026-01-01', end: '2026-12-31', today: '2026-08-03',
+    bankCoverage: { firstDate: '2026-06-01', lastDate: '2026-08-01' } },
+  'banque-periode-incomplete');
+silence('relevés couvrant toute la période',
+  { start: '2026-06-01', end: '2026-08-31', today: '2026-08-31',
+    bankCoverage: { firstDate: '2026-06-01', lastDate: '2026-08-30' } },
+  'banque-periode-incomplete');
+silence('période trop courte pour conclure',
+  { start: '2026-08-01', end: '2026-08-31', today: '2026-08-10',
+    bankCoverage: { firstDate: '2026-08-01', lastDate: '2026-08-02' } },
+  'banque-periode-incomplete');
+silence('aucun relevé importé : autre alerte s\'en charge',
+  { bankCoverage: { firstDate: null, lastDate: null } },
+  'banque-periode-incomplete');
+verifie('la fenêtre s\'arrête à aujourd\'hui, pas à fin décembre',
+  detectInterventions(faits({
+    start: '2026-01-01', end: '2026-12-31', today: '2026-08-03',
+    bankCoverage: { firstDate: '2026-06-01', lastDate: '2026-08-01' },
+  })).find(i => i.id === 'banque-periode-incomplete').title,
+  'Achats connus sur 62 jours, ventes sur 215');
+
+// Ouverture récente. Rien de ce qui précède la première vente n'a de sens à
+// reprocher : l'outil réclamait des relevés bancaires pour janvier et signalait
+// « 113 jours consécutifs sans aucune vente » pour un local en travaux.
+declenche('année entière, ouverture au 24 avril : trou avant ouverture ignoré',
+  { start: '2026-01-01', end: '2026-12-31', today: '2026-08-03',
+    firstSaleEver: '2026-04-24', daysWithSales: [],
+    bankCoverage: { firstDate: '2026-06-01', lastDate: '2026-08-01' } },
+  'banque-periode-incomplete');
+verifie('les ventes comptent depuis l\'ouverture, pas depuis janvier',
+  detectInterventions(faits({
+    start: '2026-01-01', end: '2026-12-31', today: '2026-08-03',
+    firstSaleEver: '2026-04-24',
+    bankCoverage: { firstDate: '2026-06-01', lastDate: '2026-08-01' },
+  })).find(i => i.id === 'banque-periode-incomplete').title,
+  'Achats connus sur 62 jours, ventes sur 102');
+verifie('le ratio est annoncé MINORÉ, pas majoré',
+  detectInterventions(faits({
+    start: '2026-01-01', end: '2026-12-31', today: '2026-08-03',
+    firstSaleEver: '2026-04-24',
+    bankCoverage: { firstDate: '2026-06-01', lastDate: '2026-08-01' },
+  })).find(i => i.id === 'banque-periode-incomplete').impact.includes('MINORÉ'), true);
+
+// Le trou de ventes ne compte plus les jours d'avant l'ouverture.
+silence('aucune vente avant l\'ouverture : ce n\'est pas un trou',
+  { start: '2026-01-01', end: '2026-08-31', today: '2026-08-03',
+    firstSaleEver: '2026-08-01',
+    daysWithSales: ['2026-08-01'] },
+  'trou-historique-ventes');
+
+// Un établissement de moins de six mois ne se juge pas au 28-32 %.
+verifie('le rodage est mentionné pour un jeune établissement',
+  detectInterventions(faits({ foodCostPercent: 62, firstSaleEver: '2026-04-24', today: '2026-08-03' }))
+    .find(i => i.id === 'food-cost-trop-haut').impact.includes('mois d\'activité'), true);
+verifie('… mais pas pour un établissement installé',
+  detectInterventions(faits({ foodCostPercent: 62, firstSaleEver: '2024-01-15' }))
+    .find(i => i.id === 'food-cost-trop-haut').impact.includes('mois d\'activité'), false);
+
+// Masse salariale. Un restaurant sans salaires n'est pas impossible — deux
+// associés non rémunérés au démarrage — mais ça change la lecture de tous les
+// autres ratios, donc ça doit être un choix affiché et non un oubli.
+declenche('1 370 € de salaires pour 1 627 commandes',
+  { laborPercent: 2.9, laborAmount: 1370, ordersCount: 1627 },
+  'masse-salariale-invraisemblable');
+silence('masse salariale normale à 31 %', {}, 'masse-salariale-invraisemblable');
+silence('trop peu de commandes pour conclure',
+  { laborPercent: 2.9, laborAmount: 1370, ordersCount: 40 },
+  'masse-salariale-invraisemblable');
+silence('masse salariale inconnue',
+  { laborPercent: null, ordersCount: 1627 },
+  'masse-salariale-invraisemblable');
+
 // Food cost — ne se déclenche que s'il y a du CA, sinon c'est une conséquence
 declenche('food cost à 62 %', { foodCostPercent: 62 }, 'food-cost-trop-haut');
 declenche('food cost à 9 %', { foodCostPercent: 9 }, 'food-cost-trop-bas');
@@ -377,7 +469,10 @@ verifie('compte courant yohan débiteur', factsBase.ccaBalances.find(b => b.asso
 verifie('compte courant justine créditeur', factsBase.ccaBalances.find(b => b.associe === 'justine').balance, 300);
 verifie('trajets hors compte courant', factsBase.tripsNotInCca.count, 1);
 verifie('part non facturée transmise', factsBase.foodCostBankSharePercent, 88);
+verifie('première date de relevé lue', factsBase.bankCoverage.firstDate === '2026-06-11', true);
+verifie('dernière date de relevé lue', factsBase.bankCoverage.lastDate === '2026-06-23', true);
 verifie('dernier service synchronisé', factsBase.lastSyncedService === '2026-06-10', true);
+verifie('première vente (date d\'ouverture déduite)', factsBase.firstSaleEver === '2026-06-10', true);
 
 const vues = detectInterventions(factsBase).map(i => i.id);
 verifie('ventes manquantes détectées sur ces données', vues.includes('ca-square-incomplet'), true);

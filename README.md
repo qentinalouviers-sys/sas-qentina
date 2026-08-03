@@ -116,7 +116,7 @@ base et consomme l'API Square.
 npm run verify:compta
 ```
 
-153 contrôles de non-régression sur les calculs de TVA, la classification des
+171 contrôles de non-régression sur les calculs de TVA, la classification des
 écritures, le lettrage et la détection des anomalies. **À lancer après toute
 modification touchant `src/lib/tva.ts`, `src/lib/accounting.ts`,
 `src/lib/bank-csv.ts`, `src/lib/interventions.ts`, `src/lib/reconciliation.ts`,

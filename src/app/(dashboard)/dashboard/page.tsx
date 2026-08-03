@@ -432,6 +432,8 @@ export default function DashboardPage() {
         today: toISODate(new Date()),
         foodCostPercent: caHt > 0 ? foodCost : null,
         foodCostBankSharePercent: caHt > 0 ? foodCostBanquePercent : null,
+        laborPercent: caHt > 0 ? ratioSalariale : null,
+        laborAmount: totalLabor,
       });
       setInterventions(detectInterventions(facts));
     } catch {
