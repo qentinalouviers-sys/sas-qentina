@@ -11,7 +11,7 @@ avis Google et assistant IA « Fuego ».
 
 - **Next.js 16** (App Router, `proxy.ts` pour l'auth) + React 19 + TypeScript strict
 - **Supabase** : base Postgres + Auth + Storage (fichiers de factures)
-- **Square** : source des ventes (synchro manuelle + webhook temps réel)
+- **Square** : source des ventes et **référence du chiffre d'affaires** (synchro nocturne automatique + webhook temps réel)
 - **Anthropic Claude** : OCR de factures/relevés, audits, chat Fuego
 - **Google** : avis (Places API) + réponses (My Business API, OAuth)
 
@@ -37,6 +37,7 @@ npm run dev
 | `NEXT_PUBLIC_APP_URL` | URL publique de l'app (ex. `https://…vercel.app`) |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OAuth Google Business (réponses aux avis) |
 | `GOOGLE_PLACES_API_KEY` / `GOOGLE_PLACE_ID` | Lecture des avis Google |
+| `CRON_SECRET` | **Obligatoire** : authentifie la synchro Square nocturne. Absente, elle refuse de tourner |
 
 ### Base de données
 
@@ -60,6 +61,34 @@ chercher le problème dans le code.
 
 Les variables d'environnement vivent dans *Settings → Environments* et sont indépendantes de la
 liaison Git : les reconnecter ne les efface pas.
+
+## Synchronisation Square automatique
+
+La caisse se synchronise **toute seule chaque nuit**, il n'y a aucun bouton à cliquer
+au quotidien. `vercel.json` déclare le travail planifié :
+
+```json
+{ "crons": [{ "path": "/api/cron/square-sync", "schedule": "0 1 * * *" }] }
+```
+
+**L'horaire est en UTC** — Vercel Cron ne gère pas les fuseaux. `0 1 * * *` donne
+2 h du matin à Paris en hiver et 3 h en été. Les deux tombent après le service et
+avant l'ouverture, ce qui est le seul point qui compte.
+
+La fenêtre couvre les **45 derniers jours**, pas l'année : elle englobe le mois
+courant et le précédent en entier — la période utile pour une déclaration de TVA —
+et se termine toujours largement dans le temps imparti. Une reprise annuelle chaque
+nuit serait lente et risquerait d'être coupée en cours de pagination, ce qui
+minorerait le chiffre d'affaires sans le signaler.
+
+Pour remonter plus loin, *Réglages → Historique Square* permet une reprise ponctuelle
+sur 3, 6 ou 12 mois. L'opération est rejouable : l'upsert sur `square_order_id`
+ne crée jamais de doublon.
+
+**`CRON_SECRET` est obligatoire.** Vercel ajoute l'en-tête
+`Authorization: Bearer $CRON_SECRET` à ses appels dès que la variable existe. Sans
+elle, la route refuse de travailler (503) au lieu de rester ouverte — elle écrit en
+base et consomme l'API Square.
 
 ## Contrôles comptables
 
@@ -92,10 +121,11 @@ src/
 ├── app/
 │   ├── (dashboard)/          # Les 15 pages de l'application
 │   ├── api/
-│   │   ├── square/           # sync (365 j), webhook (signé HMAC), import-catalog
+│   │   ├── square/           # sync (rattrapage), webhook (signé HMAC), import-catalog
 │   │   ├── scanner/          # Analyse (étape 1) + confirm (étape 2) + health
 │   │   ├── invoices/extract  # Import direct (analyse + enregistrement en 1 appel)
 │   │   ├── bank/extract      # Relevé bancaire (PDF/CSV) → transactions
+│   │   ├── cron/             # Travaux planifiés (synchro Square nocturne, CRON_SECRET)
 │   │   ├── ai/               # Insights ventes, audit stock, réponses aux avis
 │   │   ├── chat/             # Fuego (contexte chiffré du mois injecté)
 │   │   └── google/           # OAuth (state anti-CSRF) + avis
@@ -108,7 +138,9 @@ src/
     ├── square.ts             # API Square + écriture des commandes (sync ET webhook)
     ├── invoices.ts           # Enregistrement de facture unifié (scanner + import direct)
     ├── ai/                   # Prompt OCR unique, parseur JSON robuste
+    ├── accounting.ts         # Flux financiers, taux indicatifs (règles comptables)
     ├── tva.ts                # Calcul TVA (source de vérité unique)
+    ├── square-sync.ts        # Import des commandes (cron + rattrapage manuel)
     ├── recipes.ts            # Coût des recettes + conversion d'unités (anti-cycle)
     └── utils.ts              # Formats €/dates, fuseau Europe/Paris, CSV
 ```

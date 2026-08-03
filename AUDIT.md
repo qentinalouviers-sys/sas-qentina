@@ -459,6 +459,42 @@ de compte courant, virements de trésorerie et retraits sont écartés des recet
 charges, et affichés sur une ligne dédiée « Flux financiers exclus du résultat » — visibles,
 détaillables, mais hors résultat d'exploitation.
 
+### La caisse se synchronise seule chaque nuit
+
+Le bouton « Synchroniser » de la page Ventes a été retiré : un chiffre d'affaires qui dépend d'un
+clic est un chiffre d'affaires qui finit par manquer un jour. `vercel.json` déclare un travail
+planifié sur `/api/cron/square-sync`.
+
+**L'horaire est en UTC** — Vercel Cron ne gère pas les fuseaux. `0 1 * * *` donne 2 h du matin à
+Paris en hiver et 3 h en été ; les deux tombent après le service et avant l'ouverture, ce qui est le
+seul critère qui compte.
+
+**La fenêtre couvre 45 jours, pas l'année.** Elle englobe le mois courant et le précédent en entier
+— la période utile pour une déclaration — et se termine largement dans le temps imparti. Une reprise
+annuelle chaque nuit serait lente et risquerait d'être coupée en cours de pagination : on
+retomberait exactement sur le défaut qui minorait le chiffre d'affaires. Pour remonter plus loin,
+*Réglages → Historique Square* propose une reprise ponctuelle sur 3, 6 ou 12 mois.
+
+**Sur la sécurité de cette route.** Elle écrit en base et consomme l'API Square : laissée ouverte,
+n'importe qui pourrait la déclencher en boucle. Vercel ajoute l'en-tête
+`Authorization: Bearer $CRON_SECRET` à ses appels dès que la variable existe ; **sans elle, la route
+refuse de travailler (503) plutôt que de s'exécuter à découvert** — même principe que le webhook
+Square. La comparaison du secret est à temps constant.
+
+Vérifié sur un serveur de production réel :
+
+| Cas | Réponse |
+|---|---|
+| `CRON_SECRET` absent | **503**, et pas de redirection vers `/login` |
+| Aucun en-tête `Authorization` | 401 |
+| Jeton faux, longueur différente | 401 |
+| Jeton faux, **même longueur** (éprouve `timingSafeEqual`) | 401 |
+| En-tête mal formé (sans « Bearer ») | 401 |
+| Bon jeton | passe l'authentification |
+
+Et `/dashboard` continue de rediriger vers `/login` : l'exemption ajoutée au proxy ne concerne que
+`/api/cron/`.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 - **Réconcilier le CA du Dashboard (TTC) et du P&L (HT)** : les deux pages affichent un « CA »
