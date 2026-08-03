@@ -371,39 +371,53 @@ export async function POST(request: NextRequest) {
         + '« autre », à revoir dans la liste.'
       : undefined;
 
-    // ── STEP 4 : Insert with upsert + ON CONFLICT DO NOTHING ──────────────
-    // The DB-level unique index (migration_dedup.sql) is the ultimate safety net.
-    // ignoreDuplicates: true maps to ON CONFLICT DO NOTHING.
-    const { error: insertError, count: insertedCount } = await supabase
-      .from('bank_transactions')
-      .upsert(toInsertRows, {
-        onConflict: 'date,description,amount', // matches the unique index
-        ignoreDuplicates: true,                 // silently skips conflicts
-        count: 'exact',
-      });
+    // ── STEP 4 : insertion par lots ────────────────────────────────────────
+    // Surtout pas de `onConflict` ici : l'index anti-doublon porte sur une
+    // EXPRESSION (description normalisée), et PostgreSQL ne sait pas rattacher
+    // « ON CONFLICT (date, description, amount) » à un index d'expression.
+    // L'insertion groupée échouait donc systématiquement et repartait ligne à
+    // ligne — 177 allers-retours pour un relevé de deux mois, assez lent pour
+    // que la fonction soit coupée en cours de route et que la moitié du relevé
+    // manque, sans le moindre message.
+    //
+    // Un INSERT simple n'a besoin d'aucune inférence : il fonctionne avec cet
+    // index. Les doublons connus ont déjà été retirés à l'étape 3 ; il ne reste
+    // que le cas rare de deux imports simultanés, où le lot fautif est repris
+    // ligne à ligne.
+    const CHUNK = 50;
+    let insertedCount = 0;
 
-    if (insertError) {
-      // Fallback: insert row-by-row so one conflict doesn't block the whole batch
-      console.warn('Bulk upsert failed, falling back to row-by-row insert:', insertError);
-      let fallbackCount = 0;
-      for (const row of toInsertRows) {
-        const { error: rowErr } = await supabase
-          .from('bank_transactions')
-          .insert(row);
-        if (!rowErr) fallbackCount++;
+    for (let i = 0; i < toInsertRows.length; i += CHUNK) {
+      const chunk = toInsertRows.slice(i, i + CHUNK);
+      const { error: chunkError } = await supabase.from('bank_transactions').insert(chunk);
+
+      if (!chunkError) {
+        insertedCount += chunk.length;
+        continue;
+      }
+
+      // Un seul doublon fait échouer tout le lot : on le rejoue ligne à ligne
+      // pour n'écarter que la ligne fautive — au plus CHUNK requêtes, pas 177.
+      console.warn(`Lot ${i / CHUNK + 1} refusé, reprise ligne à ligne :`, chunkError.message);
+      for (const row of chunk) {
+        const { error: rowErr } = await supabase.from('bank_transactions').insert(row);
+        if (!rowErr) insertedCount++;
         else if (rowErr.code !== '23505') {
-          // 23505 = unique_violation — expected, skip silently
-          console.error('Row insert error (non-duplicate):', rowErr);
+          // 23505 = doublon, attendu et sans conséquence
+          console.error('Ligne refusée (hors doublon) :', rowErr);
         }
       }
-      return NextResponse.json({ success: true, count: fallbackCount, message: degradedNote });
     }
 
-    return NextResponse.json({
-      success: true,
-      count: insertedCount ?? toInsertRows.length,
-      message: degradedNote,
-    });
+    // Si des lignes ont été perdues en route, on le dit plutôt que d'annoncer
+    // un import complet : c'est exactement ce qui a masqué un demi-relevé.
+    const manquantes = toInsertRows.length - insertedCount;
+    const note = manquantes > 0
+      ? `${insertedCount} opérations importées sur ${toInsertRows.length} : `
+        + `${manquantes} ont été refusées. Relance l'import pour les rattraper.`
+      : degradedNote;
+
+    return NextResponse.json({ success: true, count: insertedCount, message: note });
 
   } catch (error: any) {
     console.error('Bank extract error:', error);
