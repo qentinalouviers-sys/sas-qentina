@@ -10,8 +10,8 @@ import {
 import { KpiCard, SectionHeader, Modal, EmptyState, LoadingPage } from '@/components/ui';
 import {
   DEFAULT_CONFIG, mergeConfig, computeTotals, allocateShares, matchDestination,
-  cvLabel, driverLabel,
-  type MileageConfig, type CvBracket,
+  cvLabel, driverLabel, tripDateFromLabel,
+  type MileageConfig, type CvBracket, type DetectionSource,
 } from '@/lib/mileage';
 
 interface Trip {
@@ -120,45 +120,88 @@ export default function TrajetsPage() {
     if (error) setMessage({ type: 'warning', text: 'Enregistrement des réglages impossible.' });
   };
 
-  // ── Détection automatique depuis les factures ─────────────────────────────
-  const detectFromInvoices = async () => {
+  // ── Détection automatique ─────────────────────────────────────────────────
+  const detectTrips = async () => {
     setDetecting(true);
     setMessage(null);
     try {
       const supabase = createClient();
-      const { data: invoices, error } = await supabase
-        .from('invoices')
-        .select('id, date, invoice_number, supplier:suppliers(name)')
-        .gte('date', `${year}-01-01`)
-        .lte('date', `${year}-12-31`)
-        .order('date');
+      const fromBank = config.detectionSource === 'banque';
 
-      if (error) throw error;
+      // Un trajet par JOUR et par DESTINATION : deux achats Metro le même jour
+      // = un seul aller-retour (choix validé avec le restaurateur).
+      const candidates = new Map<string, {
+        date: string; dest: typeof config.destinations[0];
+        invoiceId: string | null; note: string | null;
+      }>();
+      let approximate = 0;
 
-      // Un trajet par JOUR et par DESTINATION : deux factures Metro le même
-      // jour = un seul aller-retour (choix validé avec le restaurateur).
-      const candidates = new Map<string, { date: string; dest: typeof config.destinations[0]; invoiceId: string; ref: string }>();
+      if (fromBank) {
+        // On ne retient que les DÉBITS : un encaissement n'est pas un achat.
+        const { data: txs, error } = await supabase
+          .from('bank_transactions')
+          .select('date, description, amount')
+          .lt('amount', 0)
+          .gte('date', `${year}-01-01`)
+          .lte('date', `${year}-12-31`)
+          .order('date');
+        if (error) throw error;
 
-      for (const inv of invoices || []) {
-        const supplierName = (inv.supplier as any)?.name || '';
-        if (!supplierName || !inv.date) continue;
+        for (const tx of txs || []) {
+          const dest = matchDestination(tx.description || '', config.destinations);
+          if (!dest || !tx.date) continue;
 
-        const dest = matchDestination(supplierName, config.destinations);
-        if (!dest) continue;
+          // La date d'écriture n'est pas celle du déplacement — voir
+          // tripDateFromLabel : un règlement à terme arrive des mois après.
+          const { date, exact } = tripDateFromLabel(tx.description || '', tx.date);
+          if (date.slice(0, 4) !== String(year)) continue;
+          if (!exact) approximate++;
 
-        const key = `${inv.date}|${dest.key}`;
-        if (!candidates.has(key)) {
-          candidates.set(key, {
-            date: inv.date,
-            dest,
-            invoiceId: inv.id,
-            ref: inv.invoice_number || '',
-          });
+          const key = `${date}|${dest.key}`;
+          if (!candidates.has(key)) {
+            candidates.set(key, {
+              date,
+              dest,
+              invoiceId: null,
+              note: `${tx.description}${exact ? '' : ' — date de paiement'}`,
+            });
+          }
+        }
+      } else {
+        const { data: invoices, error } = await supabase
+          .from('invoices')
+          .select('id, date, invoice_number, supplier:suppliers(name)')
+          .gte('date', `${year}-01-01`)
+          .lte('date', `${year}-12-31`)
+          .order('date');
+        if (error) throw error;
+
+        for (const inv of invoices || []) {
+          const supplierName = (inv.supplier as any)?.name || '';
+          if (!supplierName || !inv.date) continue;
+
+          const dest = matchDestination(supplierName, config.destinations);
+          if (!dest) continue;
+
+          const key = `${inv.date}|${dest.key}`;
+          if (!candidates.has(key)) {
+            candidates.set(key, {
+              date: inv.date,
+              dest,
+              invoiceId: inv.id,
+              note: inv.invoice_number ? `Facture n° ${inv.invoice_number}` : null,
+            });
+          }
         }
       }
 
       if (candidates.size === 0) {
-        setMessage({ type: 'warning', text: `Aucune facture Metro ou Mozzalat trouvée sur ${year}.` });
+        setMessage({
+          type: 'warning',
+          text: fromBank
+            ? `Aucune opération Metro ou Mozzalat dans le relevé ${year}. Importe ton relevé depuis la page Banque.`
+            : `Aucune facture Metro ou Mozzalat trouvée sur ${year}. Scanne-les, ou bascule la détection sur le relevé bancaire dans les réglages.`,
+        });
         return;
       }
 
@@ -171,7 +214,7 @@ export default function TrajetsPage() {
         driver,
         invoice_id: c.invoiceId,
         source: 'auto',
-        note: c.ref ? `Facture n° ${c.ref}` : null,
+        note: c.note,
         dedupe_key: dedupeKey,
       }));
 
@@ -187,10 +230,14 @@ export default function TrajetsPage() {
       await loadData();
       const { data: after } = await supabase.from('mileage_trips').select('id');
       const added = (after?.length || before) - before;
+      const origine = fromBank ? 'ton relevé bancaire' : 'tes factures';
+      const reserve = approximate > 0
+        ? ` ${approximate} sont datés du jour du paiement, faute de date d'achat dans le libellé : vérifie-les.`
+        : '';
       setMessage({
-        type: 'success',
+        type: approximate > 0 ? 'warning' : 'success',
         text: added > 0
-          ? `${added} trajet${added > 1 ? 's' : ''} ajouté${added > 1 ? 's' : ''} depuis tes factures ${year}.`
+          ? `${added} trajet${added > 1 ? 's' : ''} ajouté${added > 1 ? 's' : ''} depuis ${origine} ${year}.${reserve}`
           : `Aucun nouveau trajet : les ${candidates.size} déplacements de ${year} sont déjà enregistrés.`,
       });
     } catch (e: any) {
@@ -366,9 +413,18 @@ export default function TrajetsPage() {
           <button className="btn btn-secondary btn-sm" onClick={() => setShowConfig(true)}>
             <Settings size={16} /> <span className="btn-text">Réglages</span>
           </button>
-          <button className="btn btn-secondary btn-sm" onClick={detectFromInvoices} disabled={detecting}>
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={detectTrips}
+            disabled={detecting}
+            title={config.detectionSource === 'banque'
+              ? 'Détecter les trajets depuis le relevé bancaire'
+              : 'Détecter les trajets depuis les factures scannées'}
+          >
             <RefreshCw size={16} className={detecting ? 'spinning' : ''} />
-            <span className="btn-text">{detecting ? 'Détection…' : 'Détecter'}</span>
+            <span className="btn-text">
+              {detecting ? 'Détection…' : `Détecter (${config.detectionSource})`}
+            </span>
           </button>
           <button className="btn btn-secondary btn-sm" onClick={() => setShowAdd(true)}>
             <Plus size={16} /> <span className="btn-text">Trajet</span>
@@ -651,6 +707,24 @@ export default function TrajetsPage() {
               calculateur d&apos;itinéraire avec tes adresses exactes : en cas de contrôle, la distance
               doit être justifiable.
             </span>
+          </div>
+
+          <SectionHeader
+            title="Source de la détection"
+            subtitle="Une seule à la fois : un achat laisse une facture ET une ligne bancaire"
+          />
+          <div className="form-group">
+            <select className="form-select" value={config.detectionSource}
+              onChange={e => saveConfig({ ...config, detectionSource: e.target.value as DetectionSource })}>
+              <option value="banque">Relevé bancaire</option>
+              <option value="factures">Factures scannées</option>
+            </select>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+              Le relevé est plus complet — toute dépense y figure, et ça marche sans scanner.
+              La facture reste la pièce justificative en cas de contrôle. Les deux décrivent
+              le <strong>même</strong> déplacement : les cumuler compterait chaque trajet deux fois.
+              Si tu changes de source, supprime les trajets déjà détectés avant de relancer.
+            </div>
           </div>
 
           <SectionHeader title="Véhicule" subtitle="Repris de la carte grise — imprimé sur la note de frais" />
