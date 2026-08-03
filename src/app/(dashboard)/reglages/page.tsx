@@ -2,7 +2,8 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { Plus, Trash2, Save, Settings, Flame, RefreshCw } from 'lucide-react';
+import { Plus, Trash2, Save, Settings, Flame, RefreshCw, Stethoscope } from 'lucide-react';
+import { formatCurrency } from '@/lib/utils';
 import { UNITS } from '@/lib/recipes';
 import type { Supplier, Ingredient } from '@/lib/types';
 
@@ -27,6 +28,29 @@ export default function ReglagesPage() {
   const [syncDays, setSyncDays] = useState(365);
   const [syncing, setSyncing] = useState(false);
   const [syncReport, setSyncReport] = useState<string | null>(null);
+  const [diagnosing, setDiagnosing] = useState(false);
+  const [diagnostic, setDiagnostic] = useState<any | null>(null);
+
+  /**
+   * Compare ce que Square contient à ce que la base contient.
+   *
+   * Relancer une reprise ne sert à rien si la cause est ailleurs — une
+   * boutique Square non configurée ne se rattrape pas, elle se configure.
+   * Lecture seule : rien n'est écrit ni corrigé.
+   */
+  const runDiagnostic = async () => {
+    setDiagnosing(true);
+    setDiagnostic(null);
+    try {
+      const res = await fetch(`/api/square/diagnostic?days=${syncDays}`);
+      const data = await res.json();
+      setDiagnostic(res.ok ? data : { error: data.error || 'Diagnostic impossible' });
+    } catch (e: any) {
+      setDiagnostic({ error: `Diagnostic impossible : ${e.message}` });
+    } finally {
+      setDiagnosing(false);
+    }
+  };
 
   const supabase = createClient();
 
@@ -361,11 +385,59 @@ export default function ReglagesPage() {
                   <option value={365}>12 derniers mois</option>
                 </select>
               </div>
-              <button className="btn btn-primary" onClick={runHistorySync} disabled={syncing}>
+              <button className="btn btn-primary" onClick={runHistorySync} disabled={syncing || diagnosing}>
                 <RefreshCw size={18} className={syncing ? 'spinning' : ''} />
                 {syncing ? 'Reprise en cours…' : 'Reprendre l’historique'}
               </button>
+              {/* Avant de relancer une reprise, savoir si la reprise est bien
+                  en cause : une boutique Square non importée ne se rattrape
+                  pas, elle se configure. */}
+              <button className="btn btn-secondary" onClick={runDiagnostic} disabled={syncing || diagnosing}>
+                <Stethoscope size={18} />
+                {diagnosing ? 'Analyse…' : 'Diagnostiquer l’écart'}
+              </button>
             </div>
+
+            {diagnostic && (
+              <div
+                className={`alert ${diagnostic.error ? 'alert-warning' : 'alert-success'}`}
+                style={{
+                  marginTop: 16, alignItems: 'flex-start', flexDirection: 'column',
+                  gap: 8, background: diagnostic.error ? undefined : 'var(--cream-light)',
+                  color: diagnostic.error ? undefined : 'var(--text-primary)',
+                  borderColor: diagnostic.error ? undefined : 'var(--border)',
+                }}
+              >
+                {diagnostic.error ? (
+                  <span>{diagnostic.error}</span>
+                ) : (
+                  <>
+                    <strong>
+                      Comparaison sur {diagnostic.days} jours (depuis le {diagnostic.since})
+                    </strong>
+                    <ul style={{ margin: 0, paddingLeft: 18, display: 'flex', flexDirection: 'column', gap: 6, fontWeight: 500 }}>
+                      {diagnostic.findings.map((f: string, i: number) => <li key={i}>{f}</li>)}
+                    </ul>
+                    {diagnostic.locations.length > 1 && (
+                      <div style={{ marginTop: 4, fontSize: 12.5 }}>
+                        <strong>Boutiques du compte Square :</strong>
+                        <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+                          {diagnostic.locations.map((l: any) => (
+                            <li key={l.id}>
+                              {l.name} — {l.completed.count} commandes,{' '}
+                              {formatCurrency(l.completed.amountTtc)}{' '}
+                              {l.configured
+                                ? <strong style={{ color: 'var(--green)' }}>(importée)</strong>
+                                : <strong style={{ color: 'var(--red)' }}>(ignorée)</strong>}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
             {syncReport && (
               <div
                 className={`alert ${syncReport.startsWith('Erreur') ? 'alert-warning' : 'alert-success'}`}
