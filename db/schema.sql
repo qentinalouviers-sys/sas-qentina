@@ -178,7 +178,7 @@ create table bank_transactions (
   date date not null,
   description text not null,
   amount numeric not null,
-  category text check (category in ('fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'variable_fournisseur', 'variable_salaire', 'impot_taxe', 'recette', 'autre')),
+  category text check (category in ('fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'variable_fournisseur', 'variable_salaire', 'impot_taxe', 'recette', 'investissement', 'flux_financier', 'autre')),
   status text default 'pending_invoice' check (status in ('pending_invoice', 'reconciled', 'ignored')),
   invoice_id uuid references invoices(id) on delete set null,
   created_at timestamptz default now()

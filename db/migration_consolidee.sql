@@ -70,6 +70,30 @@ DROP POLICY IF EXISTS "Authenticated users full access" ON app_settings;
 CREATE POLICY "Authenticated users full access" ON app_settings
   FOR ALL USING (auth.role() = 'authenticated');
 
+-- ── 5 bis. Deux catégories manquantes ───────────────────────────
+--
+-- `investissement` : achats d'équipement, travaux d'aménagement, réparations.
+-- Ils n'ont leur place ni dans le coût matières (ce ne sont pas des achats
+-- revendus) ni dans les charges fixes : un four à 1 400 € rangé en charge fixe
+-- gonfle le coût de structure du mois et le fait paraître meilleur les mois
+-- suivants. Sans ce poste, ces dépenses restaient en « autre » — indistinctes
+-- de celles qui ne sont simplement pas encore classées.
+--
+-- `flux_financier` : le code la gérait déjà (`FINANCIAL_CATEGORY` dans
+-- `lib/accounting.ts`, requête de la page TVA) mais la contrainte la refusait :
+-- impossible de marquer une écriture hors exploitation à la main, l'écriture
+-- échouait sans que l'interface l'explique. Elle sert aux prélèvements erronés
+-- en attente de remboursement, dont le débit **et** le remboursement doivent
+-- rester hors du résultat — sinon la dépense gonfle les charges ce mois-ci et
+-- le remboursement gonfle le chiffre d'affaires le mois suivant.
+ALTER TABLE bank_transactions DROP CONSTRAINT IF EXISTS bank_transactions_category_check;
+ALTER TABLE bank_transactions ADD CONSTRAINT bank_transactions_category_check
+  CHECK (category IN (
+    'fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'variable_fournisseur',
+    'variable_salaire', 'impot_taxe', 'recette',
+    'investissement', 'flux_financier', 'autre'
+  ));
+
 -- ── 6. Index utiles ─────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_bank_transactions_date ON bank_transactions(date);
 CREATE INDEX IF NOT EXISTS idx_bank_transactions_category ON bank_transactions(category);
@@ -88,4 +112,16 @@ SELECT 'bank_transactions.accounting_class',
           WHERE table_name = 'bank_transactions' AND column_name = 'accounting_class')
 UNION ALL
 SELECT 'mouvements_cca (table)',
-  EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'mouvements_cca');
+  EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'mouvements_cca')
+UNION ALL
+-- La contrainte doit accepter « investissement », sinon la catégorisation
+-- échoue silencieusement à l'import et la dépense retombe en « autre ».
+SELECT 'bank_transactions accepte « investissement »',
+  EXISTS (SELECT 1 FROM pg_constraint
+          WHERE conname = 'bank_transactions_category_check'
+            AND pg_get_constraintdef(oid) LIKE '%investissement%')
+UNION ALL
+SELECT 'bank_transactions accepte « flux_financier »',
+  EXISTS (SELECT 1 FROM pg_constraint
+          WHERE conname = 'bank_transactions_category_check'
+            AND pg_get_constraintdef(oid) LIKE '%flux_financier%');

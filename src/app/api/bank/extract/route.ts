@@ -10,7 +10,7 @@ import {
 
 const CATEGORIES = [
   'fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'variable_fournisseur',
-  'variable_salaire', 'impot_taxe', 'recette', 'autre',
+  'variable_salaire', 'impot_taxe', 'recette', 'investissement', 'autre',
 ] as const;
 
 const CATEGORY_PROMPT = `Tu catégorises des libellés d'opérations bancaires pour un restaurant.
@@ -23,7 +23,8 @@ Catégories autorisées : ${CATEGORIES.join(' | ')}
 Règles :
 - fixe_loyer : loyers, charges locatives
 - fixe_assurance : assurances
-- fixe_abonnement : internet, téléphone, électricité, eau, gaz, logiciels, télésurveillance
+- fixe_abonnement : internet, téléphone, électricité, eau, gaz, logiciels, télésurveillance,
+  honoraires (comptable, avocat), impression et communication
 - variable_fournisseur : achats de marchandises (Metro, Mozzalat, Eurocibus, grossistes,
   supermarchés, boucheries, primeurs)
 - variable_salaire : salaires, acomptes
@@ -74,7 +75,7 @@ async function categorizeLabels(
 function toTransactions(rows: ParsedBankRow[], categories: Record<string, string> | null) {
   const allowed = new Set<string>(CATEGORIES);
   return rows.map(r => {
-    const byRule = categoryFromRules(r.categoryKey);
+    const byRule = categoryFromRules(r.categoryKey, r.amount);
     const byAi = categories?.[r.categoryKey];
     const category = byRule
       ?? (byAi && allowed.has(byAi) ? byAi : null)
@@ -94,7 +95,7 @@ Format attendu :
       "date": "YYYY-MM-DD",
       "description": "Libellé de l'opération",
       "amount": number, // Négatif pour une dépense, positif pour une recette
-      "category": "fixe_loyer|fixe_assurance|fixe_abonnement|variable_fournisseur|variable_salaire|impot_taxe|recette|autre"
+      "category": "fixe_loyer|fixe_assurance|fixe_abonnement|variable_fournisseur|variable_salaire|impot_taxe|recette|investissement|autre"
     }
   ]
 }
@@ -102,7 +103,9 @@ Format attendu :
 Règles de catégorisation :
 - fixe_loyer : loyers, charges locatives
 - fixe_assurance : assurances responsabilité civile, locaux
-- fixe_abonnement : abonnements internet, téléphone, électricité, eau, gaz, logiciels (Qentina, etc)
+- fixe_abonnement : abonnements internet, téléphone, électricité, eau, gaz, logiciels (Qentina, etc),
+  honoraires du comptable, impression et communication
+- investissement : équipement, travaux d'aménagement, réparations, outillage
 - variable_fournisseur : prélèvements ou virements fournisseurs (Metro, Mozzalat, viandes, boissons...)
 - variable_salaire : virements de salaires, acomptes
 - impot_taxe : URSSAF, impôts, TVA
@@ -202,7 +205,11 @@ export async function POST(request: NextRequest) {
       if (rows.length > 0) {
         // Les règles locales couvrent la majorité des libellés sans rien
         // coûter ; on ne soumet à l'IA que ceux qu'elles ne reconnaissent pas.
-        const unknown = distinctCategoryKeys(rows).filter(k => !categoryFromRules(k));
+        // Un libellé n'est « inconnu » que si AUCUNE de ses lignes n'est
+        // reconnue : une règle à montant peut n'en couvrir qu'une partie.
+        const unknown = distinctCategoryKeys(rows).filter(
+          k => !rows.some(r => r.categoryKey === k && categoryFromRules(k, r.amount))
+        );
         const categories = await categorizeLabels(anthropic, unknown);
         csvDegraded = categories === null && unknown.length > 0;
         csvExtracted = { transactions: toTransactions(rows, categories) };

@@ -50,8 +50,18 @@ function fakeSupabase(tables) {
 let echecs = 0;
 const cents = v => Math.round(v * 100);
 
+/**
+ * Compare une valeur à son attendu.
+ *
+ * La comparaison était purement numérique : deux chaînes égales donnaient
+ * `NaN < 0.005` — donc un échec — et deux chaînes différentes aussi. Un test
+ * de chaîne ne pouvait pas passer, et rien ne le disait clairement. Les nombres
+ * gardent leur tolérance au centime ; tout le reste se compare strictement.
+ */
 function verifie(nom, reel, attendu) {
-  const ok = Math.abs(reel - attendu) < 0.005;
+  const ok = (typeof reel === 'number' && typeof attendu === 'number')
+    ? Math.abs(reel - attendu) < 0.005
+    : reel === attendu;
   if (!ok) echecs++;
   console.log(`  ${ok ? '✓' : '✗'} ${nom.padEnd(56)} ${String(reel).padStart(10)}${ok ? '' : `  attendu ${attendu}`}`);
 }
@@ -367,7 +377,8 @@ verifie('facture à 0 € jamais appariée',
 // de ce relevé.
 console.log('\n11. Catégorisation — le libellé décide du poste');
 
-const attendu = (label, cat) => verifie(label.slice(0, 52), categoryFromRules(label) === cat, true);
+const attendu = (label, cat, montant) =>
+  verifie(label.slice(0, 52), categoryFromRules(label, montant) === cat, true);
 
 // Achats revendus : ils appartiennent au coût matières.
 attendu('PRLV SEPA VALLEE DE SEINE BOISS', 'variable_fournisseur');
@@ -382,21 +393,61 @@ attendu('CB42METRO FRANCE 04/06/26', 'variable_fournisseur');
 // Le libellé d'un administrateur de biens ne contient jamais « loyer ».
 attendu('VIR INST OBJECTIF PIERRE GESTI', 'fixe_loyer');
 
+// « VIREMENT PERMANENT » est le loyer chez ce restaurant, mais le libellé seul
+// ne le dit pas : la règle exige le montant. Un futur virement permanent
+// (emprunt, épargne) resterait ainsi non classé — visible — au lieu d'être
+// silencieusement compté en loyer.
+attendu('VIREMENT PERMANENT', 'fixe_loyer', -1332.65);
+verifie('virement permanent d\'un autre montant : non classé',
+  categoryFromRules('VIREMENT PERMANENT', -450) === null, true);
+verifie('… ni classé sans montant connu',
+  categoryFromRules('VIREMENT PERMANENT') === null, true);
+verifie('tolérance de 1 € sur le loyer (centimes de révision)',
+  categoryFromRules('VIREMENT PERMANENT', -1333.10), 'fixe_loyer');
+
 // Droits musicaux et logiciels : charges fixes, pas des achats.
 attendu('PRLV SEPA SACEM-SOC AUTEUR COMP', 'fixe_abonnement');
 attendu('PRLV SEPA SPRE', 'fixe_abonnement');
 attendu('IA CLAUDE JUILLET', 'fixe_abonnement');
 attendu('APPLE.COM/BI', 'fixe_abonnement');
 
+// Fournisseurs identifiés par l'exploitant, libellés tronqués par la banque.
+attendu('LAGUETTE PRI', 'variable_fournisseur');
+attendu('VAL DE', 'variable_fournisseur');
+
+// Honoraires : charge de structure récurrente, pas un achat revendu.
+attendu('PRLV SEPA SAS PARTEXIA', 'fixe_abonnement');
+attendu('VIR INST JUKACREA', 'fixe_abonnement');
+attendu('PAPETERIE DE', 'fixe_abonnement');
+
+// Équipement et travaux : hors coût matières ET hors charges fixes. Un four
+// acheté 1 400 € une fois ne fait pas partie du coût de structure mensuel.
+attendu('VIR INST GUILLAUME TRIPOLI', 'investissement');
+attendu('LOCATION CAMION TRAVAUX', 'investissement');
+attendu('VIR INST SEBASTIEN ANTONY DE F', 'investissement');
+attendu('ELECTRO DEPO', 'investissement');
+attendu('BRICOMARCHE', 'investissement');
+attendu('LEROY MERLIN', 'investissement');
+attendu('WEST PHONE', 'investissement');
+verifie('un équipement ne fabrique aucune TVA supposée',
+  estimatedVatRate('investissement'), 0);
+
+// « SEBASTIEN ANTONY DE F » est tronqué : le motif des flux financiers
+// (« de faria ») ne doit pas l'attraper, sinon les travaux disparaissent
+// du résultat au lieu d'y figurer.
+verifie('travaux non pris pour un flux financier',
+  isFinancialFlow('VIR INST SEBASTIEN ANTONY DE F'), false);
+
 // Une règle trop large est pire qu'une règle absente : ces libellés doivent
-// rester non reconnus plutôt que d'être rangés au hasard.
+// rester non reconnus plutôt que d'être rangés au hasard. « SO LOUNGE » est un
+// prélèvement erroné à se faire rembourser, « B&M » une enseigne dont on ignore
+// ce qui y a été acheté : dans les deux cas, seul l'exploitant peut trancher.
 const inconnus = [
-  'VIR INST GUILLAUME TRIPOLI', 'LOCATION CAMION TRAVAUX', 'ELECTRO DEPO',
-  'BRICOMARCHE', 'LEROY MERLIN', 'PRLV SEPA SAS PARTEXIA', 'SIEGE 27',
-  'RESULTAT ARRETE COMPTE 30062026', 'WEST PHONE', 'PAPETERIE DE',
+  'SIEGE 27', 'RESULTAT ARRETE COMPTE 30062026', 'SO LOUNGE', 'B&M',
+  'EVREUX', 'SAS DUBREUIL', 'DEMEURE', 'PHARMACIE LA', 'ESSO31769ROC',
 ];
 verifie('libellés inconnus laissés non classés',
-  inconnus.filter(l => categoryFromRules(l) === null).length, inconnus.length);
+  inconnus.filter(l => categoryFromRules(l, -100) === null).length, inconnus.length);
 
 // Les flux financiers restent reconnus comme tels, quoi qu'en dise la règle.
 verifie('mouvements de compte courant hors exploitation',

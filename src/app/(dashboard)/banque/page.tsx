@@ -10,12 +10,14 @@ import { Upload, Landmark, AlertCircle, CheckCircle, Filter, Camera, Scissors, P
 const CATEGORIES: Record<string, string> = {
   fixe_loyer: 'Loyer & Charges',
   fixe_assurance: 'Assurances',
-  fixe_abonnement: 'Abonnements',
+  fixe_abonnement: 'Abonnements & honoraires',
   variable_fournisseur: 'Fournisseurs',
   variable_salaire: 'Salaires',
   impot_taxe: 'Impôts & Taxes',
   recette: 'Recette Ventes',
-  autre: 'Autre'
+  investissement: 'Équipement & travaux',
+  flux_financier: 'Hors exploitation',
+  autre: 'Non classé'
 };
 
 const ACCOUNTING_CLASSES = [
