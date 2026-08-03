@@ -5,6 +5,7 @@ import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate } from '@/lib/utils';
 import { KpiCard } from '@/components/ui';
 import { suggestInvoicesForTransaction, sumDebits } from '@/lib/reconciliation';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { Upload, Landmark, AlertCircle, CheckCircle, Filter, Camera, Scissors, Plus, Trash2 } from 'lucide-react';
 
 const CATEGORIES: Record<string, string> = {
@@ -72,15 +73,19 @@ export default function BanquePage() {
     setLoading(true);
 
     // Requêtes indépendantes lancées en parallèle
-    const [invRes, txRes, settingsRes, movementsRes] = await Promise.all([
-      supabase
+    // Les deux premières lectures sont paginées : Supabase tronque à 1 000
+    // lignes sans le signaler, et un historique bancaire les dépasse vite.
+    const [invoiceRows, txList, settingsRes, movementsRes] = await Promise.all([
+      fetchAllRows<any>((f0, f1) => supabase
         .from('invoices')
         .select('*, supplier:suppliers(*)')
-        .order('date', { ascending: false }),
-      supabase
+        .order('date', { ascending: false })
+        .range(f0, f1)),
+      fetchAllRows<any>((f0, f1) => supabase
         .from('bank_transactions')
         .select('*, invoice:invoices(accounting_ref, invoice_number), mouvements_cca(associe)')
-        .order('date', { ascending: false }),
+        .order('date', { ascending: false })
+        .range(f0, f1)),
       supabase
         .from('app_settings')
         .select('value')
@@ -91,9 +96,8 @@ export default function BanquePage() {
         .select('associe, sens, montant, date'),
     ]);
 
-    setInvoices(invRes.data || []);
+    setInvoices(invoiceRows);
 
-    const txList = txRes.data || [];
 
     // Surcouche : classifications enregistrées dans app_settings
     try {

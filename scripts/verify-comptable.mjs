@@ -26,11 +26,24 @@ import { detectInterventions, collectInterventionFacts } from '../src/lib/interv
 import { categoryFromRules } from '../src/lib/bank-csv.ts';
 import { suggestInvoicesForTransaction, sumDebits } from '../src/lib/reconciliation.ts';
 
-// ── Faux client Supabase, qui applique réellement les filtres utilisés ──────
+/**
+ * Faux client Supabase, qui applique réellement les filtres utilisés.
+ *
+ * **Il plafonne à 1 000 lignes, comme le vrai.** C'est délibéré : Supabase
+ * tronque toute réponse à 1 000 lignes sans le signaler — `error` reste nul et
+ * le tableau est parfaitement valide, simplement incomplet. Un faux client sans
+ * ce plafond rend le défaut invisible aux tests, et c'est exactement ce qui
+ * s'est produit : sur un exercice de 1 788 commandes, le chiffre d'affaires
+ * affiché était amputé de 44 % et aucun contrôle ne s'en apercevait.
+ */
+const MAX_ROWS = 1000;
+
 function fakeSupabase(tables) {
   return {
     from(table) {
       let rows = (tables[table] || []).slice();
+      let start = 0;
+      let end = MAX_ROWS - 1;
       const q = {
         select: () => q,
         order: () => q,
@@ -40,7 +53,16 @@ function fakeSupabase(tables) {
         lte(col, v) { rows = rows.filter(r => String(r[col]) <= v); return q; },
         in(col, vs) { rows = rows.filter(r => vs.includes(r[col])); return q; },
         limit(n) { rows = rows.slice(0, n); return q; },
-        then(res) { return Promise.resolve({ data: rows, error: null }).then(res); },
+        range(from, to) {
+          start = from;
+          // Le serveur ne rend jamais plus de MAX_ROWS, même si on en demande
+          // davantage : demander 0-4999 renvoie 1 000 lignes, pas 5 000.
+          end = Math.min(to, from + MAX_ROWS - 1);
+          return q;
+        },
+        then(res) {
+          return Promise.resolve({ data: rows.slice(start, end + 1), error: null }).then(res);
+        },
       };
       return q;
     },
@@ -523,6 +545,57 @@ verifie('total des dépenses (était 250,91 par compensation)',
 verifie('un encaissement seul ne compte pas', sumDebits([{ amount: 900 }]), 0);
 verifie('liste vide', sumDebits([]), 0);
 verifie('montant absent traité comme zéro', sumDebits([{ amount: null }, { amount: -10 }]), 10);
+
+// ═══ 15. Le plafond des 1 000 lignes ═════════════════════════════════════
+// Supabase tronque toute réponse à 1 000 lignes SANS le signaler : `error`
+// reste nul et le tableau est valide, simplement incomplet. Sur un exercice
+// réel de 1 788 commandes, le chiffre d'affaires affiché était amputé de 44 %,
+// et comme le CA est le dénominateur de tous les ratios, le food cost et la
+// masse salariale étaient gonflés d'autant.
+//
+// Le symptôme reconnaissable est un compte EXACTEMENT rond. Ces contrôles
+// travaillent donc volontairement au-dessus du plafond.
+console.log('\n15. Pagination — au-delà de 1 000 lignes');
+
+// 1 788 commandes à 11 € TTC dont 1 € de TVA : 19 668 € TTC, 1 788 € de TVA.
+const EXERCICE = Array.from({ length: 1788 }, (_, i) => ({
+  id: `o${i}`,
+  net_amount: 11,
+  service: `2026-${String((i % 12) + 1).padStart(2, '0')}-15`,
+  raw_data: {
+    total_tax_money: { amount: 100 },
+    line_items: [{
+      total_money: { amount: 1100 }, total_tax_money: { amount: 100 },
+      taxes: [{ percentage: '10.0', applied_money: { amount: 100 } }],
+    }],
+  },
+}));
+
+r = await tva({ square_orders: EXERCICE });
+verifie('TVA collectée sur 1 788 commandes (était 1 000)', r.collectedTva, 1788);
+verifie('tout est ventilé à 10 %', r.collectedTvaBreakdown['10%'], 1788);
+verifie('rien de non ventilé', r.collectedTvaBreakdown.nonVentile, 0);
+
+// 2 500 dépenses : deux pages pleines plus une partielle.
+const DEPENSES = Array.from({ length: 2500 }, (_, i) => ({
+  id: `t${i}`, date: '2026-06-15', description: 'CB42METRO FRANCE',
+  amount: -11, category: 'variable_fournisseur', invoice_id: null,
+}));
+r = await tva({ bank_transactions: DEPENSES });
+verifie('2 500 dépenses lues (était 1 000)', r.unInvoicedCount, 2500);
+verifie('récupérable si facturé, sur le total', r.recoverableIfInvoiced, 2500);
+
+// Le collecteur d'interventions lit les mêmes tables.
+const gros = await collectInterventionFacts(fakeSupabase({ square_orders: EXERCICE }), {
+  start: '2026-01-01', end: '2026-12-31', today: '2027-01-05',
+});
+verifie('interventions : CA TTC complet', gros.caSquareTtc, 19668);
+verifie('interventions : nombre de commandes', gros.ordersCount, 1788);
+
+// Le compte exactement rond est la signature du défaut : s'il réapparaît,
+// c'est qu'une requête a perdu sa pagination.
+verifie('aucun compte ne tombe sur 1 000 pile',
+  [r.unInvoicedCount, gros.ordersCount].includes(1000), false);
 
 console.log(`\n${echecs === 0 ? '✓ Tous les contrôles comptables passent.' : `✗ ${echecs} contrôle(s) en échec.`}\n`);
 process.exit(echecs === 0 ? 0 : 1);

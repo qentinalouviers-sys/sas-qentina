@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { fetchAllRows, fetchAllRowsIn } from '@/lib/supabase/fetch-all';
 import { formatCurrency, formatDate, downloadCSV, toISODate, getParisHour } from '@/lib/utils';
 import { 
   ShoppingCart, 
@@ -119,20 +120,22 @@ export default function VentesPage() {
       computePeriods(period, anchorDate);
 
     // Fetch orders covering both full periods (for complete charts)
-    const { data: rawOrders, error } = await supabase
-      .from('square_orders')
-      .select('*')
-      .gte('service', prevStartISO)
-      .lte('service', currentPeriodEndISO)
-      .order('created_at', { ascending: false });
-
-    if (error) {
+    // Paginé : Supabase tronque à 1 000 lignes sans le signaler, ce qui
+    // amputait le chiffre d'affaires des périodes longues.
+    let allOrders: any[];
+    try {
+      allOrders = await fetchAllRows<any>((f0, f1) => supabase
+        .from('square_orders')
+        .select('*')
+        .gte('service', prevStartISO)
+        .lte('service', currentPeriodEndISO)
+        .order('created_at', { ascending: false })
+        .range(f0, f1));
+    } catch (error) {
       console.error('Error fetching orders:', error);
       setLoading(false);
       return;
     }
-
-    const allOrders = rawOrders || [];
     
     // orders for current period (up to currentPeriodEndISO to show the whole month in charts)
     const activeOrders = allOrders.filter(
@@ -149,12 +152,13 @@ export default function VentesPage() {
     // Calculate Top Products for active period
     if (activeOrders.length > 0) {
       const orderIds = activeOrders.map((o: any) => o.id);
-      const { data: itemsData } = await supabase
+      const itemsData = await fetchAllRowsIn<any, string>(orderIds, (ids, f0, f1) => supabase
         .from('square_items')
         .select('*')
-        .in('order_id', orderIds);
-        
-      if (itemsData) {
+        .in('order_id', ids)
+        .range(f0, f1));
+
+      if (itemsData.length > 0) {
         const itemMap: Record<string, { name: string; qty: number; ca: number }> = {};
         itemsData.forEach((item: any) => {
           if (!itemMap[item.name]) {

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { requireUser } from '@/lib/supabase/api-auth';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { squareFetch } from '@/lib/square';
 
 /**
@@ -128,13 +129,16 @@ export async function GET(request: NextRequest) {
 
     // ── 4. Ce que la base contient réellement ───────────────────────────────
     const supabase = createServiceRoleClient();
-    const { data: stored, error: storedError } = await supabase
-      .from('square_orders')
-      .select('net_amount')
-      .gte('service', startDate);
-    if (storedError) throw storedError;
-
-    const storedRows = stored || [];
+    // Paginé : c'est cette requête qui, plafonnée à 1 000 lignes, a fait
+    // annoncer « il manque 18 793 € » alors que les commandes étaient bien en
+    // base. Un diagnostic qui se trompe est pire que pas de diagnostic.
+    const storedRows = await fetchAllRows<{ net_amount: number | null }>(
+      (from, to) => supabase
+        .from('square_orders')
+        .select('net_amount')
+        .gte('service', startDate)
+        .range(from, to),
+    );
     const storedTtc = Math.round(
       storedRows.reduce((s, o) => s + (o.net_amount || 0), 0) * 100,
     ) / 100;

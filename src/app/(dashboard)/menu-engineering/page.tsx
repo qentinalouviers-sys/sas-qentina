@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { fetchAllRows, fetchAllRowsIn } from '@/lib/supabase/fetch-all';
 import { formatCurrency, formatPercent, RECIPE_CATEGORY_LABELS, FOOD_COST_TARGET } from '@/lib/utils';
 import {
   Star, TrendingDown, AlertTriangle, Flame, X, Info, Search,
@@ -162,27 +163,38 @@ export default function MenuEngineeringPage() {
     }
 
     // Load square items (sales data)
-    let query = supabase.from('square_items').select('name, quantity, total_price, order_id');
+    // Paginé : sur une année, les articles vendus se comptent en milliers et
+    // Supabase tronque à 1 000 lignes sans le signaler — le classement des
+    // plats les plus vendus s'en trouvait faussé.
+    let items: any[];
     if (dateFrom) {
       // Join with orders filtered by date
-      const { data: orders } = await supabase
+      const orders = await fetchAllRows<any>((f0, f1) => supabase
         .from('square_orders')
         .select('id')
-        .gte('service', dateFrom);
-      if (orders && orders.length > 0) {
-        const orderIds = orders.map((o: any) => o.id);
-        query = query.in('order_id', orderIds);
-      } else {
+        .gte('service', dateFrom)
+        .range(f0, f1));
+      if (orders.length === 0) {
         // No orders in period
         setSalesMap({});
         setLoading(false);
         return;
       }
+      const orderIds = orders.map((o: any) => o.id);
+      items = await fetchAllRowsIn<any, string>(orderIds, (ids, f0, f1) => supabase
+        .from('square_items')
+        .select('name, quantity, total_price, order_id')
+        .in('order_id', ids)
+        .range(f0, f1));
+    } else {
+      items = await fetchAllRows<any>((f0, f1) => supabase
+        .from('square_items')
+        .select('name, quantity, total_price, order_id')
+        .range(f0, f1));
     }
 
-    const { data: items } = await query;
     const map: Record<string, { qty: number; revenue: number }> = {};
-    if (items) {
+    {
       items.forEach((item: any) => {
         const name = (item.name || '').trim().toLowerCase();
         if (!map[name]) map[name] = { qty: 0, revenue: 0 };

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { formatCurrency, CATEGORY_LABELS } from '@/lib/utils';
 import {
   ShoppingCart, Search, Plus, Trash2, Check, X, ChevronDown,
@@ -106,17 +107,20 @@ export default function ListeCoursesPage() {
     setLoading(true);
 
     // Aggregate invoice lines into a product catalog
-    const [{ data: sup }, { data: lines }] = await Promise.all([
+    const [{ data: sup }, lines] = await Promise.all([
       supabase.from('suppliers').select('*').order('name'),
-      supabase
+      // `.limit(2000)` ne servait à rien : le serveur plafonne à 1 000 lignes
+      // et rendait donc 1 000 sans le dire. On pagine pour obtenir les 2 000
+      // demandées, en deux allers-retours.
+      fetchAllRows<any>((f0, f1) => supabase
         .from('invoice_lines')
         .select('designation, unit, unit_price_ht, category, created_at, invoice:invoices(supplier_id, supplier:suppliers(id, name), date)')
         .order('created_at', { ascending: false })
-        .limit(2000),
+        .range(f0, Math.min(f1, 1999))),
     ]);
     setSuppliers(sup || []);
 
-    if (lines) {
+    {
       // Build catalog: deduplicate by designation (normalized), keep latest price + count occurrences
       const map: Record<string, CatalogProduct> = {};
       lines.forEach((l: any) => {

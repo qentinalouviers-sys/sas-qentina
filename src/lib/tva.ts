@@ -29,6 +29,7 @@
  */
 
 import { SupabaseClient } from '@supabase/supabase-js';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { isFinancialFlow, estimatedVatRate, invoiceVat, round2 } from './accounting';
 
 export interface TvaBreakdown {
@@ -122,21 +123,27 @@ export async function computeTva(
   startStr: string,
   endStr: string,
 ): Promise<TvaResult> {
-  const [settingsRes, ordersRes, invoicesRes, bankTxRes] = await Promise.all([
+  // Toutes ces lectures sont paginées : Supabase plafonne une réponse à
+  // 1 000 lignes SANS le signaler. Sur un exercice complet, la TVA collectée
+  // était calculée sur les 1 000 premières commandes seulement.
+  const [settingsRes, orders, invoices, bankTx] = await Promise.all([
     supabase.from('app_settings').select('value').eq('key', 'masked_tva_suppliers'),
-    supabase.from('square_orders')
+    fetchAllRows<any>((from, to) => supabase.from('square_orders')
       .select('id, net_amount, raw_data')
       .gte('service', startStr)
-      .lte('service', endStr),
-    supabase.from('invoices')
+      .lte('service', endStr)
+      .range(from, to)),
+    fetchAllRows<any>((from, to) => supabase.from('invoices')
       .select('id, total_ht, total_ttc, tva_recoverable, supplier:suppliers(name)')
       .gte('date', startStr)
-      .lte('date', endStr),
-    supabase.from('bank_transactions')
+      .lte('date', endStr)
+      .range(from, to)),
+    fetchAllRows<any>((from, to) => supabase.from('bank_transactions')
       .select('id, date, description, amount, category, invoice_id')
       .lt('amount', 0) // seules les dépenses peuvent porter de la TVA déductible
       .gte('date', startStr)
-      .lte('date', endStr),
+      .lte('date', endStr)
+      .range(from, to)),
   ]);
 
   const maskedSuppliers: string[] =
@@ -150,7 +157,7 @@ export async function computeTva(
   };
   let estimatedOrdersCount = 0;
 
-  for (const order of (ordersRes.data || []) as any[]) {
+  for (const order of orders) {
     const orderTaxCents: number | undefined = order.raw_data?.total_tax_money?.amount;
 
     if (orderTaxCents === undefined) {
@@ -232,8 +239,8 @@ export async function computeTva(
   const collectedCents = cents['5.5%'] + cents['10%'] + cents['20%'] + cents.nonVentile;
 
   // ── 2. TVA déductible — factures uniquement ──────────────────────────────
-  const invoicesList = (invoicesRes.data || []) as any[];
-  const bankTxList = (bankTxRes.data || []) as any[];
+  const invoicesList = invoices;
+  const bankTxList = bankTx;
 
   let deductibleCents = 0;
   let invoiceCount = 0;
