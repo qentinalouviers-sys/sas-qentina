@@ -92,6 +92,12 @@ export interface InterventionFacts {
 
   /** Coût matières en % du CA HT, tel que le P&L le calcule. */
   foodCostPercent: number | null;
+  /**
+   * Part du coût matières provenant de virements fournisseurs SANS facture,
+   * en pourcentage. Au-delà d'un certain seuil, le food cost n'est plus une
+   * mesure mais un majorant : le contenu de ces virements est inconnu.
+   */
+  foodCostBankSharePercent: number | null;
 
   /** Factures dont la date est un 1er janvier — date de repli type de l'OCR. */
   suspectDateInvoices: { count: number; sample: string[] };
@@ -345,7 +351,33 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     });
   }
 
-  // ── 7. Food cost hors de tout intervalle plausible ───────────────────────
+  // ── 7. Le food cost n'est pas mesuré, il est majoré ──────────────────────
+  // Une facture scannée est ventilée ligne à ligne : le matériel en sort. Un
+  // virement fournisseur sans facture entre en entier — produits d'entretien
+  // et petit matériel comptés comme de la nourriture. Placée AVANT l'alerte
+  // « food cost hors norme », dont elle est souvent la cause.
+  if (f.foodCostBankSharePercent !== null && f.foodCostBankSharePercent >= 40 && f.caSquareHt > 0) {
+    out.push({
+      id: 'food-cost-non-mesure',
+      severity: 'important',
+      title: `Food cost fiable à ${(100 - f.foodCostBankSharePercent).toFixed(0)} % seulement`,
+      impact:
+        `${pct(f.foodCostBankSharePercent)} du coût matières vient de virements ` +
+        `fournisseurs sans facture rattachée. Leur contenu est inconnu : les ` +
+        `produits d'entretien, le film alimentaire et le petit matériel achetés ` +
+        `chez Metro y sont comptés comme de la nourriture. Le food cost affiché ` +
+        `est donc un MAXIMUM, pas une mesure — et il ne peut pas être comparé ` +
+        `aux 28-32 % du métier tant que cette part reste élevée.`,
+      action:
+        'Scanne les factures de tes gros fournisseurs (Metro, Eurocibus, Mozzalat). ' +
+        'Chaque facture scannée est ventilée ligne à ligne et sort le matériel du calcul.',
+      href: '/scanner',
+      hrefLabel: 'Scanner → importer les factures',
+      amount: f.foodCostBankSharePercent,
+    });
+  }
+
+  // ── 8. Food cost hors de tout intervalle plausible ───────────────────────
   // Ne se déclenche qu'une fois qu'il y a du CA ET des achats : sinon c'est
   // une conséquence des alertes précédentes, pas un problème en soi.
   if (f.foodCostPercent !== null && f.caSquareHt > 0) {
@@ -385,7 +417,7 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     }
   }
 
-  // ── 8. Compte courant d'associé débiteur ─────────────────────────────────
+  // ── 9. Compte courant d'associé débiteur ─────────────────────────────────
   // Un solde négatif signifie que la société a avancé de l'argent à l'associé.
   // Pour un gérant de SAS, l'article L.225-43 du code de commerce l'interdit,
   // et le risque est qualifié d'abus de biens sociaux.
@@ -409,7 +441,7 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     }
   }
 
-  // ── 9. Factures à date de repli (01/01) ──────────────────────────────────
+  // ── 10. Factures à date de repli (01/01) ──────────────────────────────────
   if (f.suspectDateInvoices.count > 0) {
     out.push({
       id: 'factures-date-suspecte',
@@ -425,7 +457,7 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     });
   }
 
-  // ── 10. Fournisseurs dupliqués par un encodage cassé ─────────────────────
+  // ── 11. Fournisseurs dupliqués par un encodage cassé ─────────────────────
   if (f.mojibakeSuppliers.length > 0) {
     out.push({
       id: 'fournisseurs-mojibake',
@@ -442,7 +474,7 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     });
   }
 
-  // ── 11. Trajets non portés au compte courant ─────────────────────────────
+  // ── 12. Trajets non portés au compte courant ─────────────────────────────
   if (f.tripsNotInCca.count > 0) {
     out.push({
       id: 'trajets-hors-cca',
@@ -483,7 +515,12 @@ function isSquarePayout(description: string): boolean {
 /** Rassemble les faits depuis la base. Aucune décision ici. */
 export async function collectInterventionFacts(
   supabase: SupabaseClient,
-  opts: { start: string; end: string; today: string; foodCostPercent?: number | null },
+  opts: {
+    start: string; end: string; today: string;
+    foodCostPercent?: number | null;
+    /** Part du coût matières issue de virements sans facture, en %. */
+    foodCostBankSharePercent?: number | null;
+  },
 ): Promise<InterventionFacts> {
   const { start, end, today } = opts;
 
@@ -595,6 +632,7 @@ export async function collectInterventionFacts(
     uncategorizedDebits: { count: uncatCount, amount: round2(uncatAmount) },
     tva,
     foodCostPercent: opts.foodCostPercent ?? null,
+    foodCostBankSharePercent: opts.foodCostBankSharePercent ?? null,
     suspectDateInvoices: {
       count: suspect.length,
       sample: suspect.slice(0, 5).map(i => String(i.date)),
