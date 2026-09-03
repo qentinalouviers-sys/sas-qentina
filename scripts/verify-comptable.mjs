@@ -25,6 +25,7 @@ import {
 import { detectInterventions, collectInterventionFacts } from '../src/lib/interventions.ts';
 import { categoryFromRules } from '../src/lib/bank-csv.ts';
 import { suggestInvoicesForTransaction, sumDebits } from '../src/lib/reconciliation.ts';
+import { checkInvoice, assertInvoiceAccepted } from '../src/lib/invoice-checks.ts';
 
 /**
  * Faux client Supabase, qui applique réellement les filtres utilisés.
@@ -717,6 +718,64 @@ verifie('interventions : nombre de commandes', gros.ordersCount, 1788);
 // c'est qu'une requête a perdu sa pagination.
 verifie('aucun compte ne tombe sur 1 000 pile',
   [r.unInvoicedCount, gros.ordersCount].includes(1000), false);
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Verrous à l'enregistrement d'une facture
+//
+//  Chaque cas correspond à une facture qui est réellement entrée en base
+//  fausse : date inventée au 1er janvier, HT recopié dans le TTC, lignes
+//  amputées par une réponse tronquée. Le contrôle doit refuser ce qu'il faut
+//  ET se taire sur une facture normale — une alerte à tort finit ignorée.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Verrous facture ──');
+
+const AUJOURDHUI = '2026-09-03';
+const FACTURE_SAINE = {
+  fournisseur: 'Métro', date: '2026-08-28', numero_facture: 'F-2026-4471',
+  total_ht: 100, total_ttc: 110, tva: 10, type_document: 'facture',
+  lignes: [
+    { designation: 'Farine', quantite: 25, unite: 'kg', prix_unitaire_ht: 2, prix_total_ht: 50, categorie: 'alimentaire' },
+    { designation: 'Mozzarella', quantite: 5, unite: 'kg', prix_unitaire_ht: 10, prix_total_ht: 50, categorie: 'alimentaire' },
+  ],
+};
+const codes = (inv) => checkInvoice({ ...FACTURE_SAINE, ...inv }, AUJOURDHUI).map(a => a.code);
+const niveau = (inv, code) => checkInvoice({ ...FACTURE_SAINE, ...inv }, AUJOURDHUI).find(a => a.code === code)?.level;
+
+verifie('facture saine : aucune anomalie', codes({}).length, 0);
+verifie('ticket sans numéro : rien à signaler', codes({ numero_facture: null, type_document: 'ticket_caisse' }).length, 0);
+
+verifie('date absente → bloquant', niveau({ date: null }, 'date-manquante'), 'bloquant');
+verifie('date illisible → bloquant', niveau({ date: '2026-13-45' }, 'date-manquante'), 'bloquant');
+verifie('date future → bloquant', niveau({ date: '2026-11-02' }, 'date-future'), 'bloquant');
+verifie('demain accepté (fuseau)', codes({ date: '2026-09-04' }).includes('date-future'), false);
+verifie('HT > TTC → bloquant', niveau({ total_ht: 110, total_ttc: 100, tva: 10 }, 'ht-superieur-ttc'), 'bloquant');
+verifie('montants nuls → bloquant', niveau({ total_ht: 0, total_ttc: 0 }, 'montant-nul'), 'bloquant');
+verifie('fournisseur vide → bloquant', niveau({ fournisseur: '' }, 'fournisseur-manquant'), 'bloquant');
+
+verifie('1er janvier → à confirmer', niveau({ date: '2026-01-01' }, 'date-premier-janvier'), 'a_confirmer');
+verifie('facture de 2 ans → à confirmer', niveau({ date: '2024-06-01' }, 'date-ancienne'), 'a_confirmer');
+verifie('17 mois : acceptée sans bruit', codes({ date: '2025-04-15' }).includes('date-ancienne'), false);
+verifie('facture sans numéro → à confirmer', niveau({ numero_facture: null }, 'numero-manquant'), 'a_confirmer');
+verifie('HT + TVA ≠ TTC → à confirmer', niveau({ tva: 20 }, 'tva-incoherente'), 'a_confirmer');
+verifie('arrondi de 3 centimes toléré', codes({ total_ttc: 110.03 }).includes('tva-incoherente'), false);
+verifie('HT = TTC sur une facture → à confirmer', niveau({ total_ht: 110, tva: 0 }, 'sans-tva'), 'a_confirmer');
+verifie('HT = TTC sur un ticket : normal', codes({ total_ht: 110, tva: 0, type_document: 'ticket_caisse' }).includes('sans-tva'), false);
+verifie('lignes qui ne somment pas → à confirmer',
+  niveau({ lignes: [FACTURE_SAINE.lignes[0]] }, 'lignes-incoherentes'), 'a_confirmer');
+verifie('écart de 1 % sur les lignes toléré', codes({ total_ht: 100.9, total_ttc: 110.9 }).includes('lignes-incoherentes'), false);
+verifie('6 000 € TTC → à confirmer', niveau({ total_ht: 5000, total_ttc: 6000, tva: 1000 }, 'montant-inhabituel'), 'a_confirmer');
+
+// Le serveur ne fait pas confiance à l'écran : un point non acquitté refuse.
+const tente = (inv, confirmations) => {
+  try { assertInvoiceAccepted({ ...FACTURE_SAINE, ...inv }, AUJOURDHUI, confirmations); return 'acceptée'; }
+  catch (e) { return e.name === 'InvoiceValidationError' ? 'refusée' : 'erreur'; }
+};
+verifie('saine, sans acquittement : acceptée', tente({}, []), 'acceptée');
+verifie('sans numéro, non acquittée : refusée', tente({ numero_facture: null }, []), 'refusée');
+verifie('sans numéro, acquittée : acceptée', tente({ numero_facture: null }, ['numero-manquant']), 'acceptée');
+verifie('bloquant acquitté quand même : refusée', tente({ date: null }, ['date-manquante']), 'refusée');
+verifie('acquittement d\'un autre code : refusée', tente({ numero_facture: null }, ['sans-tva']), 'refusée');
 
 console.log(`\n${echecs === 0 ? '✓ Tous les contrôles comptables passent.' : `✗ ${echecs} contrôle(s) en échec.`}\n`);
 process.exit(echecs === 0 ? 0 : 1);

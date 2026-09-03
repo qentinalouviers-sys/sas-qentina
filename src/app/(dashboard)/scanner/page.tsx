@@ -11,6 +11,7 @@ import {
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate } from '@/lib/utils';
 import ClaudeStatusIndicator from '@/components/ClaudeStatusIndicator';
+import type { InvoiceAnomaly } from '@/lib/invoice-checks';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -44,6 +45,8 @@ interface ScanResult {
   duplicate_invoice: any | null;
   bank_candidates: BankCandidate[];
   match_confidence: 'high' | 'medium' | 'low' | 'none';
+  /** Points à vérifier avant d'enregistrer (voir lib/invoice-checks.ts). */
+  anomalies?: InvoiceAnomaly[];
 }
 
 type QueueStatus =
@@ -147,7 +150,10 @@ interface CardProps {
   item: QueueItem;
   isActive: boolean;
   onRemove: () => void;
-  onConfirm: (id: string, bankId: string | null, pm: 'bank'|'cash'|'card_perso', associe?: 'justine' | 'yohan') => Promise<void>;
+  onConfirm: (
+    id: string, bankId: string | null, pm: 'bank'|'cash'|'card_perso',
+    associe: 'justine' | 'yohan' | undefined, confirmations: string[],
+  ) => Promise<void>;
   onToggleCandidates: () => void;
   onToggleManual: () => Promise<void>;
   bankTxList: any[];
@@ -158,6 +164,15 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
   const [confirming, setConfirming] = useState(false);
   const [showCcaSelector, setShowCcaSelector] = useState(false);
   const [showCashSelector, setShowCashSelector] = useState(false);
+  // Points inhabituels que l'utilisateur a cochés « j'ai vérifié ». Tant que
+  // tous ne le sont pas, les boutons d'enregistrement n'apparaissent pas :
+  // le contrôle humain est exigé, pas suggéré.
+  const [acked, setAcked] = useState<Set<string>>(() => new Set());
+
+  const anomalies  = item.result?.anomalies ?? [];
+  const blocking   = anomalies.filter(a => a.level === 'bloquant');
+  const toConfirm  = anomalies.filter(a => a.level === 'a_confirmer');
+  const canAct     = blocking.length === 0 && toConfirm.every(a => acked.has(a.code));
 
   const isTerminal = TERMINAL.includes(item.status);
   const canRemove  = (item.status === 'pending' || isTerminal) && !item.actionTaken;
@@ -172,7 +187,7 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
 
   const doConfirm = async (bankId: string | null, pm: 'bank'|'cash'|'card_perso', associe?: 'justine' | 'yohan') => {
     setConfirming(true);
-    await onConfirm(item.id, bankId, pm, associe);
+    await onConfirm(item.id, bankId, pm, associe, Array.from(acked));
     setConfirming(false);
   };
 
@@ -390,6 +405,21 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
                 )}
               </div>
 
+              {/* ── Points à vérifier avant d'enregistrer ── */}
+              {anomalies.length > 0 && (
+                <AnomalyPanel
+                  anomalies={anomalies}
+                  acked={acked}
+                  onToggle={code => setAcked(prev => {
+                    const next = new Set(prev);
+                    if (next.has(code)) next.delete(code); else next.add(code);
+                    return next;
+                  })}
+                  onRemove={onRemove}
+                />
+              )}
+
+              {canAct && (<>
               {/* ── HIGH confidence match ── */}
               {item.result.match_confidence === 'high' && item.result.bank_candidates.length > 0 && (
                 <div style={{
@@ -662,6 +692,7 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
                   </div>
                 </div>
               )}
+              </>)}
             </div>
           )}
         </div>
@@ -671,6 +702,79 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
 }
 
 // ─── Small shared sub-components ─────────────────────────────────────────────
+
+/**
+ * Ce que l'humain doit regarder avant d'enregistrer.
+ *
+ * Les bloquants n'ont pas de case : la facture ne peut pas entrer en l'état,
+ * il faut la rescanner ou la saisir autrement. Les points à confirmer exigent
+ * une coche chacun — pas de « tout accepter », c'est précisément le geste
+ * qu'on veut empêcher.
+ */
+function AnomalyPanel({ anomalies, acked, onToggle, onRemove }: {
+  anomalies: InvoiceAnomaly[];
+  acked: Set<string>;
+  onToggle: (code: string) => void;
+  onRemove: () => void;
+}) {
+  const blocking  = anomalies.filter(a => a.level === 'bloquant');
+  const toConfirm = anomalies.filter(a => a.level === 'a_confirmer');
+  const remaining = toConfirm.filter(a => !acked.has(a.code)).length;
+
+  return (
+    <div style={{
+      border: `1px solid ${blocking.length ? 'rgba(217,79,79,0.35)' : 'rgba(232,155,62,0.4)'}`,
+      background: blocking.length ? 'rgba(217,79,79,0.05)' : 'rgba(232,155,62,0.07)',
+      borderRadius: 10, padding: 12, marginBottom: 14,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <AlertCircle size={15} style={{ color: blocking.length ? 'var(--red)' : '#B45309', flexShrink: 0 }} />
+        <span style={{ fontSize: 12, fontWeight: 800, color: blocking.length ? 'var(--red)' : '#92400E' }}>
+          {blocking.length
+            ? 'Facture refusée en l\'état'
+            : remaining > 0
+              ? `${remaining} point${remaining > 1 ? 's' : ''} à vérifier avant d'enregistrer`
+              : 'Points vérifiés — tu peux enregistrer'}
+        </span>
+      </div>
+
+      {blocking.map(a => (
+        <div key={a.code} style={{ fontSize: 12, color: '#7F1D1D', lineHeight: 1.5, padding: '6px 0', borderTop: '1px solid rgba(217,79,79,0.15)' }}>
+          <strong>{a.message}</strong>
+          <div style={{ color: '#991B1B', marginTop: 2 }}>{a.verification}</div>
+        </div>
+      ))}
+
+      {toConfirm.map(a => (
+        <label key={a.code} style={{
+          display: 'flex', gap: 10, alignItems: 'flex-start', cursor: 'pointer',
+          fontSize: 12, lineHeight: 1.5, padding: '6px 0', borderTop: '1px solid rgba(232,155,62,0.2)',
+          opacity: acked.has(a.code) ? 0.65 : 1,
+        }}>
+          <input
+            type="checkbox"
+            checked={acked.has(a.code)}
+            onChange={() => onToggle(a.code)}
+            style={{ marginTop: 3, flexShrink: 0 }}
+          />
+          <span>
+            <strong style={{ color: '#78350F' }}>{a.message}</strong>
+            <div style={{ color: '#92400E', marginTop: 2 }}>{a.verification}</div>
+            {acked.has(a.code) && <div style={{ color: 'var(--green)', fontWeight: 700, marginTop: 2 }}>Vérifié</div>}
+          </span>
+        </label>
+      ))}
+
+      {blocking.length > 0 && (
+        <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+          <button className="btn btn-ghost btn-sm" onClick={onRemove} style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            Retirer de la file
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function DataPill({ label, value, valueColor, mono }: { label: string; value: string; valueColor?: string; mono?: boolean }) {
   return (
@@ -885,7 +989,8 @@ export default function ScannerPage() {
     itemId: string,
     bankId: string | null,
     pm: 'bank' | 'cash' | 'card_perso',
-    associe?: 'justine' | 'yohan'
+    associe: 'justine' | 'yohan' | undefined,
+    confirmations: string[],
   ) => {
     const item = queue.find(i => i.id === itemId);
     if (!item?.result) return;
@@ -900,6 +1005,7 @@ export default function ScannerPage() {
           bank_tx_id:     bankId,
           payment_method: pm,
           associe:        associe,
+          confirmations,
         }),
       });
       const data = await res.json();

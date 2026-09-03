@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { ExtractedInvoiceData } from '@/lib/ai/invoice-ocr';
+import { assertInvoiceAccepted } from '@/lib/invoice-checks';
 
 /**
  * invoices.ts — Enregistrement d'une facture extraite par l'IA.
@@ -43,6 +44,14 @@ export interface SaveInvoiceOptions {
   fileUrl?: string | null;
   paymentMethod?: string;
   paymentNotes?: string | null;
+  /**
+   * Codes d'anomalies que l'humain a explicitement acquittés à l'écran.
+   * Sans eux, toute facture inhabituelle est refusée : le serveur ne fait pas
+   * confiance au client pour avoir montré les avertissements.
+   */
+  confirmations?: readonly string[];
+  /** Date du jour en ISO — paramétrable pour les tests. */
+  today?: string;
 }
 
 export interface SavedInvoice {
@@ -51,12 +60,20 @@ export interface SavedInvoice {
   supplierId: string | null;
 }
 
-/** Insère la facture + ses lignes. */
+/**
+ * Insère la facture + ses lignes.
+ *
+ * @throws InvoiceValidationError si la facture est incohérente ou si un point
+ *   inhabituel n'a pas été acquitté — voir lib/invoice-checks.ts.
+ */
 export async function saveInvoice(
   supabase: SupabaseClient,
   extracted: ExtractedInvoiceData,
   options: SaveInvoiceOptions = {}
 ): Promise<SavedInvoice> {
+  const today = options.today ?? new Date().toISOString().slice(0, 10);
+  assertInvoiceAccepted(extracted, today, options.confirmations ?? []);
+
   const supplierId = await findOrCreateSupplier(supabase, extracted.fournisseur);
   const accountingRef = generateAccountingRef(extracted.date);
 
