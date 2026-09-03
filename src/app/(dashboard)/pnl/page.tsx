@@ -8,6 +8,7 @@ import {
   isFinancialFlow, orderHtAmount, bankAmountHt, makeInvoiceMatcher,
 } from '@/lib/accounting';
 import { inventorySessions, computeCogs, type CogsResult } from '@/lib/cogs';
+import ClosuresPanel from '@/components/ClosuresPanel';
 import {
   TrendingUp,
   DollarSign,
@@ -847,7 +848,7 @@ export default function PnlPage() {
         <div>
           <h2>Compte de Résultat (P&L)</h2>
           <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-            Consolidation financière en temps réel — Cliquez sur une ligne pour voir les calculs ou masquer des éléments
+            Cliquez sur une ligne pour voir les écritures et corriger une catégorie
           </span>
         </div>
         <div className="period-selector">
@@ -1337,6 +1338,7 @@ export default function PnlPage() {
                 Le compte de résultat (P&L) consolide de façon asynchrone les données de vente de votre caisse Square avec les écritures comptables extraites de vos factures et relevés bancaires. Toute transaction bancaire pointée avec sa facture est consolidée afin de vous offrir une vision nette et exempte de doublons.
               </div>
             </div>
+            <ClosuresPanel />
           </>
         )}
       </div>

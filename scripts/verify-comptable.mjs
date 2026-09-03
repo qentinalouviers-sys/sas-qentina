@@ -31,6 +31,7 @@ import {
 } from '../src/lib/referentiel.ts';
 import { checkCcaOperation, firstDebitDay } from '../src/lib/cca.ts';
 import { inventorySessions, sessionAtBoundary, computeCogs } from '../src/lib/cogs.ts';
+import { monthBounds, recentMonths, isMonthOver } from '../src/lib/months.ts';
 
 /**
  * Faux client Supabase, qui applique réellement les filtres utilisés.
@@ -936,6 +937,17 @@ silence('mois en cours : on ne réclame pas encore',
   { inventoryClosing: { found: false, day: null }, end: '2026-07-31', today: '2026-07-10' }, 'inventaire-fin-de-periode');
 silence('une semaine : pas d\'inventaire hebdomadaire réclamé',
   { inventoryClosing: { found: false, day: null }, start: '2026-06-22', end: '2026-06-28' }, 'inventaire-fin-de-periode');
+
+
+console.log('\n── Mois ──');
+verifie('bornes de février 2028 (bissextile)', monthBounds('2028-02').end, '2028-02-29');
+verifie('bornes de septembre', monthBounds('2026-09').start, '2026-09-01');
+verifie('mois invalide refusé', (() => { try { monthBounds('2026-13'); return 'accepté'; } catch { return 'refusé'; } })(), 'refusé');
+verifie('12 mois récents, le plus récent d\'abord', recentMonths('2026-09-03', 12)[0], '2026-09');
+verifie('le douzième remonte à octobre 2025', recentMonths('2026-09-03', 12)[11], '2025-10');
+verifie('août 2026 est écoulé le 3 septembre', isMonthOver('2026-08', '2026-09-03'), true);
+verifie('septembre 2026 ne l\'est pas', isMonthOver('2026-09', '2026-09-03'), false);
+verifie('un mois se termine le dernier jour inclus', isMonthOver('2026-08', '2026-08-31'), false);
 
 console.log(`\n${echecs === 0 ? '✓ Tous les contrôles comptables passent.' : `✗ ${echecs} contrôle(s) en échec.`}\n`);
 process.exit(echecs === 0 ? 0 : 1);
