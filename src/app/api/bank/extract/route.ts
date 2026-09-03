@@ -4,6 +4,7 @@ import { createServiceRoleClient } from '@/lib/supabase/server';
 import { fetchAllRowsIn } from '@/lib/supabase/fetch-all';
 import { requireUser } from '@/lib/supabase/api-auth';
 import { createClaudeMessage } from '@/lib/anthropic';
+import { createAnthropicClient } from '@/lib/ai/settings';
 import { extractJson } from '@/lib/ai/json';
 import {
   parseBankCsv, distinctCategoryKeys, categoryFromRules, type ParsedBankRow,
@@ -189,7 +190,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'PDF ou CSV requis' }, { status: 400 });
     }
 
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const anthropic = await createAnthropicClient();
 
     // ── Voie rapide : CSV lu directement ───────────────────────────────────
     // Un export bancaire est déjà structuré. Le lire nous-mêmes rend les dates

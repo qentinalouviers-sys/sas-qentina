@@ -1,12 +1,8 @@
 import { NextResponse } from 'next/server';
-import Anthropic from '@anthropic-ai/sdk';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { createClaudeMessage } from '@/lib/anthropic';
 import { requireUser } from '@/lib/supabase/api-auth';
-
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+import { createAnthropicClient } from '@/lib/ai/settings';
 
 export async function POST(request: Request) {
   const auth = await requireUser();
@@ -49,6 +45,7 @@ Ta mission :
 3. Donne 1 ou 2 conseils d'expert actionnables pour optimiser le chiffre d'affaires ou la rentabilité.
 4. Utilise un ton pro mais dynamique et encourageant, digne de "Fuego". N'hésite pas à utiliser quelques emojis.`;
 
+    const anthropic = await createAnthropicClient();
     const msg = await createClaudeMessage(anthropic, {
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 1000,

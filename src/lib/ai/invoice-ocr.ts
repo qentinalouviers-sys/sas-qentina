@@ -1,6 +1,6 @@
-import Anthropic from '@anthropic-ai/sdk';
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages';
-import { createClaudeMessage } from '@/lib/anthropic';
+import { createClaudeMessage, PRIMARY_MODEL } from '@/lib/anthropic';
+import { createAnthropicClient, getSetting } from '@/lib/ai/settings';
 import { callGemini, getGeminiModel, type GeminiPart } from '@/lib/ai/gemini';
 import { extractJson } from '@/lib/ai/json';
 
@@ -9,7 +9,8 @@ import { extractJson } from '@/lib/ai/json';
  * Utilisé par /api/scanner ET /api/invoices/extract : un seul prompt,
  * une seule logique, des résultats identiques quel que soit le point d'entrée.
  *
- * Deux moteurs possibles, choisis par la variable OCR_PROVIDER :
+ * Deux moteurs possibles, choisis dans Réglages → Moteurs IA (ou, à défaut,
+ * par la variable d'environnement OCR_PROVIDER) :
  *  - « gemini » (Google) — nettement moins cher, c'est le moteur retenu ;
  *  - « anthropic » (Claude) — conservé comme repli immédiat, sans redéploiement
  *    de code, si Gemini se révèle moins fiable sur les tickets.
@@ -179,28 +180,29 @@ export type OcrProvider = 'gemini' | 'anthropic';
  * Moteur d'OCR retenu pour cet appel.
  *
  * Ordre de résolution :
- *  1. OCR_PROVIDER, la consigne explicite (« gemini » ou « anthropic ») ;
- *  2. à défaut, Gemini dès lors que GEMINI_API_KEY est renseignée ;
+ *  1. le choix enregistré dans Réglages → Moteurs IA, sinon la variable
+ *     OCR_PROVIDER (« gemini » ou « anthropic ») ;
+ *  2. à défaut, Gemini dès lors qu'une clé Google est disponible ;
  *  3. sinon Claude, comme avant.
  *
- * Cet ordre permet d'installer le code sans rien casser : tant que la clé
- * Google n'est pas posée, l'application continue de tourner sur Claude.
+ * Cet ordre permet d'installer le code sans rien casser : tant qu'aucune clé
+ * Google n'est posée, l'application continue de tourner sur Claude.
  */
-export function resolveOcrProvider(): OcrProvider {
-  const explicit = process.env.OCR_PROVIDER?.trim().toLowerCase();
+export async function resolveOcrProvider(): Promise<OcrProvider> {
+  const explicit = (await getSetting('ocr_provider'))?.toLowerCase();
   if (explicit === 'gemini' || explicit === 'anthropic') return explicit;
   if (explicit) {
     throw new Error(
-      `OCR_PROVIDER vaut « ${explicit} », valeur inconnue. `
+      `Le moteur d'OCR vaut « ${explicit} », valeur inconnue. `
       + 'Les seules valeurs acceptées sont « gemini » et « anthropic ».'
     );
   }
-  return process.env.GEMINI_API_KEY?.trim() ? 'gemini' : 'anthropic';
+  return (await getSetting('gemini_api_key')) ? 'gemini' : 'anthropic';
 }
 
 /** OCR par Claude (Anthropic). */
 async function ocrWithClaude(files: OcrFile[]): Promise<string> {
-  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const anthropic = await createAnthropicClient();
 
   const response = await createClaudeMessage(anthropic, {
     system: INVOICE_OCR_PROMPT,
@@ -266,7 +268,7 @@ async function ocrWithGemini(files: OcrFile[]): Promise<string> {
  * configuré. Le résultat a exactement la même forme quel que soit le moteur.
  */
 export async function runInvoiceOcr(files: OcrFile[]): Promise<ExtractedInvoiceData> {
-  const provider = resolveOcrProvider();
+  const provider = await resolveOcrProvider();
   const raw = provider === 'gemini' ? await ocrWithGemini(files) : await ocrWithClaude(files);
 
   const extracted = extractJson<ExtractedInvoiceData>(raw);
@@ -275,10 +277,10 @@ export async function runInvoiceOcr(files: OcrFile[]): Promise<ExtractedInvoiceD
 }
 
 /** Moteur et modèle actifs, pour l'affichage et le diagnostic. */
-export function describeOcrEngine(): { provider: OcrProvider; model: string } {
-  const provider = resolveOcrProvider();
+export async function describeOcrEngine(): Promise<{ provider: OcrProvider; model: string }> {
+  const provider = await resolveOcrProvider();
   return {
     provider,
-    model: provider === 'gemini' ? getGeminiModel() : 'claude-sonnet-5',
+    model: provider === 'gemini' ? await getGeminiModel() : PRIMARY_MODEL,
   };
 }

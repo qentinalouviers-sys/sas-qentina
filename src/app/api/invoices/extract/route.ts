@@ -86,7 +86,7 @@ export async function POST(request: NextRequest) {
       invoice_id: saved.id,
       pdf_url: fileUrl,
       extracted,
-      ocr_engine: describeOcrEngine(),
+      ocr_engine: await describeOcrEngine(),
       reconciled_tx_id: reconciledTxId,
       accounting_ref: saved.accountingRef,
     });

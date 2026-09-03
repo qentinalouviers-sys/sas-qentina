@@ -4,30 +4,45 @@ import { requireUser } from '@/lib/supabase/api-auth';
 import { tryGetAppUrl } from '@/lib/env';
 import { describeOcrEngine } from '@/lib/ai/invoice-ocr';
 import { callGemini } from '@/lib/ai/gemini';
-import Anthropic from '@anthropic-ai/sdk';
+import { createAnthropicClient, getSettingSource } from '@/lib/ai/settings';
 
 /**
- * Contrôle des variables d'environnement : indique ce qui est configuré
- * sans jamais révéler la moindre valeur secrète.
+ * Contrôle de la configuration : indique ce qui manque sans jamais révéler
+ * la moindre valeur secrète.
+ *
+ * Les clés IA ne sont plus cherchées dans les seules variables
+ * d'environnement : elles peuvent venir de Réglages → Moteurs IA. Sans cette
+ * distinction, une clé parfaitement configurée à l'écran s'afficherait ici
+ * comme manquante — exactement le faux signal que cette page doit éviter.
  */
-function checkConfig(engine: { provider: string; model: string }) {
+async function checkConfig(engine: { provider: string; model: string }) {
   const required: { variable: string; impact: string }[] = [
     { variable: 'NEXT_PUBLIC_SUPABASE_URL', impact: 'Base de données' },
     { variable: 'NEXT_PUBLIC_SUPABASE_ANON_KEY', impact: 'Base de données' },
     { variable: 'SUPABASE_SERVICE_ROLE_KEY', impact: 'Base de données (serveur)' },
-    { variable: 'ANTHROPIC_API_KEY', impact: 'Banque, Fuego, audits' },
     { variable: 'SQUARE_ACCESS_TOKEN', impact: 'Ventes Square' },
     { variable: 'SQUARE_LOCATION_ID', impact: 'Ventes Square' },
     { variable: 'SQUARE_WEBHOOK_SECRET', impact: 'Ventes en temps réel' },
   ];
 
-  // La clé Google n'est indispensable que si l'OCR tourne effectivement
-  // sur Gemini : inutile de la réclamer à qui est resté sur Claude.
-  if (engine.provider === 'gemini') {
-    required.push({ variable: 'GEMINI_API_KEY', impact: 'Scanner IA (OCR des factures)' });
+  const missing = required.filter(r => !process.env[r.variable]?.trim());
+
+  // Clés IA : base de données ou variable d'environnement, indifféremment.
+  if ((await getSettingSource('anthropic_api_key')) === 'absent') {
+    missing.push({
+      variable: 'Clé API Anthropic',
+      impact: 'Banque, Fuego, audits, chat — à renseigner dans Réglages → Moteurs IA',
+    });
   }
 
-  const missing = required.filter(r => !process.env[r.variable]?.trim());
+  // La clé Google n'est indispensable que si l'OCR tourne effectivement
+  // sur Gemini : inutile de la réclamer à qui est resté sur Claude.
+  if (engine.provider === 'gemini' && (await getSettingSource('gemini_api_key')) === 'absent') {
+    missing.push({
+      variable: 'Clé API Google Gemini',
+      impact: 'Scanner IA (OCR des factures) — à renseigner dans Réglages → Moteurs IA',
+    });
+  }
 
   const appUrl = tryGetAppUrl();
   if (!appUrl) {
@@ -73,7 +88,7 @@ const AI_CACHE_MS = 5 * 60 * 1000;
 
 /** Ping Claude : un token de sortie sur le modèle le moins cher. */
 async function pingAnthropic(): Promise<void> {
-  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const anthropic = await createAnthropicClient();
   await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 1,
@@ -137,13 +152,13 @@ export async function GET() {
   let engine: { provider: string; model: string };
   let engineError: string | null = null;
   try {
-    engine = describeOcrEngine();
+    engine = await describeOcrEngine();
   } catch (e: any) {
     engine = { provider: 'inconnu', model: 'inconnu' };
     engineError = e.message;
   }
 
-  const config = checkConfig(engine);
+  const config = await checkConfig(engine);
   const aiHealth = engineError
     ? { status: 'red' as const, latency_ms: 0, message: engineError, provider: 'inconnu', model: 'inconnu' }
     : await checkAiHealth(engine);

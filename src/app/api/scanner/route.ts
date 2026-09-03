@@ -135,7 +135,7 @@ export async function POST(req: NextRequest) {
       extracted,
       // Moteur ayant réellement produit la lecture : indispensable pour
       // comparer Gemini et Claude sur les mêmes factures.
-      ocr_engine: describeOcrEngine(),
+      ocr_engine: await describeOcrEngine(),
       file_url: fileUrl,
       is_duplicate: isDuplicate,
       duplicate_invoice: duplicateInvoice,

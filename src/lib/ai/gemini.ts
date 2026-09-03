@@ -9,6 +9,8 @@
  * changer ne demande alors qu'un redéploiement, pas une modification de code.
  */
 
+import { getSetting } from '@/lib/ai/settings';
+
 const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 /**
@@ -43,8 +45,8 @@ export interface GeminiResult {
   usage: { input: number; output: number } | null;
 }
 
-export function getGeminiModel(): string {
-  return process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL;
+export async function getGeminiModel(): Promise<string> {
+  return (await getSetting('gemini_model')) || DEFAULT_GEMINI_MODEL;
 }
 
 /** Vrai si l'erreur justifie une nouvelle tentative (quota, surcharge, panne). */
@@ -84,18 +86,18 @@ function describeError(status: number, body: string, model: string): string {
  * Renvoie le texte brut : le découpage JSON reste à la charge de l'appelant.
  */
 export async function callGemini(options: GeminiOptions): Promise<GeminiResult> {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  const apiKey = await getSetting('gemini_api_key');
   if (!apiKey) {
     throw new Error(
-      "Variable d'environnement manquante : GEMINI_API_KEY\n"
-      + '  → Sans elle, l\'OCR par Gemini ne peut pas fonctionner.\n'
-      + '  → Créez la clé sur https://aistudio.google.com/apikey puis ajoutez-la dans '
-      + 'Vercel → Settings → Environment Variables, et redéployez. '
-      + 'Pour revenir à Claude en attendant : OCR_PROVIDER=anthropic.'
+      'Aucune clé API Google Gemini configurée.\n'
+      + "  → Sans elle, l'OCR par Gemini ne peut pas fonctionner.\n"
+      + '  → Créez la clé sur https://aistudio.google.com/apikey puis collez-la dans '
+      + 'Réglages → Moteurs IA (ou définissez GEMINI_API_KEY dans Vercel). '
+      + 'Pour revenir à Claude en attendant, choisissez ce moteur dans le même écran.'
     );
   }
 
-  const model = getGeminiModel();
+  const model = await getGeminiModel();
 
   // Le « raisonnement » de Gemini est facturé comme des tokens de sortie. Une
   // extraction de facture n'en a aucun besoin : on le coupe (budget 0), ce qui

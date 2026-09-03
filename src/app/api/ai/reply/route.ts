@@ -1,12 +1,8 @@
 import { NextResponse } from 'next/server';
-import Anthropic from '@anthropic-ai/sdk';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { createClaudeMessage } from '@/lib/anthropic';
 import { requireUser } from '@/lib/supabase/api-auth';
-
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+import { createAnthropicClient } from '@/lib/ai/settings';
 
 export async function POST(request: Request) {
   const auth = await requireUser();
@@ -31,6 +27,7 @@ Rédige une réponse professionnelle, polie et adaptée à cet avis au nom de l'
 - Ne mets pas de guillemets autour de ta réponse finale.
 - Reste concis (3-4 phrases max).`;
 
+    const anthropic = await createAnthropicClient();
     const msg = await createClaudeMessage(anthropic, {
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 300,
