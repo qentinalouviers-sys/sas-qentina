@@ -142,6 +142,11 @@ export interface InterventionFacts {
    * ingrédient ni alias : leurs prix ne mettent à jour aucune fiche.
    */
   unmatchedDesignations: { count: number; sample: string[] };
+  /**
+   * Écritures que l'ancien bouton « masquer » du P&L excluait du résultat.
+   * Le bouton n'existe plus ; elles sont réintégrées, et il faut les relire.
+   */
+  legacyMaskedItems: number;
 }
 
 const SEVERITY_RANK: Record<Severity, number> = {
@@ -613,6 +618,25 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     });
   }
 
+  // ── 16. Écritures autrefois masquées du P&L ───────────────────────────────
+  // Elles avaient été retirées du résultat à la main, sans motif ni trace. Le
+  // P&L les réintègre ; certaines sont peut-être mal catégorisées, et c'est là
+  // qu'il faut les corriger — pas en les cachant.
+  if (f.legacyMaskedItems > 0) {
+    out.push({
+      id: 'ecritures-ex-masquees',
+      severity: 'a_verifier',
+      title: `${f.legacyMaskedItems} écriture(s) réintégrée(s) au résultat`,
+      impact:
+        `Ces écritures avaient été masquées du P&L à la main. Le masquage n'existe plus : ` +
+        `un compte de résultat ajustable sans trace n'est pas un outil comptable. Elles ` +
+        `comptent de nouveau — si l'une n'a rien à y faire, c'est sa catégorie qui est fausse.`,
+      action: 'Relis-les dans le détail des postes du P&L et corrige leur catégorie.',
+      href: '/pnl',
+      hrefLabel: 'P&L → détail des postes',
+    });
+  }
+
   // Tri par gravité uniquement. `sort` étant stable, l'ordre de déclaration
   // ci-dessus est conservé à l'intérieur d'une gravité — et cet ordre est
   // délibéré : c'est l'ordre CAUSAL. La caisse d'abord, puis le chiffre
@@ -654,7 +678,7 @@ export async function collectInterventionFacts(
   // tronque à 1 000 lignes sans le dire. Sur un exercice de 1 788 commandes, ce
   // module comparait les versements bancaires à un CA amputé de 44 % — et
   // annonçait « des ventes manquantes » en désignant la mauvaise cause.
-  const [orders, lastRes, firstRes, bank, invoices, suppliers, cca, trips, tva, foodLines, ingredients, aliases] =
+  const [orders, lastRes, firstRes, bank, invoices, suppliers, cca, trips, tva, foodLines, ingredients, aliases, maskedRes] =
     await Promise.all([
       fetchAllRows<any>((f0, f1) => supabase.from('square_orders')
         .select('service, net_amount, raw_data')
@@ -690,6 +714,8 @@ export async function collectInterventionFacts(
         .select('id, name').range(f0, f1)),
       fetchAllRows<{ alias: string; ingredient_id: string }>((f0, f1) => supabase.from('ingredient_aliases')
         .select('alias, ingredient_id').range(f0, f1)),
+      // Bornée par construction : une clé de réglage.
+      supabase.from('app_settings').select('value').eq('key', 'masked_items').limit(1),
     ]);
 
   let caSquareTtc = 0;
@@ -758,6 +784,15 @@ export async function collectInterventionFacts(
   // ── Mercuriale : désignations orphelines ─────────────────────────────────
   const orphans = unmatchedDesignations(foodLines, ingredients, aliases);
 
+  // ── P&L : écritures autrefois masquées ───────────────────────────────────
+  let legacyMaskedItems = 0;
+  try {
+    const raw = maskedRes.data?.[0]?.value;
+    if (raw) legacyMaskedItems = (JSON.parse(raw) as unknown[]).length;
+  } catch {
+    // Valeur corrompue : rien à réintégrer de lisible.
+  }
+
   // Bornes réelles des relevés importés à l'intérieur de la fenêtre. Sert à
   // dire si les achats couvrent la même durée que les ventes.
   const bankDates = bank
@@ -801,5 +836,6 @@ export async function collectInterventionFacts(
       count: orphans.length,
       sample: orphans.slice(0, 5).map(o => o.designation),
     },
+    legacyMaskedItems,
   };
 }
