@@ -17,12 +17,11 @@ import {
 } from '@/lib/interventions';
 import { InterventionsCard } from '@/components/Interventions';
 import {
-  TrendingUp, TrendingDown, DollarSign, ShoppingCart,
-  Users, Package, Target, Percent, AlertTriangle,
-  Activity, Zap, BarChart2, CreditCard, Clock, Star,
+  TrendingUp, DollarSign, ShoppingCart, Users, Target, Percent,
+  AlertTriangle, Activity, Zap, CreditCard, Gauge, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import {
-  AreaChart, Area, BarChart, Bar, ComposedChart,
+  Area, BarChart, Bar, ComposedChart,
   XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
   ReferenceLine, Cell,
 } from 'recharts';
@@ -99,6 +98,9 @@ export default function DashboardPage() {
   const [period, setPeriod] = useState<PeriodFilter>('month');
   const [loading, setLoading] = useState(true);
   const [sim, setSim] = useState<SimState>(EMPTY_SIM);
+  // Le simulateur ne sert qu'à l'occasion : replié par défaut, il ne prend
+  // pas un écran entier sur l'accueil.
+  const [showSim, setShowSim] = useState(false);
   const [chargesDetails, setChargesDetails] = useState<any[]>([]);
   const [showChargesModal, setShowChargesModal] = useState(false);
 
@@ -523,12 +525,25 @@ export default function DashboardPage() {
   const displayFoodRatioToUse = (simFood || simStock) ? adjustedFoodRatio : kpis.foodCost;
   const displayFoodAmtToUse = (simFood || simStock) ? adjustedFoodAmt : kpis.foodCostAmt;
 
-  const displayPrimeCost = displayFoodRatioToUse + displayLaborRatio;
   const displayMargeNetteAmt = kpis.caHt - (adjustedFoodAmt + displayLaborAmt + displayFixedAmt);
   const displayMargeNetteRatio = kpis.caHt > 0 ? (displayMargeNetteAmt / kpis.caHt) * 100 : 0;
 
   const fcBad = displayFoodRatioToUse > FOOD_COST_TARGET;
   const tvaBad = kpis.tvaNette > 0;
+
+  // ── Point mort par service ──────────────────────────────────────────────
+  // Le chiffre le plus concret d'un restaurant : le CA HT minimum à faire à
+  // chaque service pour couvrir charges fixes et salaires, une fois la
+  // matière payée. (Fixes + salaires) ÷ (1 − food cost) ÷ nombre de services.
+  // Null tant qu'il manque une brique : sans achats, le food cost est faux ;
+  // sans ventes, il n'y a pas de service à compter.
+  const nbServices = Object.values(kpis.caByDayService)
+    .reduce((s, d) => s + d.midi.nbServices + d.soir.nbServices, 0);
+  const margeBruteRatio = 1 - kpis.foodCost / 100;
+  const pointMortParService = (nbServices > 0 && kpis.foodCost > 0 && margeBruteRatio > 0.05)
+    ? (kpis.totalFixedCharges + kpis.totalLabor) / margeBruteRatio / nbServices
+    : null;
+  const caHtParService = nbServices > 0 ? kpis.caHt / nbServices : 0;
 
   const chiffresFiables = !interventions.some(i => i.severity === 'critique');
   const { start: periodStart, end: periodEnd } = getDateRange(period);
@@ -547,7 +562,7 @@ export default function DashboardPage() {
             Tableau de bord
           </h2>
           <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
-            Vue consolidée de votre restaurant — données en temps réel
+            {periodLabel}
           </div>
         </div>
         <PeriodSelector value={period} onChange={setPeriod} />
@@ -589,13 +604,13 @@ export default function DashboardPage() {
               </div>
             )}
 
-            {/* ── SECTION 1 : Performance commerciale ─────────────────────── */}
-            <SectionHeader title="Performance commerciale" subtitle="Ventes & activité" icon={<TrendingUp size={18} />} />
+            {/* ── Ventes ───────────────────────────────────────────────────── */}
+            <SectionHeader title="Ventes" subtitle="Ce que la caisse a encaissé" icon={<TrendingUp size={18} />} />
             <div className="kpi-grid-auto">
               <KpiCard
                 label="Chiffre d'affaires TTC"
                 value={formatCurrency(kpis.caTotal)}
-                subValue={`${formatCurrency(kpis.caHt)} HT · ${kpis.nbCommandes} commandes`}
+                subValue={`${formatCurrency(kpis.caHt)} HT · ${kpis.nbCommandes} commande${kpis.nbCommandes > 1 ? 's' : ''}`}
                 icon={<DollarSign size={20} />}
                 accentColor="#2A7D7B"
                 spark={kpis.caSparkData}
@@ -603,56 +618,66 @@ export default function DashboardPage() {
               <KpiCard
                 label="Ticket moyen"
                 value={formatCurrency(kpis.ticketMoyen)}
-                subValue="Par commande"
+                subValue={nbServices > 0 ? `${formatCurrency(kpis.caTotal / nbServices)} par service · ${nbServices} service${nbServices > 1 ? 's' : ''}` : 'Par commande'}
                 icon={<ShoppingCart size={20} />}
                 accentColor="#7C3AED"
               />
               <KpiCard
-                label="Commandes"
-                value={kpis.nbCommandes.toString()}
-                subValue={kpis.caTotal > 0 && kpis.nbCommandes > 0
-                  ? `Moy. ${formatCurrency(kpis.ticketMoyen)}/commande`
-                  : 'Aucune vente'}
-                icon={<BarChart2 size={20} />}
-                accentColor="#2D8F5E"
+                label="Point mort par service"
+                value={pointMortParService !== null ? formatCurrency(pointMortParService) : '—'}
+                subValue={pointMortParService !== null
+                  ? `CA HT minimum par service · réalisé : ${formatCurrency(caHtParService)}`
+                  : nbServices === 0
+                    ? 'Aucun service encaissé sur la période'
+                    : kpis.foodCost <= 0
+                      ? 'Il manque les achats de la période (factures ou relevé)'
+                      : 'Non calculable : le coût matières absorbe tout le CA (marge brute nulle ou négative)'}
+                icon={<Gauge size={20} />}
+                accentColor={pointMortParService === null ? '#9CA3AF' : caHtParService >= pointMortParService ? '#2D8F5E' : '#D94F4F'}
+                badge={pointMortParService !== null ? {
+                  text: caHtParService >= pointMortParService
+                    ? `✓ +${formatCurrency(caHtParService - pointMortParService)} / service`
+                    : `⚠ −${formatCurrency(pointMortParService - caHtParService)} / service`,
+                  type: caHtParService >= pointMortParService ? 'good' : 'bad',
+                } : undefined}
               />
               <KpiCard
-                label="Marge nette estimée"
+                label="EBE (marge opérationnelle)"
                 value={formatPercent(displayMargeNetteRatio)}
-                subValue={formatCurrency(displayMargeNetteAmt)}
-                icon={<Star size={20} />}
+                subValue={`${formatCurrency(displayMargeNetteAmt)} HT après matières, salaires et charges fixes`}
+                icon={<Activity size={20} />}
                 accentColor={displayMargeNetteRatio >= 20 ? '#2D8F5E' : displayMargeNetteRatio >= 10 ? '#E89B3E' : '#D94F4F'}
                 badge={{
-                  text: isSimulationActive ? '🧪 Simulé' : displayMargeNetteRatio >= 20 ? '✓ Bonne marge' : displayMargeNetteRatio >= 10 ? 'Marge correcte' : 'Marge faible',
+                  text: isSimulationActive ? '🧪 Simulé' : displayMargeNetteRatio >= 20 ? '✓ Bonne marge' : displayMargeNetteRatio >= 10 ? 'Marge correcte' : displayMargeNetteRatio >= 0 ? 'Marge faible' : 'Perte',
                   type: isSimulationActive ? 'neutral' : displayMargeNetteRatio >= 20 ? 'good' : displayMargeNetteRatio >= 10 ? 'neutral' : 'bad',
                 }}
               />
             </div>
 
-            {/* ── SECTION 2 : Contrôle des coûts ──────────────────────────── */}
-            <SectionHeader title="Contrôle des coûts" subtitle="Food cost, masse salariale & stocks" icon={<Target size={18} />} />
+            {/* ── Coûts ────────────────────────────────────────────────────── */}
+            <SectionHeader title="Coûts" subtitle="Ce qui sort, en % du CA HT" icon={<Target size={18} />} />
             <div className="kpi-grid-auto">
               <KpiCard
-                label="Food Cost"
+                label="Food cost"
                 value={formatPercent(displayFoodRatioToUse)}
                 subValue={
-                  kpis.foodCostBanquePercent >= 10
-                    ? `${formatCurrency(displayFoodAmtToUse)} / ${formatCurrency(kpis.caHt)} CA HT — dont ${kpis.foodCostBanquePercent.toFixed(0)}% sans facture (majorant)`
-                    : kpis.cogs?.method === 'inventaire'
-                    ? `${formatCurrency(displayFoodAmtToUse)} consommés (achats ${formatCurrency(kpis.achatsHt)} ${kpis.cogs.stockVariation >= 0 ? '−' : '+'} stock ${formatCurrency(Math.abs(kpis.cogs.stockVariation))}) / ${formatCurrency(kpis.caHt)} CA HT`
-                    : `${formatCurrency(displayFoodAmtToUse)} d'achats / ${formatCurrency(kpis.caHt)} CA HT — sur achats, pas d'inventaire aux bornes`
+                  kpis.cogs?.method === 'inventaire'
+                    ? `${formatCurrency(displayFoodAmtToUse)} consommés — mesuré (achats ${formatCurrency(kpis.achatsHt)} ${kpis.cogs.stockVariation >= 0 ? '−' : '+'} stock ${formatCurrency(Math.abs(kpis.cogs.stockVariation))})`
+                    : kpis.foodCostBanquePercent >= 10
+                    ? `${formatCurrency(displayFoodAmtToUse)} d'achats — dont ${kpis.foodCostBanquePercent.toFixed(0)} % sans facture (majorant)`
+                    : `${formatCurrency(displayFoodAmtToUse)} d'achats — sur achats, pas d'inventaire aux bornes`
                 }
                 icon={<Target size={20} />}
                 accentColor={fcBad ? '#D94F4F' : '#2D8F5E'}
                 badge={{
-                  text: (simFood || simStock) ? '🧪 Simulé' : fcBad ? `⚠ +${(displayFoodRatioToUse - FOOD_COST_TARGET).toFixed(1)}% cible` : `✓ Cible 28-32%`,
+                  text: (simFood || simStock) ? '🧪 Simulé' : fcBad ? `⚠ +${(displayFoodRatioToUse - FOOD_COST_TARGET).toFixed(1)} pt vs cible` : `✓ Cible 28-32 %`,
                   type: (simFood || simStock) ? 'neutral' : fcBad ? 'bad' : 'good',
                 }}
               />
               <KpiCard
                 label="Masse salariale"
                 value={formatPercent(displayLaborRatio)}
-                subValue={`${formatCurrency(displayLaborAmt)} en coût total`}
+                subValue={`${formatCurrency(displayLaborAmt)} salaires et charges`}
                 icon={<Users size={20} />}
                 accentColor={displayLaborRatio > 35 ? '#D94F4F' : '#E89B3E'}
                 badge={{
@@ -661,244 +686,108 @@ export default function DashboardPage() {
                 }}
               />
               <KpiCard
-                label="Stock valorisé"
-                value={formatCurrency(displayStockAmt)}
-                subValue={simStock ? '🧪 Valeur de stock simulée' : 'Valeur du stock actuel'}
-                icon={<Package size={20} />}
-                accentColor="#1A5AA0"
-                badge={simStock ? { text: '🧪 Simulé', type: 'neutral' } : undefined}
-              />
-              <KpiCard
-                label="Charges Fixes & Ops"
+                label="Charges fixes"
                 value={formatCurrency(displayFixedAmt)}
-                subValue={kpis.caHt > 0 ? `${displayFixedRatio.toFixed(1)}% du CA HT` : '0% du CA HT'}
+                subValue={`${kpis.caHt > 0 ? displayFixedRatio.toFixed(1) : '0'} % du CA HT · loyer, assurances, abonnements, taxes — cliquer pour le détail`}
                 icon={<CreditCard size={20} />}
                 accentColor="#7C3AED"
                 badge={simFixed ? { text: '🧪 Simulé', type: 'neutral' } : undefined}
                 onClick={() => setShowChargesModal(true)}
               />
               <KpiCard
-                label="Prime Cost"
-                value={formatPercent(displayPrimeCost)}
-                subValue="Food cost + Masse salariale"
-                icon={<Zap size={20} />}
-                accentColor={displayPrimeCost > 65 ? '#D94F4F' : '#2D8F5E'}
-                badge={{
-                  text: isSimulationActive ? '🧪 Simulé' : displayPrimeCost > 65 ? '⚠ > 65%' : '✓ < 65%',
-                  type: isSimulationActive ? 'neutral' : displayPrimeCost > 65 ? 'bad' : 'good',
-                }}
-              />
-            </div>
-
-            {/* ── Simulateur EBE ───────────────────────────────────────────── */}
-            <div className="card" style={{
-              marginBottom: 24,
-              border: isSimulationActive ? '1.5px solid var(--orange)' : '1px solid var(--border)',
-              background: 'linear-gradient(135deg, white 0%, var(--cream-light) 100%)',
-              padding: 20,
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
-                <Zap size={20} style={{ color: isSimulationActive ? 'var(--orange)' : 'var(--teal)', flexShrink: 0 }} />
-                <div style={{ flex: 1, minWidth: 200 }}>
-                  <h3 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>Simulateur de Marge Opérationnelle (EBE)</h3>
-                  <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
-                    Ajustez les charges et les stocks pour voir l&apos;impact en temps réel sur vos marges
-                  </p>
-                </div>
-                {isSimulationActive && (
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--red)' }}
-                    onClick={() => setSim(EMPTY_SIM)}
-                  >
-                    Réinitialiser
-                  </button>
-                )}
-              </div>
-
-              <div className="grid-2-1" style={{ gap: 20 }}>
-                {/* Champs de simulation */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-                  {(['labor', 'food', 'fixed', 'stock'] as SimKey[]).map(key => (
-                    <SimulatorField
-                      key={key}
-                      simKey={key}
-                      sim={sim[key]}
-                      realPercent={realValues[key].percent}
-                      realEuro={realValues[key].euro}
-                      onValueChange={v => setSimValue(key, v)}
-                      onModeChange={m => setSimMode(key, m)}
-                    />
-                  ))}
-                </div>
-
-                {/* Résultat visuel */}
-                <div style={{
-                  background: 'white',
-                  border: '1px solid var(--border-light)',
-                  borderRadius: 16,
-                  padding: 20,
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 16,
-                  boxShadow: 'var(--shadow-sm)',
-                }}>
-                  {(() => {
-                    const ebeStatus = displayMargeNetteRatio >= 20
-                      ? { label: 'EBE Excellent (Cible atteinte)', color: '#2D8F5E', bg: '#EDF7ED' }
-                      : displayMargeNetteRatio >= 10
-                        ? { label: 'EBE Correct (À surveiller)', color: '#E89B3E', bg: '#FFF8E1' }
-                        : { label: 'EBE Critique (Alerte rouge)', color: '#D94F4F', bg: '#FDECEF' };
-                    const progressPercent = Math.min(Math.max((displayMargeNetteRatio / 30) * 100, 0), 100);
-
-                    return (
-                      <>
-                        <div style={{
-                          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                          background: ebeStatus.bg, color: ebeStatus.color,
-                          padding: '10px 14px', borderRadius: 12,
-                          fontWeight: 750, fontSize: 13.5, gap: 8, flexWrap: 'wrap',
-                        }}>
-                          <span>Statut Résultat :</span>
-                          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                            <span style={{
-                              width: 10, height: 10, borderRadius: '50%',
-                              background: ebeStatus.color, boxShadow: `0 0 8px ${ebeStatus.color}`,
-                              display: 'inline-block',
-                            }} />
-                            {ebeStatus.label}
-                          </span>
-                        </div>
-
-                        <div>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 6 }}>
-                            <span>Taux de Marge Opérationnelle (EBE)</span>
-                            <strong>{displayMargeNetteRatio.toFixed(1)}% / 30%</strong>
-                          </div>
-                          <div style={{ height: 10, background: 'var(--border-light)', borderRadius: 10, overflow: 'hidden' }}>
-                            <div style={{
-                              height: '100%',
-                              width: `${progressPercent}%`,
-                              background: ebeStatus.color,
-                              borderRadius: 10,
-                              transition: 'width 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
-                            }} />
-                          </div>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: 'var(--text-muted)', marginTop: 4, fontWeight: 500 }}>
-                            <span>0% (Déficitaire)</span>
-                            <span>10% (Correct)</span>
-                            <span>20% (Excellent)</span>
-                            <span>30%+</span>
-                          </div>
-                        </div>
-                      </>
-                    );
-                  })()}
-
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontSize: 13, borderTop: '1px solid var(--border-light)', paddingTop: 14 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span style={{ color: 'var(--text-secondary)' }}>Chiffre d&apos;affaires :</span>
-                      <strong>{formatCurrency(kpis.caTotal)}</strong>
-                    </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span style={{ color: 'var(--text-secondary)' }}>EBE Réel (Constaté) :</span>
-                      <span style={{ fontWeight: 600, color: kpis.margeNette >= 15 ? 'var(--green)' : 'var(--text-secondary)' }}>
-                        {formatPercent(kpis.margeNette)} ({formatCurrency(kpis.margeNetteAmt)})
-                      </span>
-                    </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px dashed var(--border-light)', paddingBottom: 8 }}>
-                      <span style={{ color: 'var(--text-secondary)' }}>EBE Projeté (Simulé) :</span>
-                      <span style={{ fontWeight: 800, fontSize: 14, color: displayMargeNetteRatio >= 15 ? 'var(--green)' : displayMargeNetteRatio >= 10 ? 'var(--orange)' : 'var(--red)' }}>
-                        {formatPercent(displayMargeNetteRatio)} ({formatCurrency(displayMargeNetteAmt)})
-                      </span>
-                    </div>
-
-                    <div style={{
-                      marginTop: 6,
-                      background: 'linear-gradient(135deg, var(--cream-light) 0%, white 100%)',
-                      borderRadius: 12,
-                      padding: '12px 14px',
-                      textAlign: 'center',
-                      border: '1px dashed var(--border)',
-                      fontSize: 13,
-                    }}>
-                      {(() => {
-                        const diff = displayMargeNetteAmt - kpis.margeNetteAmt;
-                        if (Math.abs(diff) < 0.01) {
-                          return <span style={{ color: 'var(--text-muted)', fontSize: 12.5 }}>Aucun écart par rapport aux chiffres réels.</span>;
-                        }
-                        return diff > 0 ? (
-                          <span style={{ color: '#2D8F5E', fontWeight: 800 }}>
-                            📈 Gain potentiel : <strong>+{formatCurrency(diff)} HT</strong> de bénéfices en plus !
-                          </span>
-                        ) : (
-                          <span style={{ color: '#D94F4F', fontWeight: 800 }}>
-                            📉 Écart de marge : <strong>-{formatCurrency(Math.abs(diff))} HT</strong> par rapport au réel.
-                          </span>
-                        );
-                      })()}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* ── SECTION 3 : TVA ──────────────────────────────────────────── */}
-            <SectionHeader title="Tableau de bord TVA" subtitle="Balance fiscale estimée sur la période" icon={<Percent size={18} />} />
-            <div className="kpi-grid-auto">
-              <KpiCard
-                label={kpis.tvaNette >= 0 ? 'TVA Nette à payer' : 'Crédit de TVA'}
+                label={kpis.tvaNette >= 0 ? 'TVA nette à payer' : 'Crédit de TVA'}
                 value={formatCurrency(Math.abs(kpis.tvaNette))}
-                subValue={kpis.tvaNette >= 0 ? "À reverser à l'administration" : 'Créance récupérable'}
-                icon={kpis.tvaNette >= 0 ? <TrendingUp size={20} /> : <TrendingDown size={20} />}
+                subValue={`${formatCurrency(kpis.tvaCollectee)} collectée − ${formatCurrency(kpis.tvaDeductible)} déductible sur factures`}
+                icon={<Percent size={20} />}
                 accentColor={kpis.tvaNette >= 0 ? '#E89B3E' : '#2D8F5E'}
                 badge={{
-                  text: kpis.tvaNette >= 0 ? 'À provisionner' : 'Crédit TVA',
+                  text: kpis.tvaNette >= 0 ? 'À provisionner' : 'Créance',
                   type: kpis.tvaNette >= 0 ? 'bad' : 'good',
                 }}
               />
-              <KpiCard
-                label="TVA Collectée (Ventes)"
-                value={formatCurrency(kpis.tvaCollectee)}
-                subValue={`${kpis.caHt > 0 ? ((kpis.tvaCollectee / kpis.caHt) * 100).toFixed(1) : '0'}% du CA HT`}
-                icon={<CreditCard size={20} />}
-                accentColor="#2A7D7B"
-              />
-              <KpiCard
-                label="TVA Déductible (Achats)"
-                value={formatCurrency(kpis.tvaDeductible)}
-                subValue="Sur factures & relevés banque"
-                icon={<Clock size={20} />}
-                accentColor="#7C3AED"
-              />
-              <div style={{
-                background: 'linear-gradient(135deg, #2A7D7B 0%, #1A5D5B 100%)',
-                borderRadius: 16, padding: '18px 20px',
-                color: 'white', display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
-                boxShadow: '0 4px 20px rgba(42,125,123,0.3)', minWidth: 0,
-              }}>
-                <div style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.6px', opacity: 0.75 }}>
-                  Balance TVA
-                </div>
-                <div style={{ fontSize: 22, fontWeight: 800, margin: '8px 0', overflowWrap: 'anywhere' }}>
-                  {formatCurrency(kpis.tvaCollectee)} − {formatCurrency(kpis.tvaDeductible)}
-                </div>
-                <div style={{ fontSize: 13, opacity: 0.85, fontWeight: 500 }}>
-                  = <strong>{formatCurrency(Math.abs(kpis.tvaNette))}</strong>{' '}
-                  {kpis.tvaNette >= 0 ? 'à reverser' : 'de crédit TVA'}
-                </div>
-                <div style={{ marginTop: 12, fontSize: 11, opacity: 0.65 }}>
-                  Détail complet dans l&apos;onglet TVA →
-                </div>
-              </div>
             </div>
 
-            {/* ── SECTION 4 : Tendances ────────────────────────────────────── */}
-            <SectionHeader title="Tendances & Évolution" subtitle="Visualisation de votre activité dans le temps" icon={<TrendingUp size={18} />} />
+            {/* ── Simulateur (replié) ──────────────────────────────────────── */}
+            <div className="card" style={{
+              marginBottom: 24,
+              border: isSimulationActive ? '1.5px solid var(--orange)' : '1px solid var(--border)',
+              padding: showSim ? 20 : '12px 16px',
+            }}>
+              <button
+                type="button"
+                onClick={() => setShowSim(v => !v)}
+                style={{
+                  width: '100%', background: 'none', border: 'none', cursor: 'pointer', padding: 0,
+                  display: 'flex', alignItems: 'center', gap: 10, textAlign: 'left', font: 'inherit', color: 'inherit',
+                }}
+                aria-expanded={showSim}
+              >
+                <Zap size={18} style={{ color: isSimulationActive ? 'var(--orange)' : 'var(--teal)', flexShrink: 0 }} />
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ fontSize: 14, fontWeight: 700, display: 'block' }}>
+                    Simuler une variation de charges
+                    {isSimulationActive && <span style={{ color: 'var(--orange)', fontWeight: 600, marginLeft: 8, fontSize: 12 }}>simulation active</span>}
+                  </span>
+                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    « Et si la masse salariale passait à 30 % ? » — l&apos;EBE se recalcule, les cartes ci-dessus suivent.
+                  </span>
+                </span>
+                {showSim ? <ChevronUp size={18} style={{ color: 'var(--text-muted)' }} /> : <ChevronDown size={18} style={{ color: 'var(--text-muted)' }} />}
+              </button>
 
+              {showSim && (
+                <div className="grid-2-1" style={{ gap: 20, marginTop: 18 }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                    {(['labor', 'food', 'fixed', 'stock'] as SimKey[]).map(key => (
+                      <SimulatorField
+                        key={key}
+                        simKey={key}
+                        sim={sim[key]}
+                        realPercent={realValues[key].percent}
+                        realEuro={realValues[key].euro}
+                        onValueChange={v => setSimValue(key, v)}
+                        onModeChange={m => setSimMode(key, m)}
+                      />
+                    ))}
+                    {isSimulationActive && (
+                      <button className="btn btn-ghost btn-sm" style={{ alignSelf: 'flex-start', fontSize: 12, color: 'var(--red)' }} onClick={() => setSim(EMPTY_SIM)}>
+                        Réinitialiser
+                      </button>
+                    )}
+                  </div>
+
+                  <div style={{
+                    background: 'var(--cream-light)', border: '1px solid var(--border-light)', borderRadius: 16, padding: 18,
+                    display: 'flex', flexDirection: 'column', gap: 10, fontSize: 13,
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: 'var(--text-secondary)' }}>EBE réel</span>
+                      <strong>{formatPercent(kpis.margeNette)} ({formatCurrency(kpis.margeNetteAmt)})</strong>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px dashed var(--border)', paddingBottom: 8 }}>
+                      <span style={{ color: 'var(--text-secondary)' }}>EBE simulé</span>
+                      <strong style={{ color: displayMargeNetteRatio >= 15 ? 'var(--green)' : displayMargeNetteRatio >= 10 ? 'var(--orange)' : 'var(--red)' }}>
+                        {formatPercent(displayMargeNetteRatio)} ({formatCurrency(displayMargeNetteAmt)})
+                      </strong>
+                    </div>
+                    {(() => {
+                      const diff = displayMargeNetteAmt - kpis.margeNetteAmt;
+                      if (Math.abs(diff) < 0.01) return <span style={{ color: 'var(--text-muted)', fontSize: 12.5 }}>Aucun écart avec le réel.</span>;
+                      return (
+                        <span style={{ fontWeight: 700, color: diff > 0 ? 'var(--green)' : 'var(--red)' }}>
+                          {diff > 0 ? '+' : '−'}{formatCurrency(Math.abs(diff))} HT sur la période
+                        </span>
+                      );
+                    })()}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* ── Évolution ────────────────────────────────────────────────── */}
             <ChartCard
-              title="Évolution du Chiffre d'Affaires"
-              subtitle="CA journalier sur la période sélectionnée"
+              title="Chiffre d'affaires par jour"
+              subtitle="TTC, sur la période ; la ligne pointillée est la moyenne"
               headerRight={
                 <div style={{ textAlign: 'right' }}>
                   <div style={{ fontSize: 20, fontWeight: 800, color: 'var(--teal)' }}>{formatCurrency(kpis.caTotal)}</div>
@@ -917,7 +806,7 @@ export default function DashboardPage() {
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" vertical={false} />
                     <XAxis dataKey="date" tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} />
-                    <YAxis tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} tickFormatter={v => `${v}€`} />
+                    <YAxis tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} tickFormatter={v => `${v}€`} width={48} />
                     <Tooltip content={<CurrencyTooltip />} />
                     <Area type="monotone" dataKey="ca" name="CA (€)" fill="url(#caGradient)" stroke="#2A7D7B" strokeWidth={2.5} dot={false} />
                     {kpis.caTotal > 0 && (
@@ -933,135 +822,7 @@ export default function DashboardPage() {
               </div>
             </ChartCard>
 
-            <div className="grid-2" style={{ marginBottom: 14 }}>
-              <ChartCard title="Top Produits" subtitle="Par quantité vendue" style={{ marginBottom: 0 }}>
-                {kpis.topProduits.length > 0 ? (
-                  <div style={{ height: 220 }}>
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={kpis.topProduits} layout="vertical" margin={{ top: 0, right: 10, bottom: 0, left: 0 }}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" horizontal={false} />
-                        <XAxis type="number" tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} />
-                        <YAxis dataKey="name" type="category" width={110} tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} />
-                        <Tooltip />
-                        <Bar dataKey="quantity" name="Qté vendue" fill="#2A7D7B" radius={[0, 6, 6, 0]} />
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </div>
-                ) : (
-                  <EmptyState text="Aucune donnée produit" />
-                )}
-              </ChartCard>
-
-              <ChartCard title="Achats par Catégorie" subtitle="Répartition des dépenses HT" style={{ marginBottom: 0 }}>
-                {kpis.achatsParCategorie.length > 0 ? (
-                  <>
-                    <div style={{ height: 180 }}>
-                      <ResponsiveContainer width="100%" height="100%">
-                        <BarChart data={kpis.achatsParCategorie} margin={{ top: 0, right: 10, bottom: 0, left: 0 }}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" vertical={false} />
-                          <XAxis dataKey="name" tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} />
-                          <YAxis tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} tickFormatter={v => `${v}€`} />
-                          <Tooltip formatter={(v: any) => formatCurrency(v)} />
-                          <Bar dataKey="value" name="Montant HT" radius={[6, 6, 0, 0]}>
-                            {kpis.achatsParCategorie.map((_, i) => (
-                              <Cell key={i} fill={CAT_COLORS[i % CAT_COLORS.length]} />
-                            ))}
-                          </Bar>
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
-                      {kpis.achatsParCategorie.map((c, i) => {
-                        const total = kpis.achatsParCategorie.reduce((s, x) => s + x.value, 0);
-                        return (
-                          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
-                            <div style={{ width: 10, height: 10, borderRadius: 3, background: CAT_COLORS[i % CAT_COLORS.length] }} />
-                            <span style={{ color: 'var(--text-secondary)' }}>{c.name}</span>
-                            <strong>{total > 0 ? ((c.value / total) * 100).toFixed(0) : 0}%</strong>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </>
-                ) : (
-                  <EmptyState text="Aucune facture sur cette période" />
-                )}
-              </ChartCard>
-            </div>
-
-            {kpis.achatsParFournisseur.length > 0 && (
-              <ChartCard title="Achats par Fournisseur" subtitle="Volume d'achats HT – Top 6">
-                <div style={{ height: 200 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={kpis.achatsParFournisseur} layout="vertical" margin={{ top: 0, right: 10, bottom: 0, left: 0 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" horizontal={false} />
-                      <XAxis type="number" tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} tickFormatter={v => `${v}€`} />
-                      <YAxis dataKey="name" type="category" width={120} tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} />
-                      <Tooltip formatter={(v: any) => formatCurrency(v)} />
-                      <Bar dataKey="value" name="Achats HT" fill="#E89B3E" radius={[0, 6, 6, 0]} />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              </ChartCard>
-            )}
-
-            {/* ── SECTION 5 : Marge par recette ───────────────────────────── */}
-            {kpis.margeParRecette.length > 0 && (
-              <>
-                <SectionHeader title="Rentabilité par Recette" subtitle="Food cost et marge par plat" icon={<Star size={18} />} />
-                <ChartCard title="Marges brutes" subtitle="Basées sur les fiches techniques et les derniers prix d'achat" style={{ marginBottom: 24 }}>
-                  <div className="table-container" style={{ border: 'none' }}>
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Recette</th>
-                          <th style={{ textAlign: 'right' }}>Prix vente</th>
-                          <th style={{ textAlign: 'right' }}>Coût matière</th>
-                          <th style={{ textAlign: 'right' }}>Food cost</th>
-                          <th style={{ textAlign: 'right' }}>Marge brute</th>
-                          <th>Statut</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {kpis.margeParRecette.map(r => {
-                          const fcBadRecipe = r.foodCost > FOOD_COST_TARGET;
-                          const margeGood = r.marge >= 68;
-                          return (
-                            <tr key={r.name}>
-                              <td style={{ fontWeight: 600 }}>{r.name}</td>
-                              <td style={{ textAlign: 'right' }}>{formatCurrency(r.sellingPrice)}</td>
-                              <td style={{ textAlign: 'right' }}>{formatCurrency(r.cost)}</td>
-                              <td style={{ textAlign: 'right' }}>
-                                <span className="badge" style={{
-                                  background: fcBadRecipe ? 'var(--red-light)' : 'var(--green-light)',
-                                  color: fcBadRecipe ? 'var(--red)' : 'var(--green)',
-                                  fontWeight: 700,
-                                }}>
-                                  {formatPercent(r.foodCost)}
-                                </span>
-                              </td>
-                              <td style={{ textAlign: 'right', fontWeight: 700, color: margeGood ? 'var(--green)' : r.marge < 60 ? 'var(--red)' : 'var(--text-primary)' }}>
-                                {formatPercent(r.marge)}
-                              </td>
-                              <td>
-                                <span className="badge" style={{
-                                  background: margeGood ? 'var(--green-light)' : r.marge < 60 ? 'var(--red-light)' : 'var(--orange-light)',
-                                  color: margeGood ? 'var(--green)' : r.marge < 60 ? 'var(--red)' : '#9A6B1F',
-                                }}>
-                                  {margeGood ? '⭐ Star' : r.marge < 60 ? '⚠ À revoir' : 'Correct'}
-                                </span>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                </ChartCard>
-              </>
-            )}
-
-            {/* ── SECTION 6 : Heatmap jours × services ────────────────────── */}
+            {/* ── Jours × services ─────────────────────────────────────────── */}
             {(() => {
               const hasDayData = ORDERED_DAYS.some(d => {
                 const ds = kpis.caByDayService[d];
@@ -1091,12 +852,14 @@ export default function DashboardPage() {
                     const sd = ds?.[service];
                     const avg = sd && sd.nbServices > 0 ? sd.totalCa / sd.nbServices : 0;
                     const intensity = maxAvg > 0 ? avg / maxAvg : 0;
+                    // Sous le point mort : le service ne couvre pas ses charges.
+                    const belowBreakEven = pointMortParService !== null && avg > 0 && (avg / 1.1) < pointMortParService;
                     return (
                       <div
                         key={d}
                         className="heatmap-cell"
-                        style={{ background: heatColor(intensity) }}
-                        title={ds ? `${d} ${label} — ${sd?.nbServices ?? 0} service(s), ${sd?.nbCommandes ?? 0} commandes` : ''}
+                        style={{ background: heatColor(intensity), outline: belowBreakEven ? '2px solid rgba(217,79,79,0.6)' : undefined, outlineOffset: -2 }}
+                        title={ds ? `${d} ${label} — ${sd?.nbServices ?? 0} service(s), ${sd?.nbCommandes ?? 0} commandes${belowBreakEven ? ' — sous le point mort' : ''}` : ''}
                       >
                         {avg > 0 ? (
                           <>
@@ -1117,122 +880,115 @@ export default function DashboardPage() {
               );
 
               return (
-                <>
-                  <SectionHeader
-                    title="Tendances CA par Jour & Service"
-                    subtitle="Moyenne de chiffre d'affaires par service — midi (avant 15h) vs soir (après 15h)"
-                    icon={<BarChart2 size={18} />}
-                  />
-                  <ChartCard
-                    title="Heatmap hebdomadaire"
-                    subtitle={`Basé sur ${Object.values(kpis.caByDayService).reduce((s, d) => s + d.midi.nbServices + d.soir.nbServices, 0)} services sur la période`}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16, flexWrap: 'wrap' }}>
-                      {[
-                        { alpha: 0.15, label: 'Faible CA' },
-                        { alpha: 0.55, label: 'CA moyen' },
-                        { alpha: 0.82, label: 'Fort CA' },
-                      ].map(({ alpha, label }) => (
-                        <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
-                          <div style={{ width: 16, height: 16, borderRadius: 4, background: `rgba(42,125,123,${alpha})` }} />
-                          <span>{label}</span>
-                        </div>
+                <ChartCard
+                  title="CA moyen par jour et par service"
+                  subtitle={`Midi (avant 15 h) et soir, moyenne par service ouvert — ${nbServices} services sur la période${pointMortParService !== null ? ' · contour rouge : sous le point mort' : ''}`}
+                >
+                  <div className="scroll-x">
+                    <div className="heatmap-grid">
+                      <div />
+                      {ORDERED_DAYS.map(d => (
+                        <div key={d} className="heatmap-day-header">{d.substring(0, 3).toUpperCase()}</div>
                       ))}
+                      {renderServiceRow('🌤 Midi', 'midi')}
+                      {renderServiceRow('🌙 Soir', 'soir')}
+                      <div className="heatmap-label" style={{ color: 'var(--teal)', fontWeight: 800 }}>∑ Jour</div>
+                      {ORDERED_DAYS.map(d => {
+                        const ds = kpis.caByDayService[d];
+                        const totalCa = (ds?.midi.totalCa || 0) + (ds?.soir.totalCa || 0);
+                        const days = Math.max(ds?.midi.nbServices || 0, ds?.soir.nbServices || 0);
+                        const avgDay = days > 0 ? totalCa / days : 0;
+                        return (
+                          <div key={d} style={{ borderTop: '1px solid var(--border-light)', paddingTop: 6, textAlign: 'center' }}>
+                            {avgDay > 0 ? (
+                              <>
+                                <div style={{ fontSize: 12, fontWeight: 800, color: 'var(--teal)' }}>{formatCurrency(avgDay, 0)}</div>
+                                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 1 }}>par jour</div>
+                              </>
+                            ) : (
+                              <div style={{ fontSize: 11, color: 'var(--text-muted)', opacity: 0.5 }}>—</div>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
-
-                    <div className="scroll-x">
-                      <div className="heatmap-grid">
-                        <div />
-                        {ORDERED_DAYS.map(d => (
-                          <div key={d} className="heatmap-day-header">{d.substring(0, 3).toUpperCase()}</div>
-                        ))}
-                        {renderServiceRow('🌤 Midi', 'midi')}
-                        {renderServiceRow('🌙 Soir', 'soir')}
-
-                        {/* Total par jour */}
-                        <div className="heatmap-label" style={{ color: 'var(--teal)', fontWeight: 800 }}>∑ Total</div>
-                        {ORDERED_DAYS.map(d => {
-                          const ds = kpis.caByDayService[d];
-                          const totalCa = (ds?.midi.totalCa || 0) + (ds?.soir.totalCa || 0);
-                          const totalServices = (ds?.midi.nbServices || 0) + (ds?.soir.nbServices || 0);
-                          const avgTotal = totalServices > 0 ? totalCa / totalServices : 0;
-                          return (
-                            <div key={d} style={{ borderTop: '1px solid var(--border-light)', paddingTop: 6, textAlign: 'center' }}>
-                              {avgTotal > 0 ? (
-                                <>
-                                  <div style={{ fontSize: 12, fontWeight: 800, color: 'var(--teal)' }}>
-                                    {formatCurrency(avgTotal, 0)}
-                                  </div>
-                                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 1 }}>moy/svc</div>
-                                </>
-                              ) : (
-                                <div style={{ fontSize: 11, color: 'var(--text-muted)', opacity: 0.5 }}>—</div>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    <div style={{ marginTop: 20, borderTop: '1px solid var(--border-light)', paddingTop: 16 }}>
-                      <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 12, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                        Comparaison CA moyen par jour
-                      </div>
-                      <div style={{ height: 160 }}>
-                        <ResponsiveContainer width="100%" height="100%">
-                          <BarChart
-                            data={ORDERED_DAYS.map(d => {
-                              const ds = kpis.caByDayService[d];
-                              return {
-                                name: d.substring(0, 3),
-                                Midi: ds && ds.midi.nbServices > 0 ? Math.round(ds.midi.totalCa / ds.midi.nbServices) : 0,
-                                Soir: ds && ds.soir.nbServices > 0 ? Math.round(ds.soir.totalCa / ds.soir.nbServices) : 0,
-                              };
-                            })}
-                            margin={{ top: 0, right: 10, bottom: 0, left: 0 }}
-                          >
-                            <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" vertical={false} />
-                            <XAxis dataKey="name" tick={{ fontSize: 12, fontWeight: 600 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} />
-                            <YAxis tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} tickFormatter={v => `${v}€`} />
-                            <Tooltip
-                              formatter={(v: any, name: any) => [formatCurrency(Number(v) || 0), name === 'Midi' ? '🌤 Midi' : '🌙 Soir'] as any}
-                              contentStyle={{ borderRadius: 10, border: '1px solid var(--border)', fontSize: 13 }}
-                            />
-                            <Bar dataKey="Midi" name="Midi" fill="#3A9D9B" radius={[4, 4, 0, 0]} />
-                            <Bar dataKey="Soir" name="Soir" fill="#1A5D5B" radius={[4, 4, 0, 0]} />
-                          </BarChart>
-                        </ResponsiveContainer>
-                      </div>
-                    </div>
-                  </ChartCard>
-                </>
+                  </div>
+                </ChartCard>
               );
             })()}
 
-            {/* ── Résumé de bas de page ────────────────────────────────────── */}
-            <div style={{
-              background: 'linear-gradient(135deg, var(--teal-bg) 0%, rgba(42,125,123,0.04) 100%)',
-              border: '1px solid var(--border-light)',
-              borderRadius: 16, padding: '16px 20px',
-              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-              flexWrap: 'wrap', gap: 12,
-            }}>
-              <div style={{ fontSize: 13, color: 'var(--text-secondary)', fontWeight: 500 }}>
-                Données synchronisées en temps réel · Square POS + Relevés bancaires + Fiches recettes
-              </div>
-              <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
-                {[
-                  { label: 'CA Période', value: formatCurrency(kpis.caTotal) },
-                  { label: 'TVA à payer', value: formatCurrency(Math.max(0, kpis.tvaNette)) },
-                  { label: 'Prime Cost', value: formatPercent(kpis.foodCost + kpis.ratioSalariale) },
-                ].map(({ label, value }) => (
-                  <div key={label} style={{ textAlign: 'center' }}>
-                    <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{label}</div>
-                    <div style={{ fontSize: 15, fontWeight: 800, color: 'var(--teal)' }}>{value}</div>
+            {/* ── Produits et achats ───────────────────────────────────────── */}
+            <div className="grid-2" style={{ marginBottom: 14 }}>
+              <ChartCard title="Produits les plus vendus" subtitle="Quantités sur la période" style={{ marginBottom: 0 }}>
+                {kpis.topProduits.length > 0 ? (
+                  <div style={{ height: 220 }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={kpis.topProduits} layout="vertical" margin={{ top: 0, right: 10, bottom: 0, left: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" horizontal={false} />
+                        <XAxis type="number" tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} />
+                        <YAxis dataKey="name" type="category" width={110} tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} />
+                        <Tooltip />
+                        <Bar dataKey="quantity" name="Qté vendue" fill="#2A7D7B" radius={[0, 6, 6, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
                   </div>
-                ))}
-              </div>
+                ) : (
+                  <EmptyState text="Aucune vente sur la période" />
+                )}
+              </ChartCard>
+
+              <ChartCard title="Achats par catégorie" subtitle="HT, d'après les factures scannées" style={{ marginBottom: 0 }}>
+                {kpis.achatsParCategorie.length > 0 ? (
+                  <>
+                    <div style={{ height: 180 }}>
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={kpis.achatsParCategorie} margin={{ top: 0, right: 10, bottom: 0, left: 0 }}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" vertical={false} />
+                          <XAxis dataKey="name" tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} />
+                          <YAxis tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} tickFormatter={v => `${v}€`} width={48} />
+                          <Tooltip formatter={(v: any) => formatCurrency(v)} />
+                          <Bar dataKey="value" name="Montant HT" radius={[6, 6, 0, 0]}>
+                            {kpis.achatsParCategorie.map((_, i) => (
+                              <Cell key={i} fill={CAT_COLORS[i % CAT_COLORS.length]} />
+                            ))}
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
+                      {kpis.achatsParCategorie.map((c, i) => {
+                        const total = kpis.achatsParCategorie.reduce((s, x) => s + x.value, 0);
+                        return (
+                          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+                            <div style={{ width: 10, height: 10, borderRadius: 3, background: CAT_COLORS[i % CAT_COLORS.length] }} />
+                            <span style={{ color: 'var(--text-secondary)' }}>{c.name}</span>
+                            <strong>{total > 0 ? ((c.value / total) * 100).toFixed(0) : 0}%</strong>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <EmptyState text="Aucune facture scannée sur la période" />
+                )}
+              </ChartCard>
             </div>
+
+            {kpis.achatsParFournisseur.length > 0 && (
+              <ChartCard title="Achats par fournisseur" subtitle="HT, les six premiers">
+                <div style={{ height: 200 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={kpis.achatsParFournisseur} layout="vertical" margin={{ top: 0, right: 10, bottom: 0, left: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" horizontal={false} />
+                      <XAxis type="number" tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} tickFormatter={v => `${v}€`} />
+                      <YAxis dataKey="name" type="category" width={120} tick={{ fontSize: 11 }} stroke="var(--text-muted)" axisLine={false} tickLine={false} />
+                      <Tooltip formatter={(v: any) => formatCurrency(v)} />
+                      <Bar dataKey="value" name="Achats HT" fill="#E89B3E" radius={[0, 6, 6, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </ChartCard>
+            )}
           </>
         )}
       </div>

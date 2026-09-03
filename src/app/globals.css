@@ -261,6 +261,7 @@ body {
 /* ─── Main Content ────────────────────────────────────────────────────────── */
 .main-content {
   flex: 1;
+  min-width: 0; /* évite que le contenu (tables, graphiques) élargisse la page */
   margin-left: var(--sidebar-width);
   min-height: 100vh;
   min-height: 100dvh;
@@ -286,7 +287,13 @@ body {
 .page-header h2 { font-size: 20px; font-weight: 700; color: var(--text-primary); }
 .page-header-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
-.page-body { padding: 24px 28px; flex: 1; }
+.page-body { padding: 24px 28px; flex: 1; min-width: 0; }
+
+/* Les enfants de grille ont min-width:auto par défaut : une table ou un graphique
+   plus large que sa colonne fait alors déborder toute la page. */
+.grid-2 > *, .grid-3 > *, .grid-4 > *, .grid-2-1 > *,
+.kpi-grid > *, .kpi-grid-auto > *, .cca-kpi-grid > * { min-width: 0; }
+.card, .chart-card { min-width: 0; }
 
 /* ─── Cards ───────────────────────────────────────────────────────────────── */
 .card {
@@ -468,7 +475,8 @@ tr:hover td { background: var(--teal-bg); }
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   scrollbar-width: none;
-  flex-shrink: 0;
+  min-width: 0;
+  max-width: 100%;
 }
 .period-selector::-webkit-scrollbar { display: none; }
 

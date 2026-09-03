@@ -165,7 +165,7 @@ export async function GET() {
 
   // Bucket de stockage
   const { data: buckets, error: bucketsErr } = await supabase.storage.listBuckets();
-  results.bucket_invoice_files_exists = buckets?.some(b => b.name === 'invoice-files') ?? false;
+  results.bucket_invoice_files_exists = Array.isArray(buckets) && buckets.some(b => b.name === 'invoice-files');
   if (bucketsErr) results.buckets_error = bucketsErr.message;
 
   // Test d'upload (PNG 1×1 transparent)
