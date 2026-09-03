@@ -24,6 +24,7 @@
 
 import { SupabaseClient } from '@supabase/supabase-js';
 import { unmatchedDesignations } from '@/lib/referentiel';
+import { inventorySessions, sessionAtBoundary } from '@/lib/cogs';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { foldLabel, isFinancialFlow, round2 } from './accounting';
 import { computeTva, TvaResult } from './tva';
@@ -147,6 +148,11 @@ export interface InterventionFacts {
    * Le bouton n'existe plus ; elles sont réintégrées, et il faut les relire.
    */
   legacyMaskedItems: number;
+  /**
+   * Inventaire physique disponible pour la borne de FIN de la période (à
+   * moins de 7 jours). Sans lui, le coût matières n'est qu'un cumul d'achats.
+   */
+  inventoryClosing: { found: boolean; day: string | null };
 }
 
 const SEVERITY_RANK: Record<Severity, number> = {
@@ -637,6 +643,32 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     });
   }
 
+  // ── 17. Pas d'inventaire en fin de période ────────────────────────────────
+  // Sans inventaire aux bornes, le coût matières est « achats ÷ CA » : une
+  // grosse commande le 30 gonfle le mois et flatte le suivant. On ne réclame
+  // un inventaire que pour une période d'au moins un mois déjà écoulée, avec
+  // des achats dedans : un inventaire hebdomadaire serait du bruit.
+  if (
+    !f.inventoryClosing.found
+    && f.end < f.today
+    && daysBetween(f.start, f.end) >= 27
+    && f.debitsCount > 0
+  ) {
+    out.push({
+      id: 'inventaire-fin-de-periode',
+      severity: 'a_verifier',
+      title: `Pas d'inventaire autour du ${jour(f.end)}`,
+      impact:
+        `Sans stock de fin de période, le coût matières affiché est la somme des achats, ` +
+        `pas ce qui a été consommé : une commande passée le 30 compte dans ce mois ` +
+        `alors qu'elle sera vendue le mois suivant. Le food cost n'est alors pas comparable ` +
+        `d'un mois à l'autre.`,
+      action: 'Compte les produits qui pèsent le plus (farine, mozzarella, tomate, viandes) au tournant du mois.',
+      href: '/stock',
+      hrefLabel: 'Stock → Faire l\'inventaire',
+    });
+  }
+
   // Tri par gravité uniquement. `sort` étant stable, l'ordre de déclaration
   // ci-dessus est conservé à l'intérieur d'une gravité — et cet ordre est
   // délibéré : c'est l'ordre CAUSAL. La caisse d'abord, puis le chiffre
@@ -678,7 +710,7 @@ export async function collectInterventionFacts(
   // tronque à 1 000 lignes sans le dire. Sur un exercice de 1 788 commandes, ce
   // module comparait les versements bancaires à un CA amputé de 44 % — et
   // annonçait « des ventes manquantes » en désignant la mauvaise cause.
-  const [orders, lastRes, firstRes, bank, invoices, suppliers, cca, trips, tva, foodLines, ingredients, aliases, maskedRes] =
+  const [orders, lastRes, firstRes, bank, invoices, suppliers, cca, trips, tva, foodLines, ingredients, aliases, maskedRes, counts] =
     await Promise.all([
       fetchAllRows<any>((f0, f1) => supabase.from('square_orders')
         .select('service, net_amount, raw_data')
@@ -716,6 +748,9 @@ export async function collectInterventionFacts(
         .select('alias, ingredient_id').range(f0, f1)),
       // Bornée par construction : une clé de réglage.
       supabase.from('app_settings').select('value').eq('key', 'masked_items').limit(1),
+      fetchAllRows<{ ingredient_id: string; quantity: number | null; unit_price: number | null; counted_at: string }>(
+        (f0, f1) => supabase.from('inventory_counts')
+          .select('ingredient_id, quantity, unit_price, counted_at').range(f0, f1)),
     ]);
 
   let caSquareTtc = 0;
@@ -784,6 +819,9 @@ export async function collectInterventionFacts(
   // ── Mercuriale : désignations orphelines ─────────────────────────────────
   const orphans = unmatchedDesignations(foodLines, ingredients, aliases);
 
+  // ── Inventaire de fin de période ─────────────────────────────────────────
+  const closingSession = sessionAtBoundary(inventorySessions(counts), end);
+
   // ── P&L : écritures autrefois masquées ───────────────────────────────────
   let legacyMaskedItems = 0;
   try {
@@ -837,5 +875,6 @@ export async function collectInterventionFacts(
       sample: orphans.slice(0, 5).map(o => o.designation),
     },
     legacyMaskedItems,
+    inventoryClosing: { found: !!closingSession, day: closingSession?.day ?? null },
   };
 }

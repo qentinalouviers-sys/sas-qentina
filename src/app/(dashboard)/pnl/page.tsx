@@ -7,6 +7,7 @@ import { formatCurrency, formatPercent, getDateRange, toISODate, formatDate } fr
 import {
   isFinancialFlow, orderHtAmount, bankAmountHt, makeInvoiceMatcher,
 } from '@/lib/accounting';
+import { inventorySessions, computeCogs, type CogsResult } from '@/lib/cogs';
 import {
   TrendingUp,
   DollarSign,
@@ -119,10 +120,12 @@ export default function PnlPage() {
     purchasesMateriel: 0,
     purchasesAutreInvoices: 0,
     bankSuppliersUnreconciled: 0,
-    totalCogs: 0, // Cost of Goods Sold (Matières)
+    totalCogs: 0, // Coût matières CONSOMMÉ (achats ± variation de stock)
+    achatsHt: 0,       // achats de la période, avant variation de stock
     cogsFactures: 0,   // ventilé ligne à ligne : exact
     cogsBanque: 0,     // paiements sans détail : majorant
     partBanquePercent: 0,
+    cogs: null as CogsResult | null,
     
     // Personnel
     laborTimecards: 0,
@@ -181,6 +184,7 @@ export default function PnlPage() {
         timecards,
         bankSalaries,
         fixedTx,
+        inventoryCounts,
       ] = await Promise.all([
         // A. IDs masqués depuis app_settings
         supabase
@@ -249,6 +253,11 @@ export default function PnlPage() {
           .gte('date', startStr)
           .lte('date', endStr)
           .order('date', { ascending: false })
+          .range(f0, f1)),
+        // Inventaires : pour passer des achats au coût matières consommé.
+        fetchAllRows<{ ingredient_id: string; quantity: number | null; unit_price: number | null; counted_at: string }>((f0, f1) => supabase
+          .from('inventory_counts')
+          .select('ingredient_id, quantity, unit_price, counted_at')
           .range(f0, f1)),
       ]);
 
@@ -343,8 +352,18 @@ export default function PnlPage() {
       // fiabilité ne vaut pas mieux qu'une absence de ratio.
       const cogsFactures = purchasesAlim + purchasesBoisson + purchasesEmballage;
       const cogsBanque = bankSuppliersUnreconciled;
-      const totalCogs = cogsFactures + cogsBanque;
-      const partBanquePercent = totalCogs > 0 ? (cogsBanque / totalCogs) * 100 : 0;
+      const achatsHt = cogsFactures + cogsBanque;
+      const partBanquePercent = achatsHt > 0 ? (cogsBanque / achatsHt) * 100 : 0;
+
+      // Coût matières CONSOMMÉ = stock initial + achats − stock final. Quand
+      // deux inventaires encadrent la période ; sinon les achats, et on le dit.
+      const cogs = computeCogs({
+        purchases: achatsHt,
+        sessions: inventorySessions(inventoryCounts),
+        start: startStr,
+        end: endStr,
+      });
+      const totalCogs = cogs.cogs;
 
       // 3. Masse Salariale
       // Timecards (Salaires théoriques)
@@ -419,9 +438,11 @@ export default function PnlPage() {
         purchasesAutreInvoices,
         bankSuppliersUnreconciled,
         totalCogs,
+        achatsHt,
         cogsFactures,
         cogsBanque,
         partBanquePercent,
+        cogs,
         laborTimecards,
         laborBank,
         activeLabor,
@@ -890,6 +911,11 @@ export default function PnlPage() {
                 </div>
                 <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
                   Food Cost % : <strong>{formatPercent(calculateRatio(data.totalCogs))}</strong>
+                  <div style={{ marginTop: 3, color: data.cogs?.method === 'inventaire' ? 'var(--green)' : 'var(--text-muted)' }}>
+                    {data.cogs?.method === 'inventaire'
+                      ? `mesuré : inventaires du ${formatDate(data.cogs.opening!.day)} et du ${formatDate(data.cogs.closing!.day)}`
+                      : 'sur achats — pas d\'inventaire aux bornes'}
+                  </div>
                   {data.partBanquePercent >= 10 && (
                     <div style={{ marginTop: 3, color: 'var(--orange)' }}>
                       dont {formatPercent(data.partBanquePercent)} sans détail — majorant
@@ -1055,14 +1081,14 @@ export default function PnlPage() {
 
                     {/* SECTION 2: COUT MATIERES */}
                     <tr style={{ background: 'var(--cream-light)', fontWeight: 700 }}>
-                      <td style={{ color: 'var(--orange)' }}>2. COÛTS VARIABLES (ACHATS MATIÈRES)</td>
+                      <td style={{ color: 'var(--orange)' }}>2. COÛT MATIÈRES CONSOMMÉ</td>
                       <td style={{ textAlign: 'right', color: 'var(--orange)' }}>
                         {formatCurrency(data.totalCogs)}
                       </td>
                       <td style={{ textAlign: 'right', color: 'var(--orange)' }}>
                         {formatPercent(calculateRatio(data.totalCogs))}
                       </td>
-                      <td>Food Cost global</td>
+                      <td>{data.cogs?.method === 'inventaire' ? 'Achats ± variation de stock' : 'Achats de la période (pas d\'inventaire aux bornes)'}</td>
                     </tr>
                     <PnlRow
                       label="Achats Alimentaires"
@@ -1096,6 +1122,33 @@ export default function PnlPage() {
                       note="Sans facture : contenu inconnu, matériel compris (cliquer pour voir)"
                       onClick={() => openDetail('bank_suppliers_unreconciled')}
                     />
+
+                    {/* Variation de stock : ce qui a été acheté mais pas consommé
+                        (ou consommé sur le stock du mois précédent). Signe
+                        comptable : un stock qui grossit RÉDUIT le coût consommé. */}
+                    {data.cogs?.method === 'inventaire' && (
+                      <tr className="interactive-row">
+                        <td style={{ paddingLeft: 32 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <Eye size={12} style={{ color: 'var(--orange)' }} /> Variation de stock
+                          </div>
+                        </td>
+                        <td style={{ textAlign: 'right', color: data.cogs.stockVariation > 0 ? 'var(--green)' : 'var(--red)' }}>
+                          {data.cogs.stockVariation > 0 ? '−' : '+'}{formatCurrency(Math.abs(data.cogs.stockVariation))}
+                        </td>
+                        <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>{formatPercent(calculateRatio(-data.cogs.stockVariation))}</td>
+                        <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                          Stock {formatCurrency(data.cogs.opening!.value)} le {formatDate(data.cogs.opening!.day)} → {formatCurrency(data.cogs.closing!.value)} le {formatDate(data.cogs.closing!.day)}, sur {data.cogs.commonProducts} produits comptés aux deux dates
+                        </td>
+                      </tr>
+                    )}
+                    {data.cogs && data.cogs.method === 'achats' && data.achatsHt > 0 && (
+                      <tr>
+                        <td colSpan={4} style={{ padding: '8px 16px 8px 32px', fontSize: 12, color: 'var(--text-muted)' }}>
+                          Coût matières calculé sur les achats : {data.cogs.reason} Un inventaire au tournant du mois le transformerait en consommation réelle.
+                        </td>
+                      </tr>
+                    )}
 
                     {/* Le food cost ne vaut que ce que vaut son détail. Tant
                         qu'une part vient de virements bruts, c'est un plafond,

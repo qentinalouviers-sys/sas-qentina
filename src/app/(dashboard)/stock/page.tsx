@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate, downloadCSV } from '@/lib/utils';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
+import { inventorySessions } from '@/lib/cogs';
 import { UNITS } from '@/lib/recipes';
 import {
   Package, Search, Save, Download, CheckCircle2, Clock,
@@ -191,16 +192,13 @@ export default function StockPage() {
       };
     });
 
-    // Historique : un inventaire par jour de comptage, valorisé au prix saisi ce jour-là
-    const byDay = new Map<string, InventorySession>();
-    for (const ic of inventoryCounts) {
-      const day = String(ic.counted_at).slice(0, 10);
-      const session = byDay.get(day) ?? { day, products: 0, valorisation: 0 };
-      session.products++;
-      session.valorisation += (ic.quantity || 0) * (ic.unit_price || 0);
-      byDay.set(day, session);
-    }
-    setHistory([...byDay.values()].sort((a, b) => b.day.localeCompare(a.day)));
+    // Historique : un inventaire par jour de comptage, valorisé au prix saisi
+    // ce jour-là. Même regroupement que le coût matières (lib/cogs.ts) : ce
+    // que cette page appelle « inventaire du 30 juin » est exactement ce que le
+    // P&L prend comme stock de fin de mois.
+    setHistory(inventorySessions(inventoryCounts).map(sess => ({
+      day: sess.day, products: sess.products, valorisation: sess.valorisation,
+    })));
 
     setStockData(rows);
     setLoading(false);

@@ -30,6 +30,7 @@ import {
   repairMojibake, normalizeName, findSupplierMatch, matchIngredient, unmatchedDesignations,
 } from '../src/lib/referentiel.ts';
 import { checkCcaOperation, firstDebitDay } from '../src/lib/cca.ts';
+import { inventorySessions, sessionAtBoundary, computeCogs } from '../src/lib/cogs.ts';
 
 /**
  * Faux client Supabase, qui applique réellement les filtres utilisés.
@@ -255,6 +256,7 @@ const faits = (o = {}) => ({
   tripsNotInCca: { count: 0 },
   unmatchedDesignations: { count: 0, sample: [] },
   legacyMaskedItems: 0,
+  inventoryClosing: { found: true, day: '2026-06-30' },
   ...o,
 });
 
@@ -880,6 +882,60 @@ verifie('remboursement postérieur au creux : accepté quand même',
 console.log('\n── P&L : écritures ex-masquées ──');
 declenche('écritures autrefois masquées → à relire', { legacyMaskedItems: 3 }, 'ecritures-ex-masquees');
 silence('rien de masqué : silence', { legacyMaskedItems: 0 }, 'ecritures-ex-masquees');
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Coût matières : achats ± variation de stock
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Coût matières ──');
+
+const COMPTAGES = [
+  // Inventaire du 31 mai : farine 100 kg à 1 €, mozza 20 kg à 8 €
+  { ingredient_id: 'farine', quantity: 100, unit_price: 1, counted_at: '2026-05-31T20:00:00Z' },
+  { ingredient_id: 'mozza',  quantity: 20,  unit_price: 8, counted_at: '2026-05-31T20:05:00Z' },
+  // Deux saisies le même soir : la dernière l'emporte
+  { ingredient_id: 'mozza',  quantity: 25,  unit_price: 8, counted_at: '2026-05-31T20:30:00Z' },
+  // Inventaire du 30 juin : farine 60 kg, mozza 25 kg, et un produit nouveau
+  { ingredient_id: 'farine', quantity: 60,  unit_price: 1, counted_at: '2026-06-30T21:00:00Z' },
+  { ingredient_id: 'mozza',  quantity: 25,  unit_price: 8, counted_at: '2026-06-30T21:02:00Z' },
+  { ingredient_id: 'huile',  quantity: 10,  unit_price: 5, counted_at: '2026-06-30T21:04:00Z' },
+];
+const SESSIONS = inventorySessions(COMPTAGES);
+verifie('deux journées d\'inventaire', SESSIONS.length, 2);
+verifie('la plus récente d\'abord', SESSIONS[0].day, '2026-06-30');
+verifie('la dernière saisie du soir l\'emporte (mozza 25)', SESSIONS[1].items.get('mozza').quantity, 25);
+verifie('valorisation du 31 mai : 100 + 200', SESSIONS[1].valorisation, 300);
+verifie('valorisation du 30 juin : 60 + 200 + 50', SESSIONS[0].valorisation, 310);
+
+verifie('borne 30/06 → inventaire du 30/06', sessionAtBoundary(SESSIONS, '2026-06-30')?.day, '2026-06-30');
+verifie('borne 03/07 (3 jours) → inventaire du 30/06', sessionAtBoundary(SESSIONS, '2026-07-03')?.day, '2026-06-30');
+verifie('borne 15/07 (15 jours) → aucun', sessionAtBoundary(SESSIONS, '2026-07-15'), null);
+
+const juin = computeCogs({ purchases: 1000, sessions: SESSIONS, start: '2026-06-01', end: '2026-06-30' });
+verifie('juin : méthode inventaire', juin.method, 'inventaire');
+verifie('variation sur les produits communs (farine −40, mozza 0) = −40', juin.stockVariation, -40);
+verifie('l\'huile, comptée une seule fois, n\'entre pas', juin.commonProducts, 2);
+verifie('consommé = achats − variation = 1000 + 40', juin.cogs, 1040);
+verifie('stock initial = inventaire du 31/05', juin.opening?.day, '2026-05-31');
+
+const juillet = computeCogs({ purchases: 900, sessions: SESSIONS, start: '2026-07-01', end: '2026-07-31' });
+verifie('juillet sans inventaire de fin : repli achats', juillet.method, 'achats');
+verifie('repli : cogs = achats', juillet.cogs, 900);
+verifie('repli expliqué', typeof juillet.reason, 'string');
+
+const semaine = computeCogs({ purchases: 200, sessions: SESSIONS, start: '2026-06-28', end: '2026-06-30' });
+verifie('période courte : un seul inventaire aux deux bornes → repli', semaine.method, 'achats');
+
+verifie('aucun comptage → repli', computeCogs({ purchases: 10, sessions: [], start: '2026-06-01', end: '2026-06-30' }).method, 'achats');
+
+declenche('mois écoulé sans inventaire de fin → à vérifier',
+  { inventoryClosing: { found: false, day: null } }, 'inventaire-fin-de-periode');
+silence('inventaire présent : silence',
+  { inventoryClosing: { found: true, day: '2026-06-30' } }, 'inventaire-fin-de-periode');
+silence('mois en cours : on ne réclame pas encore',
+  { inventoryClosing: { found: false, day: null }, end: '2026-07-31', today: '2026-07-10' }, 'inventaire-fin-de-periode');
+silence('une semaine : pas d\'inventaire hebdomadaire réclamé',
+  { inventoryClosing: { found: false, day: null }, start: '2026-06-22', end: '2026-06-28' }, 'inventaire-fin-de-periode');
 
 console.log(`\n${echecs === 0 ? '✓ Tous les contrôles comptables passent.' : `✗ ${echecs} contrôle(s) en échec.`}\n`);
 process.exit(echecs === 0 ? 0 : 1);
