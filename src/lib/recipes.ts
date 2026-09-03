@@ -1,7 +1,7 @@
 /**
  * recipes.ts — Calcul du coût des recettes (source de vérité unique).
  * Avant : convertQuantity/calcRecipeCost existaient en 5 exemplaires
- * (fiches-techniques ×4, menu-engineering ×1), sans protection anti-cycle.
+ * (fiches-techniques ×4, ancien menu engineering ×1), sans protection anti-cycle.
  */
 
 /** Unités proposées dans toute l'application (une seule liste). */

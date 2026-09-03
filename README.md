@@ -1,8 +1,11 @@
 # 🍕 QENTINA — Pilotage de pizzeria
 
-SaaS de gestion pour pizzeria napolitaine : ventes Square, scanner de factures par IA,
-banque, TVA, P&L, comptes d'associés, stock, fiches techniques, menu engineering,
-avis Google et assistant IA « Fuego ».
+Outil de pilotage et de comptabilité pour pizzeria napolitaine : ventes Square, scanner
+de factures par IA, banque, TVA, P&L, comptes d'associés, frais kilométriques, inventaire,
+fiches techniques et assistant IA « Fuego ».
+
+Il n'affiche que ce qu'il sait mesurer. Un chiffre qui ne peut pas être juste n'est
+pas affiché ; une donnée qui entre en base sans qu'un humain l'ait relue n'entre pas.
 
 > 📋 **Nouveau ici ?** Lis [`AUDIT.md`](./AUDIT.md) : il explique l'architecture, les choix
 > et tout ce qui a été corrigé lors de la grande révision d'août 2026.
@@ -12,8 +15,8 @@ avis Google et assistant IA « Fuego ».
 - **Next.js 16** (App Router, `proxy.ts` pour l'auth) + React 19 + TypeScript strict
 - **Supabase** : base Postgres + Auth + Storage (fichiers de factures)
 - **Square** : source des ventes et **référence du chiffre d'affaires** (synchro nocturne automatique + webhook temps réel)
-- **Anthropic Claude** : OCR de factures/relevés, audits, chat Fuego
-- **Google** : avis (Places API) + réponses (My Business API, OAuth)
+- **Google Gemini** : OCR des factures (le poste IA le plus coûteux, au tarif le plus bas)
+- **Anthropic Claude** : catégorisation bancaire, audits, chat Fuego
 
 ## Démarrage
 
@@ -40,8 +43,6 @@ npm run dev
 | `SQUARE_LOCATION_ID` | Identifiant du point de vente Square |
 | `SQUARE_WEBHOOK_SECRET` | **Important** : secret de signature du webhook (Square Developer Dashboard) |
 | `NEXT_PUBLIC_APP_URL` | URL publique de l'app (ex. `https://…vercel.app`) |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OAuth Google Business (réponses aux avis) |
-| `GOOGLE_PLACES_API_KEY` / `GOOGLE_PLACE_ID` | Lecture des avis Google |
 | `CRON_SECRET` | **Obligatoire** : authentifie la synchro Square nocturne. Absente, elle refuse de tourner |
 
 ### Moteur d'OCR des factures
@@ -241,15 +242,16 @@ une cause qui n'existe pas.
 src/
 ├── proxy.ts                  # Auth globale (pages → redirect, API → 401) + rôle comptable
 ├── app/
-│   ├── (dashboard)/          # Les 15 pages de l'application (accueil = module « À faire »)
+│   ├── (dashboard)/          # Les 12 pages de l'application (accueil = module « À faire »)
 │   ├── api/
 │   │   ├── square/           # sync (rattrapage), webhook (signé HMAC), import-catalog
 │   │   ├── scanner/          # Analyse (étape 1) + confirm (étape 2) + health
 │   │   ├── bank/             # extract (relevé → transactions), recategorize (réapplique les règles)
 │   │   ├── cron/             # Travaux planifiés (synchro Square nocturne, CRON_SECRET)
-│   │   ├── ai/               # Insights ventes, audit stock, réponses aux avis
-│   │   ├── chat/             # Fuego (contexte chiffré du mois injecté)
-│   │   └── google/           # OAuth (state anti-CSRF) + avis
+│   │   ├── ai/               # Insights ventes, audit du référentiel ingrédients
+│   │   ├── suppliers/merge   # Fusion de deux fiches fournisseur
+│   │   ├── settings/ai       # Clés API des moteurs IA (chiffrées), test de clé
+│   │   └── chat/             # Fuego (contexte chiffré du mois injecté)
 │   └── globals.css           # Design system (variables, composants, responsive)
 ├── components/
 │   ├── ui.tsx                # KpiCard, Modal, ChartCard, PeriodSelector, etc.
