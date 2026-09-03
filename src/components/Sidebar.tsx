@@ -4,8 +4,8 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
   LayoutDashboard, FileText, ChefHat, Package, ShoppingCart,
-  Settings, LogOut, X, Landmark, Flame, Star, TrendingUp,
-  Utensils, ShoppingBasket, MoreHorizontal, Percent,
+  Settings, LogOut, X, Landmark, Flame, TrendingUp,
+  MoreHorizontal, Percent,
   ChevronDown, ChevronUp, ScanLine, Coins, Calculator, Car
 } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
@@ -29,10 +29,7 @@ const secondaryNav = [
   { href: '/cca',               label: 'Comptes Associés',   icon: Coins },
   { href: '/trajets',           label: 'Frais kilométriques', icon: Car },
   { href: '/stock',             label: 'Stock',              icon: Package },
-  { href: '/liste-courses',     label: 'Courses',            icon: ShoppingBasket },
   { href: '/fiches-techniques', label: 'Fiches techniques',  icon: ChefHat },
-  { href: '/menu-engineering',  label: 'Menu Engineering',   icon: Utensils },
-  { href: '/avis',              label: 'Avis Google',        icon: Star },
   { href: '/reglages',          label: 'Réglages',           icon: Settings },
 ];
 
@@ -46,7 +43,6 @@ const navCategories = [
       { href: '/dashboard', label: 'Accueil',      icon: LayoutDashboard },
       { href: '/scanner',   label: 'Scanner IA',   icon: ScanLine },
       { href: '/fuego',     label: 'Fuego IA',     icon: Flame },
-      { href: '/avis',      label: 'Avis Google',  icon: Star },
     ]
   },
   {
@@ -55,7 +51,6 @@ const navCategories = [
     icon: ShoppingCart,
     items: [
       { href: '/ventes',           label: 'Ventes Square',    icon: ShoppingCart },
-      { href: '/menu-engineering', label: 'Menu Engineering', icon: Utensils },
     ]
   },
   {
@@ -64,7 +59,6 @@ const navCategories = [
     icon: Package,
     items: [
       { href: '/stock',             label: 'Stock',             icon: Package },
-      { href: '/liste-courses',     label: 'Liste de courses',  icon: ShoppingBasket },
       { href: '/fiches-techniques', label: 'Fiches techniques', icon: ChefHat },
     ]
   },

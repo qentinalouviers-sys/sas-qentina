@@ -45,9 +45,9 @@ export function getAppUrl(): string {
 
   throw new MissingEnvError(
     'NEXT_PUBLIC_APP_URL',
-    "Elle sert à vérifier la signature des webhooks Square et à construire la redirection OAuth Google.",
+    "Elle sert à vérifier la signature des webhooks Square.",
     "Ajoutez-la dans Vercel → Settings → Environment Variables (ex. https://qentina-saas.vercel.app), " +
-    "avec exactement la même valeur que dans le Square Developer Dashboard et la Google Cloud Console."
+    "avec exactement la même valeur que dans le Square Developer Dashboard."
   );
 }
 

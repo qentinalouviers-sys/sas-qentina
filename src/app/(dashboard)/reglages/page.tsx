@@ -2,10 +2,12 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { Plus, Trash2, Save, Settings, Flame, RefreshCw, Stethoscope, KeyRound } from 'lucide-react';
+import { Plus, Trash2, Save, Settings, Flame, RefreshCw, Stethoscope, KeyRound, Merge, Link2 } from 'lucide-react';
 import AiSettingsPanel from '@/components/AiSettingsPanel';
 import { formatCurrency } from '@/lib/utils';
 import { UNITS } from '@/lib/recipes';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
+import { unmatchedDesignations, cleanName, type UnmatchedDesignation } from '@/lib/referentiel';
 import type { Supplier, Ingredient } from '@/lib/types';
 
 const DEFAULT_OPENING_HOURS: Record<string, { Midi: boolean; Soir: boolean }> = {
@@ -21,11 +23,33 @@ export default function ReglagesPage() {
   const [loading, setLoading] = useState(true);
   const [newSupplier, setNewSupplier] = useState('');
   const [newIngredient, setNewIngredient] = useState({ name: '', unit: 'kg', last_unit_price: 0 });
-  const [tab, setTab] = useState<'suppliers' | 'ingredients' | 'ia' | 'services' | 'moteurs'>('ingredients');
+  type Tab = 'suppliers' | 'ingredients' | 'ia' | 'services' | 'moteurs';
+  const isTab = (v: string | null): v is Tab =>
+    v !== null && ['suppliers', 'ingredients', 'ia', 'services', 'moteurs'].includes(v);
+  // Onglet demandé par l'URL : les interventions de l'accueil y renvoient.
+  // Lu à l'initialisation plutôt que dans un effet : le premier rendu
+  // affiche un spinner des deux côtés, il n'y a donc rien à réconcilier.
+  const [tab, setTab] = useState<Tab>(() => {
+    if (typeof window === 'undefined') return 'ingredients';
+    const wanted = new URLSearchParams(window.location.search).get('tab');
+    return isTab(wanted) ? wanted : 'ingredients';
+  });
+  // Nombre de factures par fournisseur : pour choisir la fiche à conserver
+  // lors d'une fusion, et repérer une fiche vide.
+  const [invoiceCounts, setInvoiceCounts] = useState<Record<string, number>>({});
+  const [mergeSource, setMergeSource] = useState<string | null>(null);
+  const [merging, setMerging] = useState(false);
+  // Désignations de factures qui ne mettent à jour aucun prix.
+  const [orphans, setOrphans] = useState<UnmatchedDesignation[]>([]);
+  const [orphanChoice, setOrphanChoice] = useState<Record<string, string>>({});
+  const [linking, setLinking] = useState<string | null>(null);
   const [fuegoContext, setFuegoContext] = useState('');
   const [savingContext, setSavingContext] = useState(false);
   const [openingHours, setOpeningHours] = useState<Record<string, { Midi: boolean; Soir: boolean }>>({ ...DEFAULT_OPENING_HOURS });
   const [savingHours, setSavingHours] = useState(false);
+  // Identité de la société : sert à nommer le fichier des écritures comptables.
+  const [siren, setSiren] = useState('');
+  const [savingSiren, setSavingSiren] = useState(false);
   const [syncDays, setSyncDays] = useState(365);
   const [syncing, setSyncing] = useState(false);
   const [syncReport, setSyncReport] = useState<string | null>(null);
@@ -115,24 +139,91 @@ export default function ReglagesPage() {
   };
 
   const loadSuppliers = useCallback(async () => {
-    const { data } = await supabase.from('suppliers').select('*').order('name');
+    const [{ data }, invoices] = await Promise.all([
+      supabase.from('suppliers').select('*').order('name'),
+      fetchAllRows<{ supplier_id: string | null }>((f0, f1) =>
+        supabase.from('invoices').select('supplier_id').range(f0, f1)),
+    ]);
     setSuppliers(data || []);
+    const counts: Record<string, number> = {};
+    for (const inv of invoices) if (inv.supplier_id) counts[inv.supplier_id] = (counts[inv.supplier_id] || 0) + 1;
+    setInvoiceCounts(counts);
   }, [supabase]);
 
+  /** Fusionne la fiche `sourceId` dans `targetId` : ses factures y passent, elle disparaît. */
+  const mergeSuppliers = async (sourceId: string, targetId: string) => {
+    const source = suppliers.find(s => s.id === sourceId);
+    const target = suppliers.find(s => s.id === targetId);
+    if (!source || !target) return;
+    if (!confirm(`Fusionner « ${source.name} » (${invoiceCounts[sourceId] || 0} facture(s)) dans « ${target.name} » ?\nLa fiche « ${source.name} » sera supprimée. Cette action est définitive.`)) return;
+    setMerging(true);
+    try {
+      const res = await fetch('/api/suppliers/merge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source_id: sourceId, target_id: targetId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Fusion impossible');
+      setMergeSource(null);
+      await loadSuppliers();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMerging(false);
+    }
+  };
+
   const loadIngredients = useCallback(async () => {
-    const { data } = await supabase.from('ingredients').select('*').order('name');
+    const [{ data }, { data: aliases }, lines] = await Promise.all([
+      supabase.from('ingredients').select('*').order('name'),
+      supabase.from('ingredient_aliases').select('alias, ingredient_id'),
+      fetchAllRows<{ designation: string | null; unit: string | null; unit_price_ht: number | null }>((f0, f1) =>
+        supabase.from('invoice_lines')
+          .select('designation, unit, unit_price_ht')
+          .in('category', ['alimentaire', 'boisson'])
+          .range(f0, f1)),
+    ]);
     setIngredients(data || []);
+    setOrphans(unmatchedDesignations(lines, data || [], aliases || []));
   }, [supabase]);
+
+  /** Rattache une désignation de facture à un ingrédient existant. */
+  const linkDesignation = async (orphan: UnmatchedDesignation, ingredientId: string) => {
+    setLinking(orphan.key);
+    const { error } = await supabase
+      .from('ingredient_aliases')
+      .upsert({ alias: orphan.key, ingredient_id: ingredientId });
+    setLinking(null);
+    if (error) { alert(`Rattachement impossible : ${error.message}`); return; }
+    loadIngredients();
+  };
+
+  /** Crée l'ingrédient au nom de la désignation — un geste humain, plus jamais automatique. */
+  const createFromDesignation = async (orphan: UnmatchedDesignation) => {
+    setLinking(orphan.key);
+    const { error } = await supabase.from('ingredients').insert({
+      name: cleanName(orphan.designation),
+      unit: orphan.unit && (UNITS as readonly string[]).includes(orphan.unit) ? orphan.unit : 'kg',
+      last_unit_price: orphan.lastPrice ?? 0,
+      last_updated: new Date().toISOString(),
+    });
+    setLinking(null);
+    if (error) { alert(`Création impossible : ${error.message}`); return; }
+    loadIngredients();
+  };
 
   const loadData = useCallback(async () => {
     setLoading(true);
     const [, , { data: settings }] = await Promise.all([
       loadSuppliers(),
       loadIngredients(),
-      supabase.from('app_settings').select('key, value').in('key', ['fuego_context', 'opening_hours']),
+      supabase.from('app_settings').select('key, value').in('key', ['fuego_context', 'opening_hours', 'siren']),
     ]);
     const ctx = settings?.find((s: any) => s.key === 'fuego_context');
     if (ctx?.value) setFuegoContext(ctx.value);
+    const sirenRow = settings?.find((s: { key: string; value: string | null }) => s.key === 'siren');
+    if (sirenRow?.value) setSiren(sirenRow.value);
     const hours = settings?.find((s: any) => s.key === 'opening_hours');
     if (hours?.value) {
       try {
@@ -147,6 +238,16 @@ export default function ReglagesPage() {
   }, [supabase, loadSuppliers, loadIngredients]);
 
   useEffect(() => { loadData(); }, [loadData]);
+
+  const saveSiren = async () => {
+    const digits = siren.replace(/\D/g, '');
+    if (digits.length !== 9) { alert('Le SIREN compte exactement 9 chiffres.'); return; }
+    setSavingSiren(true);
+    const { error } = await supabase.from('app_settings').upsert({ key: 'siren', value: digits, updated_at: new Date().toISOString() });
+    setSavingSiren(false);
+    if (error) alert(`Enregistrement impossible : ${error.message}`);
+    else setSiren(digits);
+  };
 
   const saveOpeningHours = async () => {
     setSavingHours(true);
@@ -264,6 +365,29 @@ export default function ReglagesPage() {
           </div>
         )}
 
+        {tab === 'services' && (
+          <div className="card" style={{ marginTop: 20 }}>
+            <div className="card-header">
+              <div>
+                <div className="card-title">Société</div>
+                <div className="card-subtitle">
+                  Le SIREN nomme le fichier des écritures comptables (FEC) exporté depuis les clôtures :
+                  c&apos;est le format que le cabinet et l&apos;administration attendent.
+                </div>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap', padding: '12px 0 0' }}>
+              <div className="form-group" style={{ marginBottom: 0, minWidth: 220 }}>
+                <label className="form-label">SIREN (9 chiffres)</label>
+                <input className="form-input" value={siren} onChange={e => setSiren(e.target.value)} placeholder="123 456 789" inputMode="numeric" />
+              </div>
+              <button className="btn btn-primary" onClick={saveSiren} disabled={savingSiren}>
+                <Save size={18} /> {savingSiren ? 'Enregistrement…' : 'Enregistrer'}
+              </button>
+            </div>
+          </div>
+        )}
+
         {tab === 'suppliers' && (
           <div className="card">
             <div className="card-header"><div className="card-title">Fournisseurs</div></div>
@@ -271,18 +395,138 @@ export default function ReglagesPage() {
               <input className="form-input" value={newSupplier} onChange={e => setNewSupplier(e.target.value)} placeholder="Nom du fournisseur" onKeyDown={e => e.key === 'Enter' && addSupplier()} />
               <button className="btn btn-primary" onClick={addSupplier}><Plus size={18} /></button>
             </div>
+            <p style={{ margin: '0 0 12px', fontSize: 13, color: 'var(--text-muted)' }}>
+              Un même fournisseur sous deux orthographes répartit ses achats entre deux fiches : aucun
+              total n&apos;est alors exploitable. <strong>Fusionner</strong> déplace les factures d&apos;une fiche
+              vers l&apos;autre, puis supprime la fiche vidée.
+            </p>
             <div className="table-container">
               <table>
-                <thead><tr><th>Nom</th><th></th></tr></thead>
+                <thead><tr><th>Nom</th><th style={{ textAlign: 'right' }}>Factures</th><th></th></tr></thead>
                 <tbody>
-                  {suppliers.map(s => (
-                    <tr key={s.id}>
-                      <td style={{ fontWeight: 600 }}>{s.name}</td>
-                      <td style={{ textAlign: 'right' }}><button className="btn btn-ghost btn-sm" onClick={() => deleteSupplier(s.id)}><Trash2 size={16} /></button></td>
+                  {suppliers.map(s => {
+                    const broken = /[ÃÂ�]/.test(s.name);
+                    return (
+                    <tr key={s.id} style={broken ? { background: 'rgba(232,155,62,0.08)' } : undefined}>
+                      <td style={{ fontWeight: 600 }}>
+                        {s.name}
+                        {broken && <span style={{ marginLeft: 8, fontSize: 11, color: '#92400E', fontWeight: 700 }}>encodage cassé</span>}
+                      </td>
+                      <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>{invoiceCounts[s.id] || 0}</td>
+                      <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                        {mergeSource === s.id ? (
+                          <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+                            <select
+                              className="form-select"
+                              style={{ minHeight: 34, padding: '4px 8px', fontSize: 13 }}
+                              defaultValue=""
+                              disabled={merging}
+                              onChange={e => { if (e.target.value) mergeSuppliers(s.id, e.target.value); }}
+                            >
+                              <option value="">Fusionner dans…</option>
+                              {suppliers.filter(t => t.id !== s.id).map(t => (
+                                <option key={t.id} value={t.id}>{t.name} ({invoiceCounts[t.id] || 0})</option>
+                              ))}
+                            </select>
+                            <button className="btn btn-ghost btn-sm" onClick={() => setMergeSource(null)}>Annuler</button>
+                          </span>
+                        ) : (
+                          <>
+                            <button className="btn btn-ghost btn-sm" title="Fusionner dans une autre fiche" onClick={() => setMergeSource(s.id)}>
+                              <Merge size={16} />
+                            </button>
+                            <button
+                              className="btn btn-ghost btn-sm"
+                              title={invoiceCounts[s.id] ? 'Cette fiche porte des factures : fusionne-la plutôt que de la supprimer' : 'Supprimer'}
+                              disabled={!!invoiceCounts[s.id]}
+                              onClick={() => deleteSupplier(s.id)}
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </>
+                        )}
+                      </td>
+                    </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {tab === 'ingredients' && orphans.length > 0 && (
+          <div className="card" style={{ marginBottom: 20, borderLeft: '3px solid var(--orange, #E89B3E)' }}>
+            <div className="card-header">
+              <div>
+                <div className="card-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Link2 size={18} style={{ color: 'var(--orange, #E89B3E)' }} />
+                  {orphans.length} désignation{orphans.length > 1 ? 's' : ''} de factures à rattacher
+                </div>
+                <div className="card-subtitle">
+                  Ces libellés achetés ne correspondent à aucun ingrédient : leurs prix ne mettent rien à jour,
+                  et le coût des fiches techniques date. Rattache chacun à son ingrédient, ou crée-le.
+                  Les plus achetés d&apos;abord.
+                </div>
+              </div>
+            </div>
+            <div className="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Désignation sur la facture</th>
+                    <th style={{ textAlign: 'right' }}>Lignes</th>
+                    <th style={{ textAlign: 'right' }}>Dernier prix</th>
+                    <th>Ingrédient</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {orphans.slice(0, 40).map(o => (
+                    <tr key={o.key}>
+                      <td style={{ fontWeight: 600 }}>{o.designation}</td>
+                      <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>{o.count}</td>
+                      <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                        {o.lastPrice != null ? `${formatCurrency(o.lastPrice)}${o.unit ? ` / ${o.unit}` : ''}` : '—'}
+                      </td>
+                      <td>
+                        <select
+                          className="form-select"
+                          style={{ minHeight: 34, padding: '4px 8px', fontSize: 13, minWidth: 180 }}
+                          value={orphanChoice[o.key] || ''}
+                          disabled={linking === o.key}
+                          onChange={e => setOrphanChoice(c => ({ ...c, [o.key]: e.target.value }))}
+                        >
+                          <option value="">Choisir…</option>
+                          {ingredients.map(i => <option key={i.id} value={i.id}>{i.name}{i.unit ? ` (${i.unit})` : ''}</option>)}
+                        </select>
+                      </td>
+                      <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                        <button
+                          className="btn btn-primary btn-sm"
+                          disabled={!orphanChoice[o.key] || linking === o.key}
+                          onClick={() => linkDesignation(o, orphanChoice[o.key])}
+                        >
+                          <Link2 size={14} /> Rattacher
+                        </button>{' '}
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          title="Créer un ingrédient portant ce nom"
+                          disabled={linking === o.key}
+                          onClick={() => createFromDesignation(o)}
+                        >
+                          <Plus size={14} /> Créer
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              {orphans.length > 40 && (
+                <p style={{ margin: '10px 0 0', fontSize: 12, color: 'var(--text-muted)' }}>
+                  {orphans.length - 40} autres désignations moins fréquentes apparaîtront au fur et à mesure.
+                </p>
+              )}
             </div>
           </div>
         )}

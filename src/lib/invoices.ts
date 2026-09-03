@@ -1,9 +1,15 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { ExtractedInvoiceData } from '@/lib/ai/invoice-ocr';
+import { assertInvoiceAccepted } from '@/lib/invoice-checks';
+import { cleanName, findSupplierMatch, matchIngredient } from '@/lib/referentiel';
 
 /**
  * invoices.ts — Enregistrement d'une facture extraite par l'IA.
- * Logique unique partagée par /api/invoices/extract et /api/scanner/confirm.
+ *
+ * Un seul chemin d'entrée : /api/scanner/confirm, après relecture humaine.
+ * L'import « en un clic » (analyse + enregistrement + rapprochement au
+ * premier montant approchant) a été retiré : deux factures Metro de 84,30 €
+ * la même semaine se lettaient sur la mauvaise transaction, en silence.
  *
  * Prérequis : le schéma consolidé (db/migration_consolidee.sql) doit être
  * appliqué — plus aucun "fallback schéma legacy" ici.
@@ -15,25 +21,29 @@ export function generateAccountingRef(date?: string | null): string {
   return `FAC-${ym}-${suffix}`;
 }
 
-/** Retrouve un fournisseur par nom approchant, ou le crée. */
+/**
+ * Retrouve un fournisseur par son nom, ou le crée.
+ *
+ * La correspondance est une égalité après normalisation (accents, casse,
+ * encodage cassé), jamais une inclusion : l'ancien `ilike '%Métro%'` ne
+ * retrouvait pas « MÃ©tro » et aurait capté un « Eurométro ». La table est
+ * petite (quelques dizaines de fiches) : on la lit entière plutôt que de
+ * déléguer la comparaison à SQL, qui ne sait pas normaliser comme nous.
+ */
 export async function findOrCreateSupplier(
   supabase: SupabaseClient,
   name: string | null | undefined
 ): Promise<string | null> {
-  if (!name) return null;
+  const clean = cleanName(name ?? '');
+  if (!clean) return null;
 
-  const { data: found } = await supabase
-    .from('suppliers')
-    .select('id')
-    .ilike('name', `%${name}%`)
-    .limit(1)
-    .maybeSingle();
-
+  const { data: all } = await supabase.from('suppliers').select('id, name');
+  const found = findSupplierMatch(clean, (all ?? []) as { id: string; name: string }[]);
   if (found) return found.id;
 
   const { data: created } = await supabase
     .from('suppliers')
-    .insert({ name })
+    .insert({ name: clean })
     .select('id')
     .single();
   return created?.id ?? null;
@@ -43,6 +53,14 @@ export interface SaveInvoiceOptions {
   fileUrl?: string | null;
   paymentMethod?: string;
   paymentNotes?: string | null;
+  /**
+   * Codes d'anomalies que l'humain a explicitement acquittés à l'écran.
+   * Sans eux, toute facture inhabituelle est refusée : le serveur ne fait pas
+   * confiance au client pour avoir montré les avertissements.
+   */
+  confirmations?: readonly string[];
+  /** Date du jour en ISO — paramétrable pour les tests. */
+  today?: string;
 }
 
 export interface SavedInvoice {
@@ -51,12 +69,20 @@ export interface SavedInvoice {
   supplierId: string | null;
 }
 
-/** Insère la facture + ses lignes. */
+/**
+ * Insère la facture + ses lignes.
+ *
+ * @throws InvoiceValidationError si la facture est incohérente ou si un point
+ *   inhabituel n'a pas été acquitté — voir lib/invoice-checks.ts.
+ */
 export async function saveInvoice(
   supabase: SupabaseClient,
   extracted: ExtractedInvoiceData,
   options: SaveInvoiceOptions = {}
 ): Promise<SavedInvoice> {
+  const today = options.today ?? new Date().toISOString().slice(0, 10);
+  assertInvoiceAccepted(extracted, today, options.confirmations ?? []);
+
   const supplierId = await findOrCreateSupplier(supabase, extracted.fournisseur);
   const accountingRef = generateAccountingRef(extracted.date);
 
@@ -104,78 +130,52 @@ export async function saveInvoice(
 
 /**
  * Met à jour le prix des ingrédients (mercuriale) à partir des lignes
- * alimentaire/boisson. Une seule requête de lecture (plus de N+1).
+ * alimentaire/boisson d'une facture.
+ *
+ * Seules les désignations qui correspondent EXACTEMENT à un ingrédient — par
+ * son nom ou par un alias validé dans Réglages — mettent un prix à jour. Plus
+ * aucune création automatique : chaque ligne inconnue créait un ingrédient à
+ * son libellé brut, et « le nom contient » faisait porter le prix du concentré
+ * à la tomate. Les désignations non reconnues attendent dans Réglages →
+ * Ingrédients, où un humain les rattache.
  */
 export async function updateIngredientPrices(
   supabase: SupabaseClient,
   lignes: NonNullable<ExtractedInvoiceData['lignes']>
-): Promise<void> {
+): Promise<{ updated: number; unmatched: string[] }> {
   const foodLines = lignes.filter(l => l.categorie === 'alimentaire' || l.categorie === 'boisson');
-  if (foodLines.length === 0) return;
+  if (foodLines.length === 0) return { updated: 0, unmatched: [] };
 
-  const { data: ingredients } = await supabase.from('ingredients').select('id, name');
-  const all = ingredients || [];
+  const [{ data: ingredients }, { data: aliases }] = await Promise.all([
+    supabase.from('ingredients').select('id, name, last_unit_price'),
+    supabase.from('ingredient_aliases').select('alias, ingredient_id'),
+  ]);
+  const all = (ingredients ?? []) as { id: string; name: string; last_unit_price: number | null }[];
   const now = new Date().toISOString();
+  const unmatched: string[] = [];
+  let updated = 0;
 
   for (const l of foodLines) {
-    const needle = (l.designation || '').toLowerCase();
-    const match = all.find(
-      (ing: { id: string; name: string }) =>
-        needle.includes(ing.name.toLowerCase()) || ing.name.toLowerCase().includes(needle)
-    );
-
-    if (match) {
-      await supabase
-        .from('ingredients')
-        .update({ last_unit_price: l.prix_unitaire_ht, last_updated: now })
-        .eq('id', match.id);
-    } else {
-      const { data: created } = await supabase
-        .from('ingredients')
-        .insert({
-          name: l.designation,
-          unit: l.unite || 'kg',
-          last_unit_price: l.prix_unitaire_ht,
-          last_updated: now,
-        })
-        .select('id, name')
-        .single();
-      if (created) all.push(created);
+    const match = matchIngredient(l.designation ?? '', all, aliases ?? []);
+    if (!match) {
+      unmatched.push(l.designation);
+      continue;
     }
+    const price = Number(l.prix_unitaire_ht);
+    if (!Number.isFinite(price) || price <= 0 || price === match.last_unit_price) continue;
+
+    await supabase
+      .from('ingredients')
+      .update({ last_unit_price: price, last_updated: now })
+      .eq('id', match.id);
+    match.last_unit_price = price;
+    updated++;
   }
-}
 
-/**
- * Rapprochement bancaire automatique : cherche une transaction en attente
- * au même montant (±0,50 €) dans les ±10 jours et la lie à la facture.
- */
-export async function autoReconcileBankTx(
-  supabase: SupabaseClient,
-  invoiceId: string,
-  extracted: ExtractedInvoiceData
-): Promise<string | null> {
-  if (!extracted.total_ttc || !extracted.date) return null;
-
-  const targetAmount = -Math.abs(extracted.total_ttc);
-  const invoiceDate = new Date(extracted.date);
-  const minDate = new Date(invoiceDate); minDate.setDate(invoiceDate.getDate() - 10);
-  const maxDate = new Date(invoiceDate); maxDate.setDate(invoiceDate.getDate() + 10);
-
-  const { data: bankTx } = await supabase
-    .from('bank_transactions')
-    .select('id')
-    .eq('status', 'pending_invoice')
-    .gte('amount', targetAmount - 0.5)
-    .lte('amount', targetAmount + 0.5)
-    .gte('date', minDate.toISOString().split('T')[0])
-    .lte('date', maxDate.toISOString().split('T')[0])
-    .limit(1)
-    .maybeSingle();
-
-  if (!bankTx) return null;
-
-  await linkBankTransaction(supabase, bankTx.id, invoiceId, extracted.compte_comptable);
-  return bankTx.id;
+  if (unmatched.length > 0) {
+    console.log(`[Mercuriale] ${updated} prix mis à jour, ${unmatched.length} désignation(s) non rattachée(s) : ${unmatched.slice(0, 5).join(' | ')}`);
+  }
+  return { updated, unmatched };
 }
 
 /** Marque une transaction bancaire comme rapprochée avec une facture. */

@@ -7,11 +7,16 @@ import {
   linkBankTransaction,
   createCcaMovementForInvoice,
 } from '@/lib/invoices';
+import { InvoiceValidationError } from '@/lib/invoice-checks';
 
 /**
  * Scanner IA — étape 2 : enregistrement après validation par l'utilisateur.
  * Crée la facture + lignes, le mouvement CCA si payé en perso,
  * et lie la transaction bancaire choisie.
+ *
+ * `confirmations` : codes des anomalies que l'utilisateur a cochées « vérifié ».
+ * Le serveur recalcule les anomalies lui-même et refuse (422) tout ce qui n'a
+ * pas été acquitté — l'écran peut être contourné, pas cette route.
  */
 export async function POST(req: NextRequest) {
   const auth = await requireUser();
@@ -25,6 +30,7 @@ export async function POST(req: NextRequest) {
       payment_method = 'bank',
       payment_notes,
       associe,
+      confirmations = [],
     } = await req.json();
 
     if (!extracted) {
@@ -38,6 +44,7 @@ export async function POST(req: NextRequest) {
       fileUrl: file_url,
       paymentMethod: payment_method,
       paymentNotes: payment_notes,
+      confirmations: Array.isArray(confirmations) ? confirmations.map(String) : [],
     });
 
     // 2. Mise à jour de la mercuriale (prix des ingrédients)
@@ -62,6 +69,12 @@ export async function POST(req: NextRequest) {
       reconciled: !!bank_tx_id,
     });
   } catch (err: any) {
+    if (err instanceof InvoiceValidationError) {
+      return NextResponse.json(
+        { error: err.message, anomalies: err.anomalies },
+        { status: 422 }
+      );
+    }
     console.error('Scanner confirm error:', err);
     return NextResponse.json({ error: err.message || 'Erreur confirmation scanner' }, { status: 500 });
   }

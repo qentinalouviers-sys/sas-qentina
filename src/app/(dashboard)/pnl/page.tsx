@@ -7,6 +7,8 @@ import { formatCurrency, formatPercent, getDateRange, toISODate, formatDate } fr
 import {
   isFinancialFlow, orderHtAmount, bankAmountHt, makeInvoiceMatcher,
 } from '@/lib/accounting';
+import { inventorySessions, computeCogs, type CogsResult } from '@/lib/cogs';
+import ClosuresPanel from '@/components/ClosuresPanel';
 import {
   TrendingUp,
   DollarSign,
@@ -19,10 +21,41 @@ import {
   X,
   Search,
   Eye,
-  EyeOff
+  Tag,
 } from 'lucide-react';
 import { BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import type { PeriodFilter } from '@/lib/types';
+
+/**
+ * Catégories bancaires proposées dans le détail du P&L.
+ *
+ * Une écriture qu'on voudrait « sortir » du résultat est en réalité mal
+ * classée : un remboursement d'emprunt rangé en fournisseur, un virement
+ * perso compté en recette. On la corrige à la source — la catégorie — et le
+ * P&L, la TVA et le tableau de bord suivent tous. L'ancien bouton « masquer »
+ * retirait l'écriture du seul P&L, sans motif ni trace : un compte de
+ * résultat qu'on peut ajuster en silence n'est pas un outil comptable.
+ */
+const BANK_CATEGORIES: Record<string, string> = {
+  variable_fournisseur: 'Fournisseurs (coût matières)',
+  fixe_loyer: 'Loyer & charges locatives',
+  fixe_assurance: 'Assurances',
+  fixe_abonnement: 'Abonnements & honoraires',
+  variable_salaire: 'Salaires & charges sociales',
+  impot_taxe: 'Impôts & taxes',
+  investissement: 'Équipement & travaux',
+  recette: 'Encaissement (hors chiffre d\'affaires)',
+  flux_financier: 'Flux financier — hors résultat',
+  autre: 'Non classé',
+};
+
+const LINE_CATEGORIES: Record<string, string> = {
+  alimentaire: 'Alimentaire',
+  boisson: 'Boissons',
+  emballage: 'Emballages',
+  materiel: 'Matériel',
+  autre: 'Autre',
+};
 
 // Formateur de ligne de modale pour une transaction bancaire (Date / Libellé / Montant),
 // paramétré par la couleur du montant.
@@ -63,8 +96,11 @@ const PnlRow = ({ label, value, ratio, note, color = 'var(--text-secondary)', on
 export default function PnlPage() {
   const [period, setPeriod] = useState<PeriodFilter>('month');
   const [loading, setLoading] = useState(true);
-  const [maskedIds, setMaskedIds] = useState<string[]>([]);
-  const [showMaskedInModal, setShowMaskedInModal] = useState(false);
+  // Écritures que l'ancien bouton « masquer » excluait du P&L. Elles sont
+  // réintégrées ; on garde le compte pour le dire une fois, et proposer de
+  // les recatégoriser.
+  const [legacyMaskedCount, setLegacyMaskedCount] = useState(0);
+  const [recategorizing, setRecategorizing] = useState<string | null>(null);
   const [data, setData] = useState({
     // CA — la caisse Square est la référence
     caSquare: 0,
@@ -85,10 +121,12 @@ export default function PnlPage() {
     purchasesMateriel: 0,
     purchasesAutreInvoices: 0,
     bankSuppliersUnreconciled: 0,
-    totalCogs: 0, // Cost of Goods Sold (Matières)
+    totalCogs: 0, // Coût matières CONSOMMÉ (achats ± variation de stock)
+    achatsHt: 0,       // achats de la période, avant variation de stock
     cogsFactures: 0,   // ventilé ligne à ligne : exact
     cogsBanque: 0,     // paiements sans détail : majorant
     partBanquePercent: 0,
+    cogs: null as CogsResult | null,
     
     // Personnel
     laborTimecards: 0,
@@ -147,6 +185,7 @@ export default function PnlPage() {
         timecards,
         bankSalaries,
         fixedTx,
+        inventoryCounts,
       ] = await Promise.all([
         // A. IDs masqués depuis app_settings
         supabase
@@ -164,7 +203,7 @@ export default function PnlPage() {
         // CA Banque (Recettes)
         fetchAllRows<any>((f0, f1) => supabase
           .from('bank_transactions')
-          .select('id, date, description, amount, status')
+          .select('id, date, description, amount, status, category')
           .eq('category', 'recette')
           .gte('date', startStr)
           .lte('date', endStr)
@@ -183,7 +222,7 @@ export default function PnlPage() {
         // Achats Fournisseurs non lettrés (dans banque directement, non lié à facture)
         fetchAllRows<any>((f0, f1) => supabase
           .from('bank_transactions')
-          .select('id, date, description, amount, status')
+          .select('id, date, description, amount, status, category')
           .eq('category', 'variable_fournisseur')
           .is('invoice_id', null)
           .gte('date', startStr)
@@ -201,7 +240,7 @@ export default function PnlPage() {
         // Banque Salaires & Charges
         fetchAllRows<any>((f0, f1) => supabase
           .from('bank_transactions')
-          .select('id, date, description, amount, status')
+          .select('id, date, description, amount, status, category')
           .eq('category', 'variable_salaire')
           .gte('date', startStr)
           .lte('date', endStr)
@@ -216,17 +255,21 @@ export default function PnlPage() {
           .lte('date', endStr)
           .order('date', { ascending: false })
           .range(f0, f1)),
+        // Inventaires : pour passer des achats au coût matières consommé.
+        fetchAllRows<{ ingredient_id: string; quantity: number | null; unit_price: number | null; counted_at: string }>((f0, f1) => supabase
+          .from('inventory_counts')
+          .select('ingredient_id, quantity, unit_price, counted_at')
+          .range(f0, f1)),
       ]);
 
-      const loadedMaskedIds: string[] = settingsData && settingsData.length > 0 && settingsData[0].value
+      const legacyMasked: string[] = settingsData && settingsData.length > 0 && settingsData[0].value
         ? JSON.parse(settingsData[0].value)
         : [];
-
-      setMaskedIds(loadedMaskedIds);
+      setLegacyMaskedCount(legacyMasked.length);
 
       // 1. Chiffre d'Affaires (Square Orders)
       const ordersList = orders || [];
-      const activeOrders = ordersList.filter((o: any) => !loadedMaskedIds.includes(String(o.id)));
+      const activeOrders = ordersList;
       const caSquare = activeOrders.reduce((s: number, o: any) => s + orderHtAmount(o), 0);
 
       // ── Flux financiers : ni recette, ni charge ──────────────────────────
@@ -245,7 +288,7 @@ export default function PnlPage() {
 
       // Encaissements bancaires (indicatif — le CA vient de Square)
       const bankRecettesList = sansFlux(bankRecettes || []);
-      const activeBankRecettes = bankRecettesList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
+      const activeBankRecettes = bankRecettesList;
       const caBank = activeBankRecettes.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
       const totalCA = caSquare; // La caisse Square est la référence du CA
 
@@ -268,7 +311,7 @@ export default function PnlPage() {
           .in('invoice_id', ids)
           .range(f0, f1));
         
-        const activeInvoiceLines = invoiceLinesList.filter((l: any) => !loadedMaskedIds.includes(String(l.id)));
+        const activeInvoiceLines = invoiceLinesList;
         
         activeInvoiceLines.forEach((l: any) => {
           const amt = l.total_ht || 0;
@@ -289,7 +332,7 @@ export default function PnlPage() {
       // Achats Fournisseurs non lettrés (dans banque directement, non lié à facture)
       const bankSuppliersUnreconciledList = sansFlux(bankSuppliers || [])
         .filter((t: any) => !matcher.alreadyInvoiced(t));
-      const activeBankSuppliers = bankSuppliersUnreconciledList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
+      const activeBankSuppliers = bankSuppliersUnreconciledList;
       // Les lignes de factures sont en HT, les montants bancaires en TTC :
       // on ramène ces derniers en HT pour que le ratio reste comparable.
       const bankSuppliersUnreconciled = activeBankSuppliers.reduce(
@@ -310,18 +353,28 @@ export default function PnlPage() {
       // fiabilité ne vaut pas mieux qu'une absence de ratio.
       const cogsFactures = purchasesAlim + purchasesBoisson + purchasesEmballage;
       const cogsBanque = bankSuppliersUnreconciled;
-      const totalCogs = cogsFactures + cogsBanque;
-      const partBanquePercent = totalCogs > 0 ? (cogsBanque / totalCogs) * 100 : 0;
+      const achatsHt = cogsFactures + cogsBanque;
+      const partBanquePercent = achatsHt > 0 ? (cogsBanque / achatsHt) * 100 : 0;
+
+      // Coût matières CONSOMMÉ = stock initial + achats − stock final. Quand
+      // deux inventaires encadrent la période ; sinon les achats, et on le dit.
+      const cogs = computeCogs({
+        purchases: achatsHt,
+        sessions: inventorySessions(inventoryCounts),
+        start: startStr,
+        end: endStr,
+      });
+      const totalCogs = cogs.cogs;
 
       // 3. Masse Salariale
       // Timecards (Salaires théoriques)
       const timecardsList = timecards || [];
-      const activeTimecards = timecardsList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
+      const activeTimecards = timecardsList;
       const laborTimecards = activeTimecards.reduce((s: number, t: any) => s + (t.hours_worked || 0) * (t.hourly_rate || 0), 0);
 
       // Banque Salaires & Charges
       const bankSalariesList = sansFlux(bankSalaries || []);
-      const activeBankSalaries = bankSalariesList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
+      const activeBankSalaries = bankSalariesList;
       const laborBank = activeBankSalaries.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
 
       // Utiliser les flux réels banque si dispos, sinon timecards comme coût théorique
@@ -333,7 +386,7 @@ export default function PnlPage() {
       // on ramène les montants en HT.
       const fixedTxList = sansFlux(fixedTx || [])
         .filter((t: any) => !matcher.alreadyInvoiced(t));
-      const activeFixedTx = fixedTxList.filter((t: any) => !loadedMaskedIds.includes(String(t.id)));
+      const activeFixedTx = fixedTxList;
 
       let chargesLoyer = 0;
       let chargesAssurance = 0;
@@ -386,9 +439,11 @@ export default function PnlPage() {
         purchasesAutreInvoices,
         bankSuppliersUnreconciled,
         totalCogs,
+        achatsHt,
         cogsFactures,
         cogsBanque,
         partBanquePercent,
+        cogs,
         laborTimecards,
         laborBank,
         activeLabor,
@@ -437,30 +492,29 @@ export default function PnlPage() {
     return () => { supabase.removeChannel(channel); };
   }, [loadData]);
 
-  // Action de masquer / démasquer un élément
-  const toggleMaskItem = async (id: string) => {
-    const supabase = createClient();
-    let newMaskedIds: string[] = [];
-    
-    if (maskedIds.includes(id)) {
-      newMaskedIds = maskedIds.filter(mId => mId !== id);
-    } else {
-      newMaskedIds = [...maskedIds, id];
-    }
-    
-    // Mettre à jour l'état local immédiatement (optimiste)
-    setMaskedIds(newMaskedIds);
-    
-    try {
-      await supabase
-        .from('app_settings')
-        .upsert({ key: 'masked_items', value: JSON.stringify(newMaskedIds) });
-      
-      // Recharger pour recalculer les totaux de la page
-      loadData();
-    } catch (error) {
-      console.error("Erreur lors de la sauvegarde du masquage :", error);
-    }
+  // Corriger la catégorie d'une écriture, à la source. Le P&L se recharge :
+  // la TVA et le tableau de bord verront la même correction.
+  const recategorizeBank = async (id: string, category: string) => {
+    setRecategorizing(id);
+    const { error } = await createClient().from('bank_transactions').update({ category }).eq('id', id);
+    setRecategorizing(null);
+    if (error) { alert(`Recatégorisation impossible : ${error.message}`); return; }
+    loadData();
+  };
+
+  const recategorizeLine = async (id: string, category: string) => {
+    setRecategorizing(id);
+    const { error } = await createClient().from('invoice_lines').update({ category }).eq('id', id);
+    setRecategorizing(null);
+    if (error) { alert(`Recatégorisation impossible : ${error.message}`); return; }
+    loadData();
+  };
+
+  // Les écritures ex-masquées sont réintégrées ; une fois relues, on retire l'avis.
+  const dismissLegacyMasked = async () => {
+    const { error } = await createClient().from('app_settings').delete().eq('key', 'masked_items');
+    if (error) { alert(`Impossible de retirer l'avis : ${error.message}`); return; }
+    setLegacyMaskedCount(0);
   };
 
   // Préparation des données pour les graphiques (mémoïsées)
@@ -492,7 +546,6 @@ export default function PnlPage() {
   const openDetail = (key: string) => {
     setActiveDetail(key);
     setSearchQuery('');
-    setShowMaskedInModal(false);
   };
 
   // Rendu de la modale de détail
@@ -636,20 +689,10 @@ export default function PnlPage() {
         return null;
     }
 
-    // 2. Filtrage des éléments pour la recherche + prise en compte du masquage
+    // 2. Filtrage des éléments pour la recherche
     const searchLower = searchQuery.toLowerCase();
-    
-    // Détecter combien d'éléments de cette liste complète sont masqués
-    const totalMaskedCount = rawItemsList.filter(item => maskedIds.includes(String(item.id))).length;
 
-    // Éléments après filtres (Recherche & Masquage)
     const displayedItems = rawItemsList.filter((item: any) => {
-      const isMasked = maskedIds.includes(String(item.id));
-      
-      // Exclure si masqué et qu'on ne demande pas à les afficher
-      if (isMasked && !showMaskedInModal) return false;
-
-      // Filtre de recherche textuelle selon le type
       if (activeDetail === 'labor_timecards') {
         return item.employee_name?.toLowerCase().includes(searchLower);
       } else if (activeDetail.startsWith('purchases_')) {
@@ -658,15 +701,14 @@ export default function PnlPage() {
                item.invoice?.invoice_number?.toLowerCase().includes(searchLower);
       } else {
         return item.description?.toLowerCase().includes(searchLower) ||
-               item.date?.includes(searchLower) || 
+               item.date?.includes(searchLower) ||
                item.square_order_id?.toLowerCase().includes(searchLower) ||
                item.service?.includes(searchLower);
       }
     });
 
-    // Calcul de la somme des éléments visibles et NON masqués
-    const activeItemsList = rawItemsList.filter(item => !maskedIds.includes(String(item.id)));
-    
+    const activeItemsList = rawItemsList;
+
     if (activeDetail === 'labor_timecards') {
       consolidatedSum = activeItemsList.reduce((s: number, t: any) => s + (t.hours_worked || 0) * (t.hourly_rate || 0), 0);
     } else if (activeDetail.startsWith('purchases_')) {
@@ -677,8 +719,13 @@ export default function PnlPage() {
       consolidatedSum = activeItemsList.reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
     }
 
-    // Ajouter la colonne "Action" au tableau de la modale
-    const finalHeaders = [...headers, 'Action'];
+    // Une catégorie se corrige sur une écriture bancaire ou une ligne de
+    // facture. Une vente Square ou un pointage n'ont pas de catégorie à
+    // discuter : une vente est une vente.
+    const isBankDetail = ['ca_bank', 'flux_financiers', 'bank_suppliers_unreconciled', 'labor_bank'].includes(activeDetail)
+      || activeDetail.startsWith('charges_');
+    const isLineDetail = activeDetail.startsWith('purchases_');
+    const finalHeaders = (isBankDetail || isLineDetail) ? [...headers, 'Catégorie'] : headers;
 
     return (
       <div className="modal-overlay" onClick={() => setActiveDetail(null)}>
@@ -687,7 +734,7 @@ export default function PnlPage() {
             <div>
               <h3 className="modal-title">{title}</h3>
               <div style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                Total actif consolidé : <strong>{formatCurrency(consolidatedSum)}</strong> ({activeItemsList.length} élément(s) actif(s))
+                Total : <strong>{formatCurrency(consolidatedSum)}</strong> ({activeItemsList.length} écriture(s))
               </div>
             </div>
             <button className="modal-close" onClick={() => setActiveDetail(null)}>
@@ -707,27 +754,12 @@ export default function PnlPage() {
               />
               <Search size={16} style={{ position: 'absolute', left: '12px', top: '12px', color: 'var(--text-muted)' }} />
             </div>
-            
-            {totalMaskedCount > 0 && (
-              <button 
-                className={`btn ${showMaskedInModal ? 'btn-primary' : 'btn-secondary'} btn-sm`} 
-                onClick={() => setShowMaskedInModal(!showMaskedInModal)}
-                style={{ height: '38px' }}
-              >
-                {showMaskedInModal ? "👁️ Masquer les éléments exclus" : `👁️ Afficher les masqués (${totalMaskedCount})`}
-              </button>
-            )}
           </div>
 
           <div className="table-container" style={{ maxHeight: '60vh', overflowY: 'auto' }}>
             {displayedItems.length === 0 ? (
               <div className="empty-state" style={{ padding: '32px' }}>
-                <p>Aucune écriture active trouvée.</p>
-                {totalMaskedCount > 0 && !showMaskedInModal && (
-                  <p style={{ fontSize: '13px', marginTop: '8px' }}>
-                    💡 Il y a {totalMaskedCount} élément(s) masqué(s) dans cette liste. Cliquez sur &ldquo;Afficher les masqués&rdquo; ci-dessus pour les auditer.
-                  </p>
-                )}
+                <p>Aucune écriture trouvée.</p>
               </div>
             ) : (
               <table>
@@ -736,7 +768,7 @@ export default function PnlPage() {
                     {finalHeaders.map((h, idx) => {
                       const isRightAlign = idx === finalHeaders.length - 2 || 
                                            ['Montant', 'Total HT', 'Total Brut', 'Prix U. HT'].includes(h);
-                      const isCenterAlign = h === 'Action';
+                      const isCenterAlign = h === 'Catégorie';
                       return (
                         <th 
                           key={idx} 
@@ -755,44 +787,43 @@ export default function PnlPage() {
                 <tbody>
                   {displayedItems.map((item) => {
                     const rowData = formatRowFunction(item);
-                    const isMasked = maskedIds.includes(rowData.id);
-                    
+                    const busy = recategorizing === rowData.id;
+
                     return (
-                      <tr 
-                        key={rowData.id}
-                        style={isMasked ? { opacity: 0.5, textDecoration: 'line-through', background: 'var(--cream-light)' } : {}}
-                      >
+                      <tr key={rowData.id} style={busy ? { opacity: 0.5 } : undefined}>
                         {rowData.cells.map((cell: any, cellIdx: number) => {
-                          const isRightAlign = cellIdx === rowData.cells.length - 1 || 
+                          const isRightAlign = cellIdx === rowData.cells.length - 1 ||
                                                ['Montant', 'Total HT', 'Total Brut', 'Prix U. HT'].includes(headers[cellIdx]);
                           return (
-                            <td 
-                              key={cellIdx} 
+                            <td
+                              key={cellIdx}
                               style={isRightAlign ? { textAlign: 'right' } : {}}
                             >
                               {cell}
                             </td>
                           );
                         })}
-                        {/* Colonne Action pour Masquer / Démasquer */}
-                        <td style={{ textAlign: 'center' }}>
-                          <button
-                            className="btn btn-secondary btn-sm"
-                            style={{ 
-                              padding: '4px 8px', 
-                              borderColor: isMasked ? 'var(--teal)' : 'var(--border)',
-                              background: isMasked ? 'var(--teal-bg)' : 'white'
-                            }}
-                            onClick={() => toggleMaskItem(rowData.id)}
-                            title={isMasked ? "Démasquer et réintégrer l'élément" : "Masquer et exclure des calculs"}
-                          >
-                            {isMasked ? (
-                              <Eye size={14} style={{ color: 'var(--teal)' }} />
-                            ) : (
-                              <EyeOff size={14} style={{ color: 'var(--text-muted)' }} />
-                            )}
-                          </button>
-                        </td>
+                        {(isBankDetail || isLineDetail) && (
+                          <td style={{ textAlign: 'center', whiteSpace: 'nowrap' }}>
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                              <Tag size={13} style={{ color: 'var(--text-muted)' }} />
+                              <select
+                                className="form-select"
+                                style={{ minHeight: 32, padding: '2px 8px', fontSize: 12 }}
+                                value={item.category || 'autre'}
+                                disabled={busy}
+                                title="Corriger la catégorie de cette écriture, à la source"
+                                onChange={e => isBankDetail
+                                  ? recategorizeBank(rowData.id, e.target.value)
+                                  : recategorizeLine(rowData.id, e.target.value)}
+                              >
+                                {Object.entries(isBankDetail ? BANK_CATEGORIES : LINE_CATEGORIES).map(([k, label]) => (
+                                  <option key={k} value={k}>{label}</option>
+                                ))}
+                              </select>
+                            </span>
+                          </td>
+                        )}
                       </tr>
                     );
                   })}
@@ -817,7 +848,7 @@ export default function PnlPage() {
         <div>
           <h2>Compte de Résultat (P&L)</h2>
           <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-            Consolidation financière en temps réel — Cliquez sur une ligne pour voir les calculs ou masquer des éléments
+            Cliquez sur une ligne pour voir les écritures et corriger une catégorie
           </span>
         </div>
         <div className="period-selector">
@@ -881,6 +912,11 @@ export default function PnlPage() {
                 </div>
                 <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
                   Food Cost % : <strong>{formatPercent(calculateRatio(data.totalCogs))}</strong>
+                  <div style={{ marginTop: 3, color: data.cogs?.method === 'inventaire' ? 'var(--green)' : 'var(--text-muted)' }}>
+                    {data.cogs?.method === 'inventaire'
+                      ? `mesuré : inventaires du ${formatDate(data.cogs.opening!.day)} et du ${formatDate(data.cogs.closing!.day)}`
+                      : 'sur achats — pas d\'inventaire aux bornes'}
+                  </div>
                   {data.partBanquePercent >= 10 && (
                     <div style={{ marginTop: 3, color: 'var(--orange)' }}>
                       dont {formatPercent(data.partBanquePercent)} sans détail — majorant
@@ -909,12 +945,19 @@ export default function PnlPage() {
               </div>
             )}
 
-            {maskedIds.length > 0 && (
-              <div className="alert alert-success" style={{ marginBottom: 20, background: 'rgba(42, 125, 123, 0.05)', color: 'var(--teal)', borderColor: 'rgba(42, 125, 123, 0.2)' }}>
-                <Info size={16} />
-                <span>
-                  <strong>Ajustements actifs :</strong> {maskedIds.length} écriture(s) ont été masquée(s) et exclue(s) du calcul du P&L. Ouvrez les détails pour les réintégrer.
+            {legacyMaskedCount > 0 && (
+              <div className="alert alert-warning" style={{ marginBottom: 20, alignItems: 'flex-start' }}>
+                <AlertCircle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+                <span style={{ flex: 1 }}>
+                  <strong>{legacyMaskedCount} écriture(s) étaient exclues du résultat à la main.</strong> Le bouton
+                  « masquer » n&apos;existe plus : un compte de résultat qu&apos;on peut ajuster sans trace n&apos;est pas
+                  un outil comptable. Ces écritures sont réintégrées. Si l&apos;une d&apos;elles n&apos;a rien à faire dans le
+                  résultat (emprunt, virement perso, doublon), ouvre le détail de son poste et corrige sa
+                  <strong> catégorie</strong> — la correction vaut alors aussi pour la TVA et le tableau de bord.
                 </span>
+                <button className="btn btn-secondary btn-sm" onClick={dismissLegacyMasked} style={{ flexShrink: 0 }}>
+                  J&apos;ai relu, retirer cet avis
+                </button>
               </div>
             )}
 
@@ -1039,14 +1082,14 @@ export default function PnlPage() {
 
                     {/* SECTION 2: COUT MATIERES */}
                     <tr style={{ background: 'var(--cream-light)', fontWeight: 700 }}>
-                      <td style={{ color: 'var(--orange)' }}>2. COÛTS VARIABLES (ACHATS MATIÈRES)</td>
+                      <td style={{ color: 'var(--orange)' }}>2. COÛT MATIÈRES CONSOMMÉ</td>
                       <td style={{ textAlign: 'right', color: 'var(--orange)' }}>
                         {formatCurrency(data.totalCogs)}
                       </td>
                       <td style={{ textAlign: 'right', color: 'var(--orange)' }}>
                         {formatPercent(calculateRatio(data.totalCogs))}
                       </td>
-                      <td>Food Cost global</td>
+                      <td>{data.cogs?.method === 'inventaire' ? 'Achats ± variation de stock' : 'Achats de la période (pas d\'inventaire aux bornes)'}</td>
                     </tr>
                     <PnlRow
                       label="Achats Alimentaires"
@@ -1080,6 +1123,33 @@ export default function PnlPage() {
                       note="Sans facture : contenu inconnu, matériel compris (cliquer pour voir)"
                       onClick={() => openDetail('bank_suppliers_unreconciled')}
                     />
+
+                    {/* Variation de stock : ce qui a été acheté mais pas consommé
+                        (ou consommé sur le stock du mois précédent). Signe
+                        comptable : un stock qui grossit RÉDUIT le coût consommé. */}
+                    {data.cogs?.method === 'inventaire' && (
+                      <tr className="interactive-row">
+                        <td style={{ paddingLeft: 32 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <Eye size={12} style={{ color: 'var(--orange)' }} /> Variation de stock
+                          </div>
+                        </td>
+                        <td style={{ textAlign: 'right', color: data.cogs.stockVariation > 0 ? 'var(--green)' : 'var(--red)' }}>
+                          {data.cogs.stockVariation > 0 ? '−' : '+'}{formatCurrency(Math.abs(data.cogs.stockVariation))}
+                        </td>
+                        <td style={{ textAlign: 'right', color: 'var(--text-secondary)' }}>{formatPercent(calculateRatio(-data.cogs.stockVariation))}</td>
+                        <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                          Stock {formatCurrency(data.cogs.opening!.value)} le {formatDate(data.cogs.opening!.day)} → {formatCurrency(data.cogs.closing!.value)} le {formatDate(data.cogs.closing!.day)}, sur {data.cogs.commonProducts} produits comptés aux deux dates
+                        </td>
+                      </tr>
+                    )}
+                    {data.cogs && data.cogs.method === 'achats' && data.achatsHt > 0 && (
+                      <tr>
+                        <td colSpan={4} style={{ padding: '8px 16px 8px 32px', fontSize: 12, color: 'var(--text-muted)' }}>
+                          Coût matières calculé sur les achats : {data.cogs.reason} Un inventaire au tournant du mois le transformerait en consommation réelle.
+                        </td>
+                      </tr>
+                    )}
 
                     {/* Le food cost ne vaut que ce que vaut son détail. Tant
                         qu'une part vient de virements bruts, c'est un plafond,
@@ -1268,6 +1338,7 @@ export default function PnlPage() {
                 Le compte de résultat (P&L) consolide de façon asynchrone les données de vente de votre caisse Square avec les écritures comptables extraites de vos factures et relevés bancaires. Toute transaction bancaire pointée avec sa facture est consolidée afin de vous offrir une vision nette et exempte de doublons.
               </div>
             </div>
+            <ClosuresPanel />
           </>
         )}
       </div>

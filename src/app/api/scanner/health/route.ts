@@ -48,13 +48,13 @@ async function checkConfig(engine: { provider: string; model: string }) {
   if (!appUrl) {
     missing.push({
       variable: 'NEXT_PUBLIC_APP_URL',
-      impact: 'Webhook Square rejeté + connexion Google impossible',
+      impact: 'Webhook Square rejeté (signature calculée sur une mauvaise URL)',
     });
   }
 
-  // Variables optionnelles (les avis Google fonctionnent sans)
-  const optional = ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_PLACES_API_KEY', 'GOOGLE_PLACE_ID']
-    .filter(key => !process.env[key]?.trim());
+  // Variables optionnelles : le travail planifié tourne sans, mais refuse alors
+  // de travailler (503) — c'est voulu, la route écrit en base.
+  const optional = ['CRON_SECRET'].filter(key => !process.env[key]?.trim());
 
   return {
     ok: missing.length === 0,

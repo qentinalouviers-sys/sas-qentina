@@ -3,7 +3,8 @@
 import { useState, useEffect, useCallback, type ReactNode } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate, toISODate, CATEGORY_LABELS, downloadCSV } from '@/lib/utils';
-import { Upload, FileText, Filter, Download, Search, Paperclip, Banknote, CreditCard, Link2, X, Info, ArrowRight, Trash2, CheckCircle, Check, Loader2, Clock } from 'lucide-react';
+import Link from 'next/link';
+import { ScanLine, FileText, Filter, Download, Search, Paperclip, Banknote, CreditCard, Link2, X, Info, ArrowRight, Trash2, CheckCircle, Check, Loader2, Clock } from 'lucide-react';
 import type { Invoice, Supplier, InvoiceLine } from '@/lib/types';
 import ClaudeStatusIndicator from '@/components/ClaudeStatusIndicator';
 
@@ -155,9 +156,7 @@ export default function FacturesPage() {
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [lines, setLines] = useState<InvoiceLine[]>([]);
   const [loading, setLoading] = useState(true);
-  const [uploading, setUploading] = useState(false);
   const [selectedInvoice, setSelectedInvoice] = useState<string | null>(null);
-  const [dragActive, setDragActive] = useState(false);
 
   // Reconciliation states
   const [linkedTx, setLinkedTx] = useState<any>(null);
@@ -373,70 +372,6 @@ export default function FacturesPage() {
     }
   };
 
-  const handleUpload = async (file: File) => {
-    if (!file) return;
-    const isPDF = file.type === 'application/pdf' || file.name.endsWith('.pdf');
-    const isImage = file.type.startsWith('image/') || file.name.endsWith('.jpg') || file.name.endsWith('.jpeg') || file.name.endsWith('.png') || file.name.endsWith('.webp');
-    
-    if (!isPDF && !isImage) {
-      alert('Veuillez uploader un fichier PDF ou une image (JPG, PNG, WEBP).');
-      return;
-    }
-
-    let mimeType = file.type;
-    if (!mimeType) {
-      if (file.name.endsWith('.pdf')) mimeType = 'application/pdf';
-      else if (file.name.endsWith('.jpg') || file.name.endsWith('.jpeg')) mimeType = 'image/jpeg';
-      else if (file.name.endsWith('.png')) mimeType = 'image/png';
-      else if (file.name.endsWith('.webp')) mimeType = 'image/webp';
-      else mimeType = 'application/octet-stream';
-    }
-
-    setUploading(true);
-    try {
-      const reader = new FileReader();
-      reader.onload = async () => {
-        const base64 = (reader.result as string).split(',')[1];
-        const res = await fetch('/api/invoices/extract', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            fileBase64: base64,
-            mimeType: mimeType,
-            filename: file.name
-          }),
-        });
-        const data = await res.json();
-        if (data.success) {
-          if (data.reconciled_tx_id) {
-            alert(`Facture importée avec succès ! Réf: ${data.accounting_ref || 'Créée'}.\nElle a été automatiquement rapprochée d'une transaction bancaire correspondante.`);
-          } else {
-            alert(`Facture importée avec succès ! Réf: ${data.accounting_ref || 'Créée'}.`);
-          }
-          await loadData();
-          if (data.invoice_id) loadLines(data.invoice_id);
-        } else {
-          alert('Erreur extraction : ' + (data.error || 'Inconnu'));
-        }
-        setUploading(false);
-      };
-      reader.onerror = () => {
-        setUploading(false);
-        alert('Erreur lors de la lecture du fichier.');
-      };
-      reader.readAsDataURL(file);
-    } catch {
-      alert('Erreur lors de l\'upload');
-      setUploading(false);
-    }
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragActive(false);
-    if (e.dataTransfer.files.length) handleUpload(e.dataTransfer.files[0]);
-  };
-
   const updateCategory = async (lineId: string, category: string) => {
     await supabase.from('invoice_lines').update({ category }).eq('id', lineId);
     setLines(prev => prev.map(l => l.id === lineId ? { ...l, category: category as InvoiceLine['category'] } : l));
@@ -569,37 +504,21 @@ export default function FacturesPage() {
         </div>
       </div>
       <div className="page-body">
-        {/* Upload Zone */}
-        <div
-          className={`dropzone ${dragActive ? 'active' : ''}`}
-          onDragOver={e => { e.preventDefault(); setDragActive(true); }}
-          onDragLeave={() => setDragActive(false)}
-          onDrop={handleDrop}
-          onClick={() => {
-            const i = document.createElement('input'); 
-            i.type = 'file'; 
-            i.accept = '.pdf,.jpg,.jpeg,.png,.webp'; 
-            i.onchange = (e) => { 
-              const f = (e.target as HTMLInputElement).files?.[0]; 
-              if (f) handleUpload(f); 
-            }; 
-            i.click(); 
-          }}
-          style={{ marginBottom: 24 }}
+        {/* Toute facture passe par le Scanner : les données lues par l'IA y
+            sont relues et les points inhabituels confirmés avant d'entrer en
+            base. L'import direct depuis cette page enregistrait sans relecture
+            et lettrait au premier montant approchant. */}
+        <Link
+          href="/scanner"
+          className="dropzone"
+          style={{ marginBottom: 24, display: 'block', textDecoration: 'none', color: 'inherit' }}
         >
-          {uploading ? (
-            <>
-              <div className="spinner" style={{ width: 32, height: 32, margin: '0 auto 12px' }} />
-              <div className="dropzone-text">Extraction IA et rapprochement automatique en cours...</div>
-            </>
-          ) : (
-            <>
-              <Upload size={40} style={{ color: 'var(--teal)', marginBottom: 12 }} />
-              <div className="dropzone-text">Glissez une Facture (PDF ou image) ici ou cliquez</div>
-              <div className="dropzone-hint">Détourage des lignes de commande et pointage automatique avec la banque</div>
-            </>
-          )}
-        </div>
+          <ScanLine size={40} style={{ color: 'var(--teal)', marginBottom: 12 }} />
+          <div className="dropzone-text">Ajouter une facture : ouvrir le Scanner</div>
+          <div className="dropzone-hint">
+            Lecture par l&apos;IA, relecture des points douteux, puis rapprochement bancaire — rien n&apos;entre en base sans ton accord.
+          </div>
+        </Link>
 
         {/* Filters */}
         <div className="filter-bar">

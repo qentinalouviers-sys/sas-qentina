@@ -11,6 +11,7 @@ import {
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate } from '@/lib/utils';
 import ClaudeStatusIndicator from '@/components/ClaudeStatusIndicator';
+import type { InvoiceAnomaly } from '@/lib/invoice-checks';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -44,6 +45,8 @@ interface ScanResult {
   duplicate_invoice: any | null;
   bank_candidates: BankCandidate[];
   match_confidence: 'high' | 'medium' | 'low' | 'none';
+  /** Points à vérifier avant d'enregistrer (voir lib/invoice-checks.ts). */
+  anomalies?: InvoiceAnomaly[];
 }
 
 type QueueStatus =
@@ -147,7 +150,10 @@ interface CardProps {
   item: QueueItem;
   isActive: boolean;
   onRemove: () => void;
-  onConfirm: (id: string, bankId: string | null, pm: 'bank'|'cash'|'card_perso', associe?: 'justine' | 'yohan') => Promise<void>;
+  onConfirm: (
+    id: string, bankId: string | null, pm: 'bank'|'cash'|'card_perso',
+    associe: 'justine' | 'yohan' | undefined, confirmations: string[],
+  ) => Promise<void>;
   onToggleCandidates: () => void;
   onToggleManual: () => Promise<void>;
   bankTxList: any[];
@@ -158,6 +164,15 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
   const [confirming, setConfirming] = useState(false);
   const [showCcaSelector, setShowCcaSelector] = useState(false);
   const [showCashSelector, setShowCashSelector] = useState(false);
+  // Points inhabituels que l'utilisateur a cochés « j'ai vérifié ». Tant que
+  // tous ne le sont pas, les boutons d'enregistrement n'apparaissent pas :
+  // le contrôle humain est exigé, pas suggéré.
+  const [acked, setAcked] = useState<Set<string>>(() => new Set());
+
+  const anomalies  = item.result?.anomalies ?? [];
+  const blocking   = anomalies.filter(a => a.level === 'bloquant');
+  const toConfirm  = anomalies.filter(a => a.level === 'a_confirmer');
+  const canAct     = blocking.length === 0 && toConfirm.every(a => acked.has(a.code));
 
   const isTerminal = TERMINAL.includes(item.status);
   const canRemove  = (item.status === 'pending' || isTerminal) && !item.actionTaken;
@@ -172,7 +187,7 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
 
   const doConfirm = async (bankId: string | null, pm: 'bank'|'cash'|'card_perso', associe?: 'justine' | 'yohan') => {
     setConfirming(true);
-    await onConfirm(item.id, bankId, pm, associe);
+    await onConfirm(item.id, bankId, pm, associe, Array.from(acked));
     setConfirming(false);
   };
 
@@ -390,6 +405,21 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
                 )}
               </div>
 
+              {/* ── Points à vérifier avant d'enregistrer ── */}
+              {anomalies.length > 0 && (
+                <AnomalyPanel
+                  anomalies={anomalies}
+                  acked={acked}
+                  onToggle={code => setAcked(prev => {
+                    const next = new Set(prev);
+                    if (next.has(code)) next.delete(code); else next.add(code);
+                    return next;
+                  })}
+                  onRemove={onRemove}
+                />
+              )}
+
+              {canAct && (<>
               {/* ── HIGH confidence match ── */}
               {item.result.match_confidence === 'high' && item.result.bank_candidates.length > 0 && (
                 <div style={{
@@ -662,6 +692,7 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
                   </div>
                 </div>
               )}
+              </>)}
             </div>
           )}
         </div>
@@ -671,6 +702,79 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
 }
 
 // ─── Small shared sub-components ─────────────────────────────────────────────
+
+/**
+ * Ce que l'humain doit regarder avant d'enregistrer.
+ *
+ * Les bloquants n'ont pas de case : la facture ne peut pas entrer en l'état,
+ * il faut la rescanner ou la saisir autrement. Les points à confirmer exigent
+ * une coche chacun — pas de « tout accepter », c'est précisément le geste
+ * qu'on veut empêcher.
+ */
+function AnomalyPanel({ anomalies, acked, onToggle, onRemove }: {
+  anomalies: InvoiceAnomaly[];
+  acked: Set<string>;
+  onToggle: (code: string) => void;
+  onRemove: () => void;
+}) {
+  const blocking  = anomalies.filter(a => a.level === 'bloquant');
+  const toConfirm = anomalies.filter(a => a.level === 'a_confirmer');
+  const remaining = toConfirm.filter(a => !acked.has(a.code)).length;
+
+  return (
+    <div style={{
+      border: `1px solid ${blocking.length ? 'rgba(217,79,79,0.35)' : 'rgba(232,155,62,0.4)'}`,
+      background: blocking.length ? 'rgba(217,79,79,0.05)' : 'rgba(232,155,62,0.07)',
+      borderRadius: 10, padding: 12, marginBottom: 14,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <AlertCircle size={15} style={{ color: blocking.length ? 'var(--red)' : '#B45309', flexShrink: 0 }} />
+        <span style={{ fontSize: 12, fontWeight: 800, color: blocking.length ? 'var(--red)' : '#92400E' }}>
+          {blocking.length
+            ? 'Facture refusée en l\'état'
+            : remaining > 0
+              ? `${remaining} point${remaining > 1 ? 's' : ''} à vérifier avant d'enregistrer`
+              : 'Points vérifiés — tu peux enregistrer'}
+        </span>
+      </div>
+
+      {blocking.map(a => (
+        <div key={a.code} style={{ fontSize: 12, color: '#7F1D1D', lineHeight: 1.5, padding: '6px 0', borderTop: '1px solid rgba(217,79,79,0.15)' }}>
+          <strong>{a.message}</strong>
+          <div style={{ color: '#991B1B', marginTop: 2 }}>{a.verification}</div>
+        </div>
+      ))}
+
+      {toConfirm.map(a => (
+        <label key={a.code} style={{
+          display: 'flex', gap: 10, alignItems: 'flex-start', cursor: 'pointer',
+          fontSize: 12, lineHeight: 1.5, padding: '6px 0', borderTop: '1px solid rgba(232,155,62,0.2)',
+          opacity: acked.has(a.code) ? 0.65 : 1,
+        }}>
+          <input
+            type="checkbox"
+            checked={acked.has(a.code)}
+            onChange={() => onToggle(a.code)}
+            style={{ marginTop: 3, flexShrink: 0 }}
+          />
+          <span>
+            <strong style={{ color: '#78350F' }}>{a.message}</strong>
+            <div style={{ color: '#92400E', marginTop: 2 }}>{a.verification}</div>
+            {acked.has(a.code) && <div style={{ color: 'var(--green)', fontWeight: 700, marginTop: 2 }}>Vérifié</div>}
+          </span>
+        </label>
+      ))}
+
+      {blocking.length > 0 && (
+        <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+          <button className="btn btn-ghost btn-sm" onClick={onRemove} style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            Retirer de la file
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function DataPill({ label, value, valueColor, mono }: { label: string; value: string; valueColor?: string; mono?: boolean }) {
   return (
@@ -730,6 +834,13 @@ export default function ScannerPage() {
 
   const isProcessingRef  = useRef(false);
   const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Mouvement bancaire désigné par la page Banque (« joindre la facture »).
+  // Lu dans window.location plutôt que via useSearchParams : cette page est
+  // pré-rendue statiquement, et useSearchParams y exigerait une frontière
+  // Suspense pour un simple paramètre optionnel.
+  const [pinnedTx, setPinnedTx] = useState<BankCandidate | null>(null);
+  const pinnedTxRef = useRef<BankCandidate | null>(null);
   const cameraRef        = useRef<HTMLInputElement>(null);
   const fileRef          = useRef<HTMLInputElement>(null);
   const supabase         = createClient();
@@ -737,6 +848,31 @@ export default function ScannerPage() {
   // Nettoyage du timer de progression au démontage du composant
   useEffect(() => () => {
     if (progressTimerRef.current) clearInterval(progressTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get('bank_tx');
+    if (!id) return;
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase
+        .from('bank_transactions')
+        .select('id, date, description, amount, status')
+        .eq('id', id)
+        .maybeSingle();
+      if (cancelled || !data) return;
+      const tx: BankCandidate = { ...data, score: 100, amount_diff: 0, date_diff: 0 };
+      pinnedTxRef.current = tx;
+      setPinnedTx(tx);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- lecture unique de l'URL au montage
+  }, []);
+
+  const unpinTx = useCallback(() => {
+    pinnedTxRef.current = null;
+    setPinnedTx(null);
+    window.history.replaceState(null, '', '/scanner');
   }, []);
 
   // ── Queue helpers ──────────────────────────────────────────────────────────
@@ -854,6 +990,15 @@ export default function ScannerPage() {
       // Step 4 — matching
       upd({ status: 'matching', progress: 90, step: 'Recherche de rapprochement bancaire...' });
 
+      // Le mouvement désigné depuis la page Banque passe en tête des
+      // candidats : c'est lui que l'utilisateur est venu rattacher. Il reste
+      // libre de choisir autrement si la lecture montre que ce n'est pas lui.
+      const pinned = pinnedTxRef.current;
+      if (pinned && !data.is_duplicate) {
+        data.bank_candidates = [pinned, ...(data.bank_candidates ?? []).filter((c: BankCandidate) => c.id !== pinned.id)];
+        data.match_confidence = 'high';
+      }
+
       // Step 5 — result
       if (data.is_duplicate) {
         upd({ status: 'duplicate', progress: 100, step: '⚠️ Doublon détecté', result: data });
@@ -885,7 +1030,8 @@ export default function ScannerPage() {
     itemId: string,
     bankId: string | null,
     pm: 'bank' | 'cash' | 'card_perso',
-    associe?: 'justine' | 'yohan'
+    associe: 'justine' | 'yohan' | undefined,
+    confirmations: string[],
   ) => {
     const item = queue.find(i => i.id === itemId);
     if (!item?.result) return;
@@ -900,6 +1046,7 @@ export default function ScannerPage() {
           bank_tx_id:     bankId,
           payment_method: pm,
           associe:        associe,
+          confirmations,
         }),
       });
       const data = await res.json();
@@ -992,6 +1139,30 @@ export default function ScannerPage() {
       </div>
 
       <div className="page-body">
+
+        {/* ── Mouvement bancaire à rattacher (venu de la page Banque) ── */}
+        {pinnedTx && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+            background: 'rgba(42,125,123,0.07)', border: '1px solid rgba(42,125,123,0.3)',
+            borderRadius: 12, padding: '12px 16px', marginBottom: 20,
+          }}>
+            <Link2 size={16} style={{ color: 'var(--teal)', flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 200, fontSize: 13 }}>
+              <div style={{ fontWeight: 800, color: 'var(--teal)' }}>Facture à rattacher à ce mouvement bancaire</div>
+              <div style={{ color: 'var(--text-secondary)', marginTop: 2 }}>
+                {formatDate(pinnedTx.date)} · {pinnedTx.description} ·{' '}
+                <strong style={{ color: 'var(--red)' }}>{formatCurrency(pinnedTx.amount)}</strong>
+              </div>
+              <div style={{ color: 'var(--text-muted)', fontSize: 12, marginTop: 2 }}>
+                Il sera proposé en premier après la lecture. Si le montant lu ne correspond pas, ne le lie pas.
+              </div>
+            </div>
+            <button className="btn btn-ghost btn-sm" onClick={unpinTx} style={{ fontSize: 12 }}>
+              <X size={13} /> Ne pas pré-sélectionner
+            </button>
+          </div>
+        )}
 
         {/* ── KPI strip ───────────────────────────────────────────────── */}
         {total > 0 && (

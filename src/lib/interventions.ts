@@ -23,6 +23,9 @@
  */
 
 import { SupabaseClient } from '@supabase/supabase-js';
+import { unmatchedDesignations } from '@/lib/referentiel';
+import { inventorySessions, sessionAtBoundary } from '@/lib/cogs';
+import { isFuelPurchase } from '@/lib/mileage';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { foldLabel, isFinancialFlow, round2 } from './accounting';
 import { computeTva, TvaResult } from './tva';
@@ -134,8 +137,31 @@ export interface InterventionFacts {
   /** Solde du compte courant par associé (positif = la société lui doit). */
   ccaBalances: { associe: string; balance: number }[];
 
-  /** Trajets non portés au compte courant d'associé. */
+  /**
+   * Trajets non portés au compte courant d'associé, parmi ceux qui datent
+   * d'au moins 45 jours : une note de frais se fait au mois ou au trimestre,
+   * pas le lendemain de la course.
+   */
   tripsNotInCca: { count: number };
+  /** Trajets (barème kilométrique) enregistrés dans la période. */
+  tripsInPeriod: number;
+  /** Pleins de carburant payés par la société dans la période. */
+  fuelDebits: { count: number; amount: number };
+  /**
+   * Désignations alimentaires de factures qui ne correspondent à aucun
+   * ingrédient ni alias : leurs prix ne mettent à jour aucune fiche.
+   */
+  unmatchedDesignations: { count: number; sample: string[] };
+  /**
+   * Écritures que l'ancien bouton « masquer » du P&L excluait du résultat.
+   * Le bouton n'existe plus ; elles sont réintégrées, et il faut les relire.
+   */
+  legacyMaskedItems: number;
+  /**
+   * Inventaire physique disponible pour la borne de FIN de la période (à
+   * moins de 7 jours). Sans lui, le coût matières n'est qu'un cumul d'achats.
+   */
+  inventoryClosing: { found: boolean; day: string | null };
 }
 
 const SEVERITY_RANK: Record<Severity, number> = {
@@ -565,9 +591,50 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
         `Le même fournisseur existe donc deux fois sous deux orthographes, et ses ` +
         `achats sont répartis entre les deux fiches : aucun des deux totaux n'est ` +
         `exploitable.`,
-      action: 'Renomme la fiche fautive, puis fusionne-la avec la fiche correcte.',
-      href: '/factures',
-      hrefLabel: 'Factures → fournisseurs',
+      action: 'Fusionne la fiche fautive dans la fiche correcte.',
+      href: '/reglages?tab=suppliers',
+      hrefLabel: 'Réglages → Fournisseurs',
+    });
+  }
+
+  // ── 14 bis. Carburant payé par la société ET barème kilométrique ──────────
+  // Le barème couvre déjà le carburant. Un plein sur le compte de la société
+  // le même mois qu'une indemnité kilométrique déduit la même dépense deux
+  // fois — c'est ce qu'un contrôleur cherche en premier sur une note de frais.
+  if (f.tripsInPeriod > 0 && f.fuelDebits.count > 0) {
+    out.push({
+      id: 'carburant-et-bareme',
+      severity: 'important',
+      title: `${eur(f.fuelDebits.amount)} de carburant payés par la société, avec ${f.tripsInPeriod} trajet(s) au barème`,
+      impact:
+        `L'indemnité kilométrique couvre déjà le carburant, l'assurance et l'usure du ` +
+        `véhicule. Un plein payé par la société en plus est déduit deux fois : au réel ` +
+        `dans les charges, et dans l'indemnité. En contrôle, c'est la première chose ` +
+        `qu'on reprend sur une note de frais.`,
+      action: 'Soit le plein est un frais personnel (à porter en remboursement au compte courant), soit le trajet du jour sort de la note de frais.',
+      href: '/banque',
+      hrefLabel: 'Banque → pleins de carburant',
+      amount: f.fuelDebits.amount,
+    });
+  }
+
+  // ── 15. Désignations de factures non rattachées à un ingrédient ──────────
+  // Un prix d'achat qui ne met à jour aucune fiche laisse les coûts des
+  // recettes à leur ancienne valeur : le food cost par plat vieillit sans que
+  // rien ne le dise. Seuil : une ou deux désignations orphelines, c'est le
+  // bruit normal d'une facture ; au-delà, la mercuriale décroche.
+  if (f.unmatchedDesignations.count >= 3) {
+    out.push({
+      id: 'designations-non-rattachees',
+      severity: 'a_verifier',
+      title: `${f.unmatchedDesignations.count} désignations de factures sans ingrédient`,
+      impact:
+        `« ${f.unmatchedDesignations.sample[0]} » et ${f.unmatchedDesignations.count - 1} autres libellés ` +
+        `achetés ne correspondent à aucun ingrédient : leurs prix ne mettent rien à jour, ` +
+        `et le coût des fiches techniques date du dernier libellé reconnu.`,
+      action: 'Rattache chaque désignation à son ingrédient, ou crée l\'ingrédient manquant.',
+      href: '/reglages?tab=ingredients',
+      hrefLabel: 'Réglages → Ingrédients',
     });
   }
 
@@ -584,6 +651,51 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
       action: 'Ouvre la note de frais et porte les trajets au compte courant.',
       href: '/trajets',
       hrefLabel: 'Frais kilométriques',
+    });
+  }
+
+  // ── 16. Écritures autrefois masquées du P&L ───────────────────────────────
+  // Elles avaient été retirées du résultat à la main, sans motif ni trace. Le
+  // P&L les réintègre ; certaines sont peut-être mal catégorisées, et c'est là
+  // qu'il faut les corriger — pas en les cachant.
+  if (f.legacyMaskedItems > 0) {
+    out.push({
+      id: 'ecritures-ex-masquees',
+      severity: 'a_verifier',
+      title: `${f.legacyMaskedItems} écriture(s) réintégrée(s) au résultat`,
+      impact:
+        `Ces écritures avaient été masquées du P&L à la main. Le masquage n'existe plus : ` +
+        `un compte de résultat ajustable sans trace n'est pas un outil comptable. Elles ` +
+        `comptent de nouveau — si l'une n'a rien à y faire, c'est sa catégorie qui est fausse.`,
+      action: 'Relis-les dans le détail des postes du P&L et corrige leur catégorie.',
+      href: '/pnl',
+      hrefLabel: 'P&L → détail des postes',
+    });
+  }
+
+  // ── 17. Pas d'inventaire en fin de période ────────────────────────────────
+  // Sans inventaire aux bornes, le coût matières est « achats ÷ CA » : une
+  // grosse commande le 30 gonfle le mois et flatte le suivant. On ne réclame
+  // un inventaire que pour une période d'au moins un mois déjà écoulée, avec
+  // des achats dedans : un inventaire hebdomadaire serait du bruit.
+  if (
+    !f.inventoryClosing.found
+    && f.end < f.today
+    && daysBetween(f.start, f.end) >= 27
+    && f.debitsCount > 0
+  ) {
+    out.push({
+      id: 'inventaire-fin-de-periode',
+      severity: 'a_verifier',
+      title: `Pas d'inventaire autour du ${jour(f.end)}`,
+      impact:
+        `Sans stock de fin de période, le coût matières affiché est la somme des achats, ` +
+        `pas ce qui a été consommé : une commande passée le 30 compte dans ce mois ` +
+        `alors qu'elle sera vendue le mois suivant. Le food cost n'est alors pas comparable ` +
+        `d'un mois à l'autre.`,
+      action: 'Compte les produits qui pèsent le plus (farine, mozzarella, tomate, viandes) au tournant du mois.',
+      href: '/stock',
+      hrefLabel: 'Stock → Faire l\'inventaire',
     });
   }
 
@@ -628,7 +740,7 @@ export async function collectInterventionFacts(
   // tronque à 1 000 lignes sans le dire. Sur un exercice de 1 788 commandes, ce
   // module comparait les versements bancaires à un CA amputé de 44 % — et
   // annonçait « des ventes manquantes » en désignant la mauvaise cause.
-  const [orders, lastRes, firstRes, bank, invoices, suppliers, cca, trips, tva] =
+  const [orders, lastRes, firstRes, bank, invoices, suppliers, cca, trips, tva, foodLines, ingredients, aliases, maskedRes, counts] =
     await Promise.all([
       fetchAllRows<any>((f0, f1) => supabase.from('square_orders')
         .select('service, net_amount, raw_data')
@@ -653,9 +765,22 @@ export async function collectInterventionFacts(
         .select('name').range(f0, f1)),
       fetchAllRows<any>((f0, f1) => supabase.from('mouvements_cca')
         .select('associe, sens, montant').range(f0, f1)),
-      fetchAllRows<any>((f0, f1) => supabase.from('mileage_trips')
-        .select('id, cca_movement_id').range(f0, f1)),
+      fetchAllRows<{ id: string; date: string | null; cca_movement_id: string | null }>((f0, f1) => supabase.from('mileage_trips')
+        .select('id, date, cca_movement_id').range(f0, f1)),
       computeTva(supabase, start, end),
+      fetchAllRows<{ designation: string | null }>((f0, f1) => supabase.from('invoice_lines')
+        .select('designation')
+        .in('category', ['alimentaire', 'boisson'])
+        .range(f0, f1)),
+      fetchAllRows<{ id: string; name: string }>((f0, f1) => supabase.from('ingredients')
+        .select('id, name').range(f0, f1)),
+      fetchAllRows<{ alias: string; ingredient_id: string }>((f0, f1) => supabase.from('ingredient_aliases')
+        .select('alias, ingredient_id').range(f0, f1)),
+      // Bornée par construction : une clé de réglage.
+      supabase.from('app_settings').select('value').eq('key', 'masked_items').limit(1),
+      fetchAllRows<{ ingredient_id: string; quantity: number | null; unit_price: number | null; counted_at: string }>(
+        (f0, f1) => supabase.from('inventory_counts')
+          .select('ingredient_id, quantity, unit_price, counted_at').range(f0, f1)),
     ]);
 
   let caSquareTtc = 0;
@@ -719,7 +844,35 @@ export async function collectInterventionFacts(
     balances.set(m.associe, round2((balances.get(m.associe) || 0) + signed));
   }
 
-  const tripsNotInCca = trips.filter((t: any) => !t.cca_movement_id).length;
+  // Trajets à porter au compte courant : ceux d'au moins 45 jours. Une note
+  // de frais se fait au mois ou au trimestre, pas le lendemain de la course.
+  const olderThan45 = addDays(today, -45);
+  const tripsNotInCca = trips.filter(t => !t.cca_movement_id && String(t.date ?? '') <= olderThan45).length;
+  const tripsInPeriod = trips.filter(t => { const d = String(t.date ?? ''); return d >= start && d <= end; }).length;
+
+  // Pleins de carburant payés par la société sur la période.
+  let fuelCount = 0;
+  let fuelAmount = 0;
+  for (const t of bank) {
+    if ((t.amount || 0) >= 0) continue;
+    if (isFinancialFlow(t.description || '', t.category)) continue;
+    if (isFuelPurchase(t.description || '')) { fuelCount++; fuelAmount += Math.abs(t.amount || 0); }
+  }
+
+  // ── Mercuriale : désignations orphelines ─────────────────────────────────
+  const orphans = unmatchedDesignations(foodLines, ingredients, aliases);
+
+  // ── Inventaire de fin de période ─────────────────────────────────────────
+  const closingSession = sessionAtBoundary(inventorySessions(counts), end);
+
+  // ── P&L : écritures autrefois masquées ───────────────────────────────────
+  let legacyMaskedItems = 0;
+  try {
+    const raw = maskedRes.data?.[0]?.value;
+    if (raw) legacyMaskedItems = (JSON.parse(raw) as unknown[]).length;
+  } catch {
+    // Valeur corrompue : rien à réintégrer de lisible.
+  }
 
   // Bornes réelles des relevés importés à l'intérieur de la fenêtre. Sert à
   // dire si les achats couvrent la même durée que les ventes.
@@ -760,5 +913,13 @@ export async function collectInterventionFacts(
     mojibakeSuppliers: mojibake,
     ccaBalances: [...balances].map(([associe, balance]) => ({ associe, balance })),
     tripsNotInCca: { count: tripsNotInCca },
+    tripsInPeriod,
+    fuelDebits: { count: fuelCount, amount: round2(fuelAmount) },
+    unmatchedDesignations: {
+      count: orphans.length,
+      sample: orphans.slice(0, 5).map(o => o.designation),
+    },
+    legacyMaskedItems,
+    inventoryClosing: { found: !!closingSession, day: closingSession?.day ?? null },
   };
 }

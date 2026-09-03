@@ -1,8 +1,11 @@
 # 🍕 QENTINA — Pilotage de pizzeria
 
-SaaS de gestion pour pizzeria napolitaine : ventes Square, scanner de factures par IA,
-banque, TVA, P&L, comptes d'associés, stock, fiches techniques, menu engineering,
-avis Google et assistant IA « Fuego ».
+Outil de pilotage et de comptabilité pour pizzeria napolitaine : ventes Square, scanner
+de factures par IA, banque, TVA, P&L, comptes d'associés, frais kilométriques, inventaire,
+fiches techniques et assistant IA « Fuego ».
+
+Il n'affiche que ce qu'il sait mesurer. Un chiffre qui ne peut pas être juste n'est
+pas affiché ; une donnée qui entre en base sans qu'un humain l'ait relue n'entre pas.
 
 > 📋 **Nouveau ici ?** Lis [`AUDIT.md`](./AUDIT.md) : il explique l'architecture, les choix
 > et tout ce qui a été corrigé lors de la grande révision d'août 2026.
@@ -12,8 +15,8 @@ avis Google et assistant IA « Fuego ».
 - **Next.js 16** (App Router, `proxy.ts` pour l'auth) + React 19 + TypeScript strict
 - **Supabase** : base Postgres + Auth + Storage (fichiers de factures)
 - **Square** : source des ventes et **référence du chiffre d'affaires** (synchro nocturne automatique + webhook temps réel)
-- **Anthropic Claude** : OCR de factures/relevés, audits, chat Fuego
-- **Google** : avis (Places API) + réponses (My Business API, OAuth)
+- **Google Gemini** : OCR des factures (le poste IA le plus coûteux, au tarif le plus bas)
+- **Anthropic Claude** : catégorisation bancaire, audits, chat Fuego
 
 ## Démarrage
 
@@ -40,8 +43,6 @@ npm run dev
 | `SQUARE_LOCATION_ID` | Identifiant du point de vente Square |
 | `SQUARE_WEBHOOK_SECRET` | **Important** : secret de signature du webhook (Square Developer Dashboard) |
 | `NEXT_PUBLIC_APP_URL` | URL publique de l'app (ex. `https://…vercel.app`) |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OAuth Google Business (réponses aux avis) |
-| `GOOGLE_PLACES_API_KEY` / `GOOGLE_PLACE_ID` | Lecture des avis Google |
 | `CRON_SECRET` | **Obligatoire** : authentifie la synchro Square nocturne. Absente, elle refuse de tourner |
 
 ### Moteur d'OCR des factures
@@ -110,6 +111,9 @@ savoir qu'une clé est bonne sans l'apprendre au milieu d'un scan de facture.
 3. Créer le bucket Storage **`invoice-files`** (public) pour les fichiers de factures.
 4. Module frais kilométriques : exécuter `db/migration_trajets.sql`.
 5. Clés IA gérées depuis l'application : exécuter `db/migration_ai_settings.sql`.
+6. Correspondances désignation → ingrédient : exécuter `db/migration_referentiel.sql`.
+7. Verrou du compte courant d'associé : exécuter `db/migration_cca_verrou.sql`.
+8. Clôture mensuelle : exécuter `db/migration_clotures.sql`.
 
 > ⚠️ La migration consolidée est à **ré-exécuter** après une mise à jour qui
 > ajoute une catégorie bancaire : la contrainte `CHECK` de `bank_transactions`
@@ -180,11 +184,14 @@ base et consomme l'API Square.
 npm run verify:compta
 ```
 
-171 contrôles de non-régression sur les calculs de TVA, la classification des
-écritures, le lettrage et la détection des anomalies. **À lancer après toute
+317 contrôles de non-régression sur les calculs de TVA, la classification des
+écritures, le lettrage, la détection des anomalies, les verrous à
+l'enregistrement d'une facture, le référentiel, la règle du compte courant, le
+coût matières consommé et l'équilibre de chaque écriture exportée. **À lancer après toute
 modification touchant `src/lib/tva.ts`, `src/lib/accounting.ts`,
 `src/lib/bank-csv.ts`, `src/lib/interventions.ts`, `src/lib/reconciliation.ts`,
-le P&L ou le tableau de bord.** Chaque contrôle correspond à une erreur qui a
+`src/lib/invoice-checks.ts`, `src/lib/referentiel.ts`, `src/lib/cca.ts`,
+`src/lib/cogs.ts`, `src/lib/fec.ts`, le P&L ou le tableau de bord.** Chaque contrôle correspond à une erreur qui a
 réellement été commise : TVA déduite sans facture, ventilation par taux ne
 réconciliant pas avec son total, taux à 7 % classé en 5,5 %, encaissement traité
 comme un achat, coût matières HT divisé par un chiffre d'affaires TTC, dépenses
@@ -208,6 +215,59 @@ contournées :
    `lib/accounting.ts`) sont le seul passage autorisé d'une base à l'autre — le
    P&L et le tableau de bord affichaient sinon deux food cost différents pour le
    même mois.
+
+## Verrous : ce qui n'entre pas sans un humain
+
+L'outil est un outil de comptabilité autant que de pilotage : un chiffre faux
+qui entre en base contamine tout ce qui en découle, et personne ne s'en aperçoit
+avant la déclaration de TVA. Quatre verrous, du plus au moins strict :
+
+| Verrou | Où | Ce qu'il refuse |
+|---|---|---|
+| **Compte courant d'associé** | Trigger Postgres (`db/migration_cca_verrou.sql`), miroir `lib/cca.ts` | Tout mouvement qui rend un solde débiteur à partir de sa date, quel que soit le chemin (écran, API, SQL). Art. L.225-43 C. com. |
+| **Facture incohérente** | `lib/invoice-checks.ts`, appliqué par `saveInvoice` | Pas de date, date future, HT > TTC, montants nuls, fournisseur absent. Refus sec. |
+| **Facture inhabituelle** | idem | 1er janvier, plus de 18 mois, pas de numéro, HT + TVA ≠ TTC, lignes qui ne somment pas, HT = TTC, plus de 5 000 €. Chaque point exige une coche « j'ai vérifié » ; le serveur recompte et refuse ce qui n'est pas acquitté. |
+| **Référentiel** | `lib/referentiel.ts` | Un libellé de facture ne met à jour un prix que s'il correspond **exactement** à un ingrédient ou à un alias validé. Plus de création automatique ; les orphelins attendent dans Réglages. |
+
+Trois principes derrière ces verrous :
+
+1. **Le serveur ne fait pas confiance à l'écran.** Une case à cocher est une
+   promesse ; la route API recompte et refuse ce qui n'est pas tenu.
+2. **Une seule porte d'entrée par donnée.** Toute facture passe par le Scanner ;
+   l'import « en un clic » a été retiré. Une écriture du P&L ne se masque pas :
+   sa catégorie se corrige dans le détail du poste, et la TVA suit.
+3. **Pas de chiffre qu'on ne sait pas mesurer.** Le stock théorique (cumul
+   depuis toujours, sans inventaire de départ) et le menu engineering
+   (recettes appariées par nom exact) ont été retirés plutôt qu'affichés faux.
+
+## Comptabilité : coût matières, clôture, export
+
+Trois briques font de l'outil une comptabilité tenue, et pas seulement un
+tableau de bord :
+
+**Coût matières consommé** (`lib/cogs.ts`). Le food cost n'est plus « achats ÷
+CA » mais *stock initial + achats − stock final*, dès que deux inventaires
+encadrent la période (à moins de 7 jours de chaque borne). La variation ne porte
+que sur les produits comptés aux deux dates — un inventaire partiel ne fabrique
+pas de variation fictive. Sans inventaire, l'outil retombe sur les achats et
+l'écrit, sur le P&L comme sur l'accueil.
+
+**Clôture mensuelle** (`db/migration_clotures.sql`, P&L → Clôtures). Un mois
+écoulé se clôture s'il n'a aucune intervention critique ouverte. Ses chiffres
+sont figés (instantané) et la base refuse ensuite toute écriture datée de ce mois
+sur les factures, la banque, le compte courant et les trajets — quel que soit le
+chemin. Réouverture possible, motivée, journalisée. Les ventes Square ne sont pas
+verrouillées (une commande tardive ne doit pas être perdue) : l'instantané permet
+de voir qu'un mois clôturé a bougé.
+
+**Export expert-comptable** (`lib/fec.ts`, bouton sur chaque mois clôturé).
+Quatre journaux — achats, ventes (une écriture par journée, éclatée par taux de
+TVA depuis les données Square), banque, opérations diverses — au format **FEC**
+(art. A47 A-1 du LPF), importé par tous les logiciels de cabinet, ou en CSV. Le
+plan de comptes vit dans `lib/plan-comptable.ts`. Chaque écriture est équilibrée
+au centime : l'export refuse de partir sinon. La TVA déductible ne figure que sur
+le journal des achats ; un paiement sans facture part en charge pour son TTC. Le
+SIREN (Réglages → Horaires & Services → Société) nomme le fichier.
 
 ## Module « À faire » (interventions)
 
@@ -241,16 +301,16 @@ une cause qui n'existe pas.
 src/
 ├── proxy.ts                  # Auth globale (pages → redirect, API → 401) + rôle comptable
 ├── app/
-│   ├── (dashboard)/          # Les 15 pages de l'application (accueil = module « À faire »)
+│   ├── (dashboard)/          # Les 12 pages de l'application (accueil = module « À faire »)
 │   ├── api/
 │   │   ├── square/           # sync (rattrapage), webhook (signé HMAC), import-catalog
 │   │   ├── scanner/          # Analyse (étape 1) + confirm (étape 2) + health
-│   │   ├── invoices/extract  # Import direct (analyse + enregistrement en 1 appel)
 │   │   ├── bank/             # extract (relevé → transactions), recategorize (réapplique les règles)
 │   │   ├── cron/             # Travaux planifiés (synchro Square nocturne, CRON_SECRET)
-│   │   ├── ai/               # Insights ventes, audit stock, réponses aux avis
-│   │   ├── chat/             # Fuego (contexte chiffré du mois injecté)
-│   │   └── google/           # OAuth (state anti-CSRF) + avis
+│   │   ├── ai/               # Insights ventes, audit du référentiel ingrédients
+│   │   ├── suppliers/merge   # Fusion de deux fiches fournisseur
+│   │   ├── settings/ai       # Clés API des moteurs IA (chiffrées), test de clé
+│   │   └── chat/             # Fuego (contexte chiffré du mois injecté)
 │   └── globals.css           # Design system (variables, composants, responsive)
 ├── components/
 │   ├── ui.tsx                # KpiCard, Modal, ChartCard, PeriodSelector, etc.
@@ -259,7 +319,7 @@ src/
 └── lib/
     ├── supabase/             # Clients + requireUser() + fetch-all (pagination)
     ├── square.ts             # API Square + écriture des commandes (sync ET webhook)
-    ├── invoices.ts           # Enregistrement de facture unifié (scanner + import direct)
+    ├── invoices.ts           # Enregistrement de facture (un seul chemin : le Scanner)
     ├── ai/                   # Prompt OCR unique, parseur JSON robuste
     ├── accounting.ts         # Flux financiers, taux indicatifs, conversions HT
     ├── interventions.ts      # Ce qui empêche les chiffres d'être justes (fonction pure)

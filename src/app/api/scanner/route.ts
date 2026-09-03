@@ -3,6 +3,7 @@ import { createServiceRoleClient } from '@/lib/supabase/server';
 import { requireUser } from '@/lib/supabase/api-auth';
 import { runInvoiceOcr, describeOcrEngine, type OcrFile } from '@/lib/ai/invoice-ocr';
 import { uploadInvoiceFile } from '@/lib/invoices';
+import { checkInvoice } from '@/lib/invoice-checks';
 
 const rnd2 = (v: number) => Math.round(Number(v) * 100) / 100;
 
@@ -133,6 +134,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       success: true,
       extracted,
+      // Ce que l'humain devra regarder avant de confirmer. Le serveur les
+      // recalcule à la confirmation : cette liste sert à l'affichage, pas à
+      // la décision.
+      anomalies: checkInvoice(extracted, new Date().toISOString().slice(0, 10)),
       // Moteur ayant réellement produit la lecture : indispensable pour
       // comparer Gemini et Claude sur les mêmes factures.
       ocr_engine: await describeOcrEngine(),

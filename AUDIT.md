@@ -855,27 +855,57 @@ l'établissement a moins de six mois : les premiers mois portent le stock
 d'ouverture et les sur-commandes du rodage, la référence 28-32 % ne s'y applique
 pas encore — mais la tendance mois par mois, si.
 
+## 7 bis. Révision du 3 septembre 2026 — verrous et épuration
+
+*Objectif fixé : un outil qui n'affiche que le nécessaire, verrouille ce qui doit
+l'être, et exige un contrôle humain là où une donnée fausse coûterait cher.*
+
+### Ce qui faussait encore les chiffres, et ce qui a été fait
+
+| Constat | Correction |
+|---|---|
+| `saveInvoice` enregistrait tout ce que l'OCR renvoyait : HT > TTC, date future, lignes qui ne somment pas, numéro absent | `lib/invoice-checks.ts` : bloquants (refus) et points à confirmer (coche obligatoire, recomptée par le serveur) |
+| Deux imports « en un clic » (Factures, Banque) sans relecture, lettrage au premier montant approchant | Route `/api/invoices/extract` supprimée. Tout passe par le Scanner ; depuis Banque, le mouvement est pré-sélectionné |
+| La mercuriale se polluait : un ingrédient créé par ligne inconnue, prix mis à jour par « le nom contient » | Correspondance exacte ou alias validé ; plus de création automatique ; écran « Désignations à rattacher » |
+| Fournisseurs dédoublés (`ilike '%Métro%'` ne retrouve pas « MÃ©tro ») | Normalisation (accents, casse, encodage) + fusion de fiches dans Réglages |
+| CCA « jamais débiteur » tenu par un `confirm()` navigateur | Trigger Postgres, refus quel que soit le chemin ; miroir `lib/cca.ts` pour prévenir avant |
+| P&L masquable sans motif ni trace | Masquage retiré ; recatégorisation à la source dans le détail des postes ; écritures ex-masquées réintégrées et signalées |
+| Stock théorique = achats depuis toujours − conso depuis toujours | Retiré. Inventaire physique, date, valorisation, historique des comptages |
+| Menu engineering : recettes appariées aux produits Square par nom exact → « poids morts » fictifs | Module retiré, à reconstruire sur un appariement explicite |
+| Liste de courses (dépend de la mercuriale polluée), Avis Google (hors pilotage) | Retirés de l'application, tables conservées |
+| Food cost = achats ÷ CA : une commande le 30 fausse deux mois | Coût matières consommé = stock initial + achats − stock final (`lib/cogs.ts`), quand deux inventaires encadrent la période ; sinon achats, et c'est écrit |
+| « Stock valorisé » du tableau de bord additionnait tous les comptages jamais saisis | Dernier inventaire seulement |
+| Le passé restait modifiable : le P&L de mars pouvait changer en septembre | Clôture mensuelle : instantané + trigger lecture seule, réouverture motivée et journalisée |
+| Rien d'exploitable par le cabinet : ressaisie | Export FEC / CSV des quatre journaux, équilibre au centime testé, plan de comptes unique |
+| Frais kilométriques : lectures plafonnées à 1 000 lignes, achat de décembre payé en janvier perdu, trajet supprimable après avoir crédité l'associé, plein de carburant + barème non détecté | Lectures paginées, fenêtre bancaire jusqu'au 15 février, refus de supprimer un trajet porté au CCA (trop-perçu signalé), intervention « carburant et barème », mois clôturés ignorés à la détection et date de repli pour le CCA |
+
+### Ce qu'il faut savoir
+
+- **Quatre migrations à jouer** : `migration_ai_settings.sql`, `migration_referentiel.sql`,
+  `migration_cca_verrou.sql`, `migration_clotures.sql`. La dernière affiche le point le plus bas de chaque compte
+  courant : un creux historique n'est pas bloqué, il est à régulariser.
+- **Toutes les pages écrivent encore directement en base** depuis le navigateur, avec
+  une politique « tout utilisateur authentifié ». Un verrou côté client se contourne ;
+  seuls le trigger CCA et les routes API sont réellement contraignants. C'est le prochain
+  chantier structurel si l'outil doit accueillir d'autres comptes que les deux associés.
+- **`verify:compta` passe de 171 à 317 contrôles.** Chaque verrou est testé dans les deux
+  sens : il refuse ce qu'il faut, et il se tait sur une facture normale.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
-**Signalées et non corrigées** — le module « À faire » les remonte déjà, la
-correction attend :
-- **Fournisseur dupliqué par un encodage cassé** (« MÃ©tro » face à « Métro ») :
-  les achats se répartissent entre deux fiches, aucun des deux totaux n'est
-  exploitable. Il manque une fusion de fiches fournisseur.
-- **Factures datées d'un 1er janvier** : l'OCR invente cette date quand il ne
-  sait pas lire celle du document. Le prompt lui interdit déjà d'inventer, sans
-  garantie ; il faudrait bloquer l'enregistrement et faire confirmer la date.
-- **Facture sans numéro ni TVA** (Eurocibus) : l'article 242 nonies A du CGI
-  impose le numéro. Sans lui, la déduction est contestable — à signaler à
-  l'import, pas seulement à la lecture.
-- **Carburant et barème kilométrique** : l'un exclut l'autre. Un plein Esso et
-  une indemnité kilométrique sur le même mois est une double déduction, à
-  détecter.
-
 **Chantiers de fond :**
-- Stock : les achats et ventes sont cumulés **depuis toujours** — un vrai calcul d'écart devrait
-  repartir du dernier inventaire. C'est un chantier métier à part entière.
-- Rapprochement produit↔ingrédient par « le nom contient » : fonctionne mais fragile
-  (« Tomate » capte « Concentré de tomate »). Une table de correspondance serait plus fiable.
-- Historique des inventaires (les comptages sont en base mais aucune page ne les affiche).
-- Réglages : ajouter la déconnexion Google et rendre configurables les seuils (food cost cible…).
+- **Écritures via routes API** plutôt que depuis le navigateur, pour que chaque
+  verrou soit réellement contraignant et que le rôle `comptable` ne puisse pas
+  modifier une table hors de son périmètre via l'API Supabase.
+- **Stock théorique repartant du dernier inventaire**, quand les fiches
+  techniques seront complètes et la mercuriale propre. Le coût matières
+  consommé (achats ± variation de stock) est fait ; le théorique par produit
+  ne l'est pas.
+- **Dérive d'un mois clôturé** : comparer l'instantané de clôture au CA Square
+  actuel et le signaler dans « À faire » si une commande tardive l'a modifié.
+- **Point mort par service et trésorerie prévisionnelle** : charges fixes ÷
+  taux de marge brute ÷ services ; solde + encaissements attendus − échéances.
+- **Journal de caisse** (espèces Square ↔ dépôts en banque).
+- **Menu engineering sur appariement explicite** recette ↔ produit Square
+  (colonne `square_item_name` sur `recipes`), plutôt que par nom.
+- Réglages : rendre configurables les seuils (food cost cible…).

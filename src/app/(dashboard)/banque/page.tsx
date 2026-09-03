@@ -1,12 +1,14 @@
 'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate } from '@/lib/utils';
 import { KpiCard } from '@/components/ui';
 import { suggestInvoicesForTransaction, sumDebits } from '@/lib/reconciliation';
+import { checkCcaOperation, describeCcaViolation } from '@/lib/cca';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
-import { Upload, Landmark, AlertCircle, CheckCircle, Filter, Camera, Scissors, Plus, Trash2 } from 'lucide-react';
+import { Upload, Landmark, AlertCircle, CheckCircle, Filter, ScanLine, Scissors, Plus, Trash2 } from 'lucide-react';
 
 const CATEGORIES: Record<string, string> = {
   fixe_loyer: 'Loyer & Charges',
@@ -68,6 +70,8 @@ export default function BanquePage() {
   [ccaMovements]);
 
   const supabase = createClient();
+
+  const router = useRouter();
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -280,43 +284,14 @@ export default function BanquePage() {
     }
   };
 
-  const handleLinkInvoice = async (transaction: any, file: File) => {
-    if (!file) return;
-    setUploading(true);
-
-    const reader = new FileReader();
-    reader.onerror = () => {
-      setUploading(false);
-      alert('Erreur de lecture du fichier.');
-    };
-    reader.onload = async () => {
-      try {
-        const base64 = (reader.result as string).split(',')[1];
-        const res = await fetch('/api/invoices/extract', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            fileBase64: base64,
-            mimeType: file.type,
-            // Le serveur rapproche lui-même cette transaction (status, invoice_id, accounting_class)
-            bank_tx_id: transaction.id,
-          }),
-        });
-        const data = await res.json();
-        if (data.success) {
-          alert('Facture analysée, rattachée et comptabilisée avec succès !');
-          loadData();
-        } else {
-          alert('Erreur : ' + (data.error || 'Inconnu'));
-        }
-      } catch (e) {
-        console.error(e);
-        alert('Erreur lors du traitement du fichier.');
-      } finally {
-        setUploading(false);
-      }
-    };
-    reader.readAsDataURL(file);
+  /**
+   * Joindre une facture à ce mouvement = l'analyser dans le Scanner, avec le
+   * mouvement pré-sélectionné. L'ancien chemin enregistrait la facture sans
+   * relecture, en un clic : le Scanner, lui, montre ce que l'IA a lu et exige
+   * une confirmation sur chaque point inhabituel avant d'écrire en base.
+   */
+  const openScannerFor = (transaction: any) => {
+    router.push(`/scanner?bank_tx=${encodeURIComponent(transaction.id)}`);
   };
 
   const handleLinkInvoiceDirect = async (transactionId: string, invoice: any) => {
@@ -409,44 +384,30 @@ export default function BanquePage() {
   const handleCreateCcaReimbursementAuto = async (tx: any, partner: 'justine' | 'yohan') => {
     setLoading(true);
     try {
-      // 1. Solde de l'associé À LA DATE du mouvement.
+      // 1. Le compte tient-il, à partir de la date du remboursement ?
       //
-      // Le contrôle portait sur le solde TOTAL, tous mouvements confondus —
-      // apports postérieurs inclus. Un remboursement daté d'avril passait donc
-      // sans alerte parce qu'un apport de juin le couvrait : le compte était
-      // pourtant débiteur en avril. On ne peut pas rembourser aujourd'hui avec
-      // l'argent apporté demain.
+      // On recalcule le solde courant sur TOUS les mouvements de l'associé,
+      // pas seulement ceux antérieurs : un remboursement daté d'avril peut
+      // rendre le compte débiteur en mai, quand un remboursement déjà saisi
+      // s'ajoute au sien. La base refusera de toute façon (trigger) ; on le
+      // dit avant, avec la date et le montant, et sans « enregistrer quand
+      // même » — la règle n'est pas négociable au clic.
       const { data: movements, error: fetchErr } = await supabase
         .from('mouvements_cca')
-        .select('sens, montant, date')
-        .eq('associe', partner)
-        .lte('date', tx.date);
+        .select('id, date, associe, sens, montant, created_at')
+        .eq('associe', partner);
 
       if (fetchErr) throw fetchErr;
 
-      const balance = (movements || []).reduce(
-        (sum: number, m: any) => sum + (m.sens === 'apport' ? Number(m.montant) : -Number(m.montant)),
-        0
-      );
-
       const reimbursementAmount = Math.abs(tx.amount);
-      if (balance - reimbursementAmount < 0) {
-        const confirmDebit = confirm(
-          `⚠️ Au ${formatDate(tx.date)}, cette opération rend le compte de ${
-            partner === 'justine' ? 'Justine' : 'Yohan'
-          } débiteur.\n\n`
-          + `Solde à cette date : ${formatCurrency(balance)}\n`
-          + `Remboursement : ${formatCurrency(reimbursementAmount)}\n`
-          + `Solde après : ${formatCurrency(balance - reimbursementAmount)}\n\n`
-          + `Un compte courant d'associé débiteur est interdit au dirigeant `
-          + `(art. L.225-43 du code de commerce) et qualifiable d'abus de biens `
-          + `sociaux. Si un apport de la même date le couvre, saisis-le d'abord.\n\n`
-          + `Enregistrer quand même ?`
-        );
-        if (!confirmDebit) {
-          setLoading(false);
-          return;
-        }
+      const violation = checkCcaOperation(movements || [], {
+        type: 'insert',
+        movement: { date: tx.date, associe: partner, sens: 'remboursement', montant: reimbursementAmount },
+      });
+      if (violation) {
+        alert(describeCcaViolation(violation));
+        setLoading(false);
+        return;
       }
 
       // 2. Insert movement
@@ -481,7 +442,7 @@ export default function BanquePage() {
       await loadData();
     } catch (e) {
       console.error(e);
-      alert("Erreur lors de la création du remboursement.");
+      alert((e as { message?: string })?.message || "Erreur lors de la création du remboursement.");
     } finally {
       setLoading(false);
     }
@@ -1240,10 +1201,10 @@ export default function BanquePage() {
                               {(t.status === 'pending_invoice' || t.status === 'facture_ok') && (
                                 <button
                                   className="btn btn-secondary btn-sm"
-                                  title="Joindre la facture (PDF ou Photo)"
-                                  onClick={() => pickFile('.pdf,image/*', f => handleLinkInvoice(t, f))}
+                                  title="Joindre la facture : l'analyser dans le Scanner, ce mouvement pré-sélectionné"
+                                  onClick={() => openScannerFor(t)}
                                 >
-                                  <Upload size={14} />
+                                  <ScanLine size={14} />
                                 </button>
                               )}
 
@@ -1335,19 +1296,10 @@ export default function BanquePage() {
                       <button
                         className="mobile-action-btn-full"
                         style={{ background: 'var(--teal)', color: 'white' }}
-                        onClick={() => pickFile('image/*', f => handleLinkInvoice(t, f), 'environment')}
+                        onClick={() => openScannerFor(t)}
                       >
-                        <Camera size={16} />
-                        Prendre une photo
-                      </button>
-
-                      <button
-                        className="mobile-action-btn-full"
-                        style={{ background: 'var(--surface)', color: 'var(--text-primary)', border: '1px solid var(--border)' }}
-                        onClick={() => pickFile('.pdf,image/*', f => handleLinkInvoice(t, f))}
-                      >
-                        <Upload size={16} />
-                        Importer fichier
+                        <ScanLine size={16} />
+                        Joindre la facture (Scanner)
                       </button>
 
                       {t.status === 'pending_invoice' && (

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { formatCurrency, formatDate, toISODate } from '@/lib/utils';
 import {
   Car, Plus, Trash2, Printer, RefreshCw, Settings, Save,
@@ -80,20 +81,25 @@ export default function TrajetsPage() {
   const [detecting, setDetecting] = useState(false);
   const [recording, setRecording] = useState(false);
   const [ccaMovements, setCcaMovements] = useState<{ id: string; montant: number }[]>([]);
+  // Mois clôturés (AAAA-MM) : la base y refuse toute écriture. Autant le
+  // savoir avant d'essayer, et dire ce qui a été laissé de côté.
+  const [closedMonths, setClosedMonths] = useState<Set<string>>(() => new Set());
   const [message, setMessage] = useState<{ type: 'success' | 'warning'; text: string } | null>(null);
 
   // ── Chargement ────────────────────────────────────────────────────────────
   const loadData = useCallback(async () => {
     setLoading(true);
     const supabase = createClient();
-    const [tripsRes, settingsRes, ccaRes] = await Promise.all([
-      supabase.from('mileage_trips').select('*').order('date', { ascending: false }),
+    const [tripRows, settingsRes, ccaRes, closuresRes] = await Promise.all([
+      fetchAllRows<Trip>((f0, f1) => supabase.from('mileage_trips').select('*').order('date', { ascending: false }).range(f0, f1)),
       supabase.from('app_settings').select('value').eq('key', 'mileage_config').maybeSingle(),
       supabase.from('mouvements_cca').select('id, montant').eq('sous_type', 'frais_perso_reverse'),
+      supabase.from('closures').select('month, reopened_at').is('reopened_at', null),
     ]);
 
-    setTrips((tripsRes.data as Trip[]) || []);
+    setTrips(tripRows);
     setCcaMovements((ccaRes.data as { id: string; montant: number }[]) || []);
+    setClosedMonths(new Set((closuresRes.data || []).map((c: { month: string }) => String(c.month).slice(0, 7))));
 
     if (settingsRes.data?.value) {
       try {
@@ -138,16 +144,21 @@ export default function TrajetsPage() {
 
       if (fromBank) {
         // On ne retient que les DÉBITS : un encaissement n'est pas un achat.
-        const { data: txs, error } = await supabase
-          .from('bank_transactions')
-          .select('date, description, amount')
-          .lt('amount', 0)
-          .gte('date', `${year}-01-01`)
-          .lte('date', `${year}-12-31`)
-          .order('date');
-        if (error) throw error;
+        // Paginé : un exercice dépasse vite les 1 000 lignes que Supabase rend
+        // sans prévenir. La fenêtre déborde sur janvier–février de l'année
+        // suivante : un achat du 28 décembre est débité en janvier, et sa date
+        // d'achat (lue dans le libellé) le rattache bien à l'année demandée.
+        const txs = await fetchAllRows<{ date: string; description: string | null; amount: number | null }>(
+          (f0, f1) => supabase
+            .from('bank_transactions')
+            .select('date, description, amount')
+            .lt('amount', 0)
+            .gte('date', `${year}-01-01`)
+            .lte('date', `${year + 1}-02-15`)
+            .order('date')
+            .range(f0, f1));
 
-        for (const tx of txs || []) {
+        for (const tx of txs) {
           const dest = matchDestination(tx.description || '', config.destinations);
           if (!dest || !tx.date) continue;
 
@@ -168,15 +179,16 @@ export default function TrajetsPage() {
           }
         }
       } else {
-        const { data: invoices, error } = await supabase
-          .from('invoices')
-          .select('id, date, invoice_number, supplier:suppliers(name)')
-          .gte('date', `${year}-01-01`)
-          .lte('date', `${year}-12-31`)
-          .order('date');
-        if (error) throw error;
+        const invoices = await fetchAllRows<{ id: string; date: string; invoice_number: string | null; supplier: unknown }>(
+          (f0, f1) => supabase
+            .from('invoices')
+            .select('id, date, invoice_number, supplier:suppliers(name)')
+            .gte('date', `${year}-01-01`)
+            .lte('date', `${year}-12-31`)
+            .order('date')
+            .range(f0, f1));
 
-        for (const inv of invoices || []) {
+        for (const inv of invoices) {
           const supplierName = (inv.supplier as any)?.name || '';
           if (!supplierName || !inv.date) continue;
 
@@ -205,6 +217,17 @@ export default function TrajetsPage() {
         return;
       }
 
+      // Un mois clôturé n'accepte plus d'écriture : on laisse ces trajets de
+      // côté et on le dit, plutôt que de faire échouer toute la détection.
+      let skippedClosed = 0;
+      for (const [key, c] of [...candidates.entries()]) {
+        if (closedMonths.has(c.date.slice(0, 7))) { candidates.delete(key); skippedClosed++; }
+      }
+      if (candidates.size === 0) {
+        setMessage({ type: 'warning', text: `${skippedClosed} déplacement(s) trouvé(s), tous dans des mois clôturés : rouvre le mois depuis le P&L pour les ajouter.` });
+        return;
+      }
+
       const rows = [...candidates.entries()].map(([dedupeKey, c]) => ({
         date: c.date,
         destination_key: c.dest.key,
@@ -228,14 +251,16 @@ export default function TrajetsPage() {
       if (insertError) throw insertError;
 
       await loadData();
-      const { data: after } = await supabase.from('mileage_trips').select('id');
-      const added = (after?.length || before) - before;
+      const { count: afterCount } = await supabase.from('mileage_trips').select('id', { count: 'exact', head: true });
+      const added = (afterCount ?? before) - before;
       const origine = fromBank ? 'ton relevé bancaire' : 'tes factures';
-      const reserve = approximate > 0
+      const reserve = (approximate > 0
         ? ` ${approximate} sont datés du jour du paiement, faute de date d'achat dans le libellé : vérifie-les.`
-        : '';
+        : '') + (skippedClosed > 0
+        ? ` ${skippedClosed} déplacement(s) laissé(s) de côté : mois clôturé(s).`
+        : '');
       setMessage({
-        type: approximate > 0 ? 'warning' : 'success',
+        type: approximate > 0 || skippedClosed > 0 ? 'warning' : 'success',
         text: added > 0
           ? `${added} trajet${added > 1 ? 's' : ''} ajouté${added > 1 ? 's' : ''} depuis ${origine} ${year}.${reserve}`
           : `Aucun nouveau trajet : les ${candidates.size} déplacements de ${year} sont déjà enregistrés.`,
@@ -254,6 +279,11 @@ export default function TrajetsPage() {
     const km = parseFloat(form.distance_km) || dest?.km || 0;
     if (km <= 0) {
       setMessage({ type: 'warning', text: 'Indique une distance supérieure à zéro.' });
+      return;
+    }
+
+    if (closedMonths.has(form.date.slice(0, 7))) {
+      setMessage({ type: 'warning', text: `Le mois ${form.date.slice(0, 7)} est clôturé : rouvre-le depuis le P&L, ou date le trajet autrement.` });
       return;
     }
 
@@ -279,10 +309,25 @@ export default function TrajetsPage() {
     await loadData();
   };
 
-  const deleteTrip = async (id: string) => {
+  const deleteTrip = async (trip: Trip) => {
+    // Un trajet déjà porté au compte courant a fait créditer l'associé : le
+    // supprimer laisserait l'indemnité en base sans le déplacement qui la
+    // justifie. On corrige par un mouvement, pas en effaçant la trace.
+    if (trip.cca_movement_id) {
+      setMessage({
+        type: 'warning',
+        text: 'Ce trajet est déjà porté au compte courant : le supprimer laisserait l\'indemnité sans justificatif. '
+          + 'Si le déplacement n\'a pas eu lieu, enregistre un remboursement du même montant depuis Comptes Associés, puis supprime le mouvement correspondant.',
+      });
+      return;
+    }
     if (!confirm('Supprimer ce trajet ?')) return;
     const supabase = createClient();
-    await supabase.from('mileage_trips').delete().eq('id', id);
+    const { error } = await supabase.from('mileage_trips').delete().eq('id', trip.id);
+    if (error) {
+      setMessage({ type: 'warning', text: `Suppression impossible : ${error.message}` });
+      return;
+    }
     await loadData();
   };
 
@@ -326,7 +371,14 @@ export default function TrajetsPage() {
     try {
       const supabase = createClient();
       const isPastYear = year < new Date().getFullYear();
-      const movementDate = isPastYear ? `${year}-12-31` : toISODate(new Date());
+      const today = toISODate(new Date());
+      // Année écoulée : on date l'indemnité du 31 décembre pour qu'elle pèse sur
+      // le bon exercice. Sauf si décembre est clôturé : on la date d'aujourd'hui
+      // et on le dit dans le libellé — c'est une régularisation sur exercice
+      // antérieur, que le cabinet saura lire.
+      const decemberClosed = closedMonths.has(`${year}-12`);
+      const movementDate = isPastYear && !decemberClosed ? `${year}-12-31` : today;
+      const regularisation = isPastYear && decemberClosed;
 
       const { data: movement, error } = await supabase
         .from('mouvements_cca')
@@ -339,7 +391,8 @@ export default function TrajetsPage() {
           note: `Frais kilométriques ${year} — ${yearTrips.length} trajet${yearTrips.length > 1 ? 's' : ''}, `
               + `${totals.totalKm.toLocaleString('fr-FR')} km`
               + (totals.tolls > 0 ? ` + péages` : '')
-              + (recorded > 0 ? ` (complément)` : ''),
+              + (recorded > 0 ? ` (complément)` : '')
+              + (regularisation ? ` — régularisation sur exercice ${year} clôturé` : ''),
           rapproche_banque: false,
         })
         .select('id')
@@ -358,8 +411,9 @@ export default function TrajetsPage() {
 
       await loadData();
       setMessage({
-        type: 'success',
-        text: `${formatCurrency(remaining)} porté au compte courant de ${driverLabel(driver)}. `
+        type: regularisation ? 'warning' : 'success',
+        text: `${formatCurrency(remaining)} porté au compte courant de ${driverLabel(driver)}`
+            + (regularisation ? ` à la date du jour (décembre ${year} est clôturé : régularisation sur exercice antérieur, à signaler au cabinet). ` : '. ')
             + `Quand tu feras le virement, enregistre-le comme remboursement depuis la page Comptes Associés.`,
       });
     } catch (e: any) {
@@ -487,8 +541,10 @@ export default function TrajetsPage() {
             <Landmark size={22} style={{ color: remaining > 0 ? 'var(--orange)' : 'var(--green)', flexShrink: 0 }} />
             <div style={{ flex: 1, minWidth: 240 }}>
               <div style={{ fontWeight: 700, fontSize: 14 }}>
-                {remaining > 0
+                {remaining > 0.005
                   ? `La société doit ${formatCurrency(remaining)} à ${driverName}`
+                  : remaining < -0.005
+                  ? `${formatCurrency(-remaining)} portés en trop au compte courant de ${driverName}`
                   : `Tout est porté au compte courant de ${driverName}`}
               </div>
               <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginTop: 3 }}>
@@ -496,8 +552,11 @@ export default function TrajetsPage() {
                   <>Déjà porté : <strong>{formatCurrency(recorded)}</strong> · </>
                 )}
                 Total {year} : <strong>{formatCurrency(totals.total)}</strong>
-                {remaining > 0 && (
+                {remaining > 0.005 && (
                   <> · tant que le virement n&apos;est pas fait, ce montant reste dû à l&apos;associé</>
+                )}
+                {remaining < -0.005 && (
+                  <> · un trajet a été retiré ou le barème a baissé après l&apos;enregistrement : régularise par un remboursement du même montant depuis Comptes Associés</>
                 )}
               </div>
             </div>
@@ -579,7 +638,7 @@ export default function TrajetsPage() {
                         <td style={{ textAlign: 'right' }}>{toll > 0 ? formatCurrency(toll) : '—'}</td>
                         <td style={{ textAlign: 'right', fontWeight: 700 }}>{formatCurrency(share + toll)}</td>
                         <td className="no-print" style={{ textAlign: 'right' }}>
-                          <button className="btn btn-ghost btn-sm" onClick={() => deleteTrip(t.id)} aria-label="Supprimer">
+                          <button className="btn btn-ghost btn-sm" onClick={() => deleteTrip(t)} aria-label="Supprimer" title={t.cca_movement_id ? "Déjà porté au compte courant : ne se supprime plus" : "Supprimer"}>
                             <Trash2 size={15} />
                           </button>
                         </td>

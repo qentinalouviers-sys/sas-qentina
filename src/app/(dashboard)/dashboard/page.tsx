@@ -11,6 +11,7 @@ import { computeTva } from '@/lib/tva';
 import {
   isFinancialFlow, orderHtAmount, bankAmountHt, makeInvoiceMatcher,
 } from '@/lib/accounting';
+import { inventorySessions, computeCogs, type CogsResult } from '@/lib/cogs';
 import {
   collectInterventionFacts, detectInterventions, type Intervention,
 } from '@/lib/interventions';
@@ -114,6 +115,9 @@ export default function DashboardPage() {
     cogsFactures: 0,
     cogsBanque: 0,
     foodCostBanquePercent: 0,
+    /** Achats HT de la période, avant variation de stock. */
+    achatsHt: 0,
+    cogs: null as CogsResult | null,
     ratioSalariale: 0,
     totalLabor: 0,
     totalFixedCharges: 0,
@@ -149,7 +153,6 @@ export default function DashboardPage() {
     // commandes, le CA affiché ici était amputé de 44 % — et avec lui le food
     // cost, la masse salariale et la marge, qui s'en servent de dénominateur.
     const [
-      settingsRes,
       orders,
       tvaRes,
       invoicesRows,
@@ -160,7 +163,6 @@ export default function DashboardPage() {
       inventoryRows,
       recipesRes,
     ] = await Promise.all([
-      supabase.from('app_settings').select('value').eq('key', 'masked_items'),
       fetchAllRows<any>((f0, f1) => supabase.from('square_orders')
         .select('id, net_amount, service, created_at, raw_data')
         .gte('service', startStr).lte('service', endStr).range(f0, f1)),
@@ -186,16 +188,12 @@ export default function DashboardPage() {
         .in('category', ['fixe_loyer', 'fixe_assurance', 'fixe_abonnement', 'impot_taxe', 'investissement', 'autre'])
         .gte('date', startStr).lte('date', endStr).range(f0, f1)),
       fetchAllRows<any>((f0, f1) => supabase.from('inventory_counts')
-        .select('quantity, unit_price').range(f0, f1)),
+        .select('ingredient_id, quantity, unit_price, counted_at').range(f0, f1)),
       supabase.from('recipes')
         .select('id, name, selling_price, portions, recipe_ingredients(quantity, ingredient:ingredients(last_unit_price))')
         .not('selling_price', 'is', null),
     ]);
 
-    const maskedIds: string[] = settingsRes.data?.[0]?.value
-      ? JSON.parse(settingsRes.data[0].value)
-      : [];
-    const notMasked = (row: { id?: string | number }) => !maskedIds.includes(String(row.id));
 
     // Prêts, apports, mouvements de compte courant : ni charge, ni recette.
     // Le même filtre qu'en P&L, sans quoi les deux écrans divergent.
@@ -206,7 +204,7 @@ export default function DashboardPage() {
     // Deux montants, et jamais l'un pour l'autre : le TTC est ce que le client
     // a payé (c'est le chiffre de la caisse), le HT est la seule base sur
     // laquelle un ratio de gestion se calcule.
-    const activeOrders = orders.filter(notMasked);
+    const activeOrders = orders;
     const caTotal = activeOrders.reduce((s: number, o: any) => s + (o.net_amount || 0), 0);
     const caHt = activeOrders.reduce((s: number, o: any) => s + orderHtAmount(o), 0);
     const validOrders = activeOrders.filter((o: any) => (o.net_amount || 0) > 0);
@@ -270,7 +268,7 @@ export default function DashboardPage() {
         .in('invoice_id', ids)
         .range(f0, f1));
 
-      activeInvoiceLines = lines.filter(notMasked);
+      activeInvoiceLines = lines;
 
       const catMap: Record<string, number> = {};
       activeInvoiceLines.forEach((l: any) => {
@@ -307,7 +305,6 @@ export default function DashboardPage() {
     //    les premiers en HT pour que le ratio veuille dire quelque chose.
     const matcher = makeInvoiceMatcher(invoices as any[]);
     const bankSuppliersUnreconciled = sansFlux(bankSuppliersRows)
-      .filter(notMasked)
       .filter((t: any) => !matcher.alreadyInvoiced(t))
       .reduce((s: number, t: any) => s + bankAmountHt(t, 'variable_fournisseur'), 0);
 
@@ -316,18 +313,22 @@ export default function DashboardPage() {
     // entre en entier, entretien et petit matériel compris. Le second est donc
     // un MAJORANT — d'où la part suivie séparément, pour pouvoir le dire.
     const cogsFactures = purchasesAlim + purchasesBoisson + purchasesEmballage;
-    const foodCostAmt = cogsFactures + bankSuppliersUnreconciled;
+    const achatsHt = cogsFactures + bankSuppliersUnreconciled;
+
+    // Coût matières CONSOMMÉ : achats ± variation de stock, quand deux
+    // inventaires encadrent la période. Sinon, les achats — et on le dit.
+    const sessions = inventorySessions(inventoryRows);
+    const cogs = computeCogs({ purchases: achatsHt, sessions, start: startStr, end: endStr });
+    const foodCostAmt = cogs.cogs;
     const foodCost = caHt > 0 ? (foodCostAmt / caHt) * 100 : 0;
-    const foodCostBanquePercent = foodCostAmt > 0
-      ? (bankSuppliersUnreconciled / foodCostAmt) * 100
+    const foodCostBanquePercent = achatsHt > 0
+      ? (bankSuppliersUnreconciled / achatsHt) * 100
       : 0;
 
     // ── 4. Masse salariale ───────────────────────────────────────────────────
     const laborTimecards = timecardsRows
-      .filter(notMasked)
       .reduce((s: number, t: any) => s + (t.hours_worked || 0) * (t.hourly_rate || 0), 0);
     const laborBank = sansFlux(bankSalariesRows)
-      .filter(notMasked)
       .reduce((s: number, t: any) => s + Math.abs(t.amount || 0), 0);
 
     const totalLabor = laborBank > 0 ? laborBank : laborTimecards;
@@ -335,7 +336,6 @@ export default function DashboardPage() {
 
     // ── 5. Charges fixes ─────────────────────────────────────────────────────
     const activeFixedTx = sansFlux(fixedTxRows)
-      .filter(notMasked)
       .filter((t: any) => !matcher.alreadyInvoiced(t));
     const fixedFromBank = activeFixedTx.reduce((s: number, t: any) => s + bankAmountHt(t), 0);
     const totalFixedCharges = fixedFromBank + purchasesMateriel + purchasesAutreInvoices;
@@ -365,8 +365,10 @@ export default function DashboardPage() {
     setChargesDetails(tempDetails);
 
     // ── 6. Stock valorisé ────────────────────────────────────────────────────
-    const stockValorise = inventoryRows
-      .reduce((s: number, i: any) => s + (i.quantity || 0) * (i.unit_price || 0), 0);
+    // Le dernier inventaire, et lui seul. L'ancien calcul additionnait TOUS
+    // les comptages jamais saisis : chaque inventaire faisait grossir le
+    // « stock » du montant du précédent.
+    const stockValorise = sessions[0]?.valorisation ?? 0;
 
     // ── 7. Top produits (sur les commandes déjà chargées) ───────────────────
     const oIds = orders.map((o: any) => o.id);
@@ -411,6 +413,7 @@ export default function DashboardPage() {
       caTotal, caHt, nbCommandes, ticketMoyen,
       foodCost, foodCostAmt,
       cogsFactures, cogsBanque: bankSuppliersUnreconciled, foodCostBanquePercent,
+      achatsHt, cogs,
       ratioSalariale, totalLabor,
       totalFixedCharges,
       stockValorise, margeNette, margeNetteAmt,
@@ -635,7 +638,9 @@ export default function DashboardPage() {
                 subValue={
                   kpis.foodCostBanquePercent >= 10
                     ? `${formatCurrency(displayFoodAmtToUse)} / ${formatCurrency(kpis.caHt)} CA HT — dont ${kpis.foodCostBanquePercent.toFixed(0)}% sans facture (majorant)`
-                    : `${formatCurrency(displayFoodAmtToUse)} matières / ${formatCurrency(kpis.caHt)} CA HT`
+                    : kpis.cogs?.method === 'inventaire'
+                    ? `${formatCurrency(displayFoodAmtToUse)} consommés (achats ${formatCurrency(kpis.achatsHt)} ${kpis.cogs.stockVariation >= 0 ? '−' : '+'} stock ${formatCurrency(Math.abs(kpis.cogs.stockVariation))}) / ${formatCurrency(kpis.caHt)} CA HT`
+                    : `${formatCurrency(displayFoodAmtToUse)} d'achats / ${formatCurrency(kpis.caHt)} CA HT — sur achats, pas d'inventaire aux bornes`
                 }
                 icon={<Target size={20} />}
                 accentColor={fcBad ? '#D94F4F' : '#2D8F5E'}

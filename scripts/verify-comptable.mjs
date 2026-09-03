@@ -25,6 +25,18 @@ import {
 import { detectInterventions, collectInterventionFacts } from '../src/lib/interventions.ts';
 import { categoryFromRules } from '../src/lib/bank-csv.ts';
 import { suggestInvoicesForTransaction, sumDebits } from '../src/lib/reconciliation.ts';
+import { checkInvoice, assertInvoiceAccepted } from '../src/lib/invoice-checks.ts';
+import {
+  repairMojibake, normalizeName, findSupplierMatch, matchIngredient, unmatchedDesignations,
+} from '../src/lib/referentiel.ts';
+import { checkCcaOperation, firstDebitDay } from '../src/lib/cca.ts';
+import { inventorySessions, sessionAtBoundary, computeCogs } from '../src/lib/cogs.ts';
+import { monthBounds, recentMonths, isMonthOver } from '../src/lib/months.ts';
+import { buildEntries, unbalancedEntries, toFec } from '../src/lib/fec.ts';
+import {
+  computeAllowance, allocateShares, tripDateFromLabel, matchDestination, isFuelPurchase,
+  DEFAULT_CONFIG,
+} from '../src/lib/mileage.ts';
 
 /**
  * Faux client Supabase, qui applique réellement les filtres utilisés.
@@ -248,6 +260,11 @@ const faits = (o = {}) => ({
   mojibakeSuppliers: [],
   ccaBalances: [{ associe: 'yohan', balance: 1200 }],
   tripsNotInCca: { count: 0 },
+  tripsInPeriod: 0,
+  fuelDebits: { count: 0, amount: 0 },
+  unmatchedDesignations: { count: 0, sample: [] },
+  legacyMaskedItems: 0,
+  inventoryClosing: { found: true, day: '2026-06-30' },
   ...o,
 });
 
@@ -451,7 +468,11 @@ const factsBase = await collectInterventionFacts(fakeSupabase({
     { associe: 'yohan', sens: 'remboursement', montant: 900 },
     { associe: 'justine', sens: 'apport', montant: 300 },
   ],
-  mileage_trips: [{ id: 't1', cca_movement_id: null }, { id: 't2', cca_movement_id: 'm1' }],
+  mileage_trips: [
+    { id: 't1', date: '2026-03-10', cca_movement_id: null },   // ancien, non porté → compte
+    { id: 't2', date: '2026-03-12', cca_movement_id: 'm1' },   // porté
+    { id: 't3', date: '2026-06-28', cca_movement_id: null },   // récent : pas encore dû
+  ],
 }), { start: '2026-06-01', end: '2026-06-30', today: '2026-07-05',
       foodCostPercent: 41, foodCostBankSharePercent: 88 });
 
@@ -717,6 +738,364 @@ verifie('interventions : nombre de commandes', gros.ordersCount, 1788);
 // c'est qu'une requête a perdu sa pagination.
 verifie('aucun compte ne tombe sur 1 000 pile',
   [r.unInvoicedCount, gros.ordersCount].includes(1000), false);
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Verrous à l'enregistrement d'une facture
+//
+//  Chaque cas correspond à une facture qui est réellement entrée en base
+//  fausse : date inventée au 1er janvier, HT recopié dans le TTC, lignes
+//  amputées par une réponse tronquée. Le contrôle doit refuser ce qu'il faut
+//  ET se taire sur une facture normale — une alerte à tort finit ignorée.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Verrous facture ──');
+
+const AUJOURDHUI = '2026-09-03';
+const FACTURE_SAINE = {
+  fournisseur: 'Métro', date: '2026-08-28', numero_facture: 'F-2026-4471',
+  total_ht: 100, total_ttc: 110, tva: 10, type_document: 'facture',
+  lignes: [
+    { designation: 'Farine', quantite: 25, unite: 'kg', prix_unitaire_ht: 2, prix_total_ht: 50, categorie: 'alimentaire' },
+    { designation: 'Mozzarella', quantite: 5, unite: 'kg', prix_unitaire_ht: 10, prix_total_ht: 50, categorie: 'alimentaire' },
+  ],
+};
+const codes = (inv) => checkInvoice({ ...FACTURE_SAINE, ...inv }, AUJOURDHUI).map(a => a.code);
+const niveau = (inv, code) => checkInvoice({ ...FACTURE_SAINE, ...inv }, AUJOURDHUI).find(a => a.code === code)?.level;
+
+verifie('facture saine : aucune anomalie', codes({}).length, 0);
+verifie('ticket sans numéro : rien à signaler', codes({ numero_facture: null, type_document: 'ticket_caisse' }).length, 0);
+
+verifie('date absente → bloquant', niveau({ date: null }, 'date-manquante'), 'bloquant');
+verifie('date illisible → bloquant', niveau({ date: '2026-13-45' }, 'date-manquante'), 'bloquant');
+verifie('date future → bloquant', niveau({ date: '2026-11-02' }, 'date-future'), 'bloquant');
+verifie('demain accepté (fuseau)', codes({ date: '2026-09-04' }).includes('date-future'), false);
+verifie('HT > TTC → bloquant', niveau({ total_ht: 110, total_ttc: 100, tva: 10 }, 'ht-superieur-ttc'), 'bloquant');
+verifie('montants nuls → bloquant', niveau({ total_ht: 0, total_ttc: 0 }, 'montant-nul'), 'bloquant');
+verifie('fournisseur vide → bloquant', niveau({ fournisseur: '' }, 'fournisseur-manquant'), 'bloquant');
+
+verifie('1er janvier → à confirmer', niveau({ date: '2026-01-01' }, 'date-premier-janvier'), 'a_confirmer');
+verifie('facture de 2 ans → à confirmer', niveau({ date: '2024-06-01' }, 'date-ancienne'), 'a_confirmer');
+verifie('17 mois : acceptée sans bruit', codes({ date: '2025-04-15' }).includes('date-ancienne'), false);
+verifie('facture sans numéro → à confirmer', niveau({ numero_facture: null }, 'numero-manquant'), 'a_confirmer');
+verifie('HT + TVA ≠ TTC → à confirmer', niveau({ tva: 20 }, 'tva-incoherente'), 'a_confirmer');
+verifie('arrondi de 3 centimes toléré', codes({ total_ttc: 110.03 }).includes('tva-incoherente'), false);
+verifie('HT = TTC sur une facture → à confirmer', niveau({ total_ht: 110, tva: 0 }, 'sans-tva'), 'a_confirmer');
+verifie('HT = TTC sur un ticket : normal', codes({ total_ht: 110, tva: 0, type_document: 'ticket_caisse' }).includes('sans-tva'), false);
+verifie('lignes qui ne somment pas → à confirmer',
+  niveau({ lignes: [FACTURE_SAINE.lignes[0]] }, 'lignes-incoherentes'), 'a_confirmer');
+verifie('écart de 1 % sur les lignes toléré', codes({ total_ht: 100.9, total_ttc: 110.9 }).includes('lignes-incoherentes'), false);
+verifie('6 000 € TTC → à confirmer', niveau({ total_ht: 5000, total_ttc: 6000, tva: 1000 }, 'montant-inhabituel'), 'a_confirmer');
+
+// Le serveur ne fait pas confiance à l'écran : un point non acquitté refuse.
+const tente = (inv, confirmations) => {
+  try { assertInvoiceAccepted({ ...FACTURE_SAINE, ...inv }, AUJOURDHUI, confirmations); return 'acceptée'; }
+  catch (e) { return e.name === 'InvoiceValidationError' ? 'refusée' : 'erreur'; }
+};
+verifie('saine, sans acquittement : acceptée', tente({}, []), 'acceptée');
+verifie('sans numéro, non acquittée : refusée', tente({ numero_facture: null }, []), 'refusée');
+verifie('sans numéro, acquittée : acceptée', tente({ numero_facture: null }, ['numero-manquant']), 'acceptée');
+verifie('bloquant acquitté quand même : refusée', tente({ date: null }, ['date-manquante']), 'refusée');
+verifie('acquittement d\'un autre code : refusée', tente({ numero_facture: null }, ['sans-tva']), 'refusée');
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Référentiel : fournisseurs et ingrédients
+//
+//  La règle est l'égalité après normalisation, jamais l'inclusion. Chaque cas
+//  ci-dessous est une confusion qui s'est produite : « Tomate » qui capte le
+//  concentré, « MÃ©tro » qui dédouble Métro, « Métro » qui capterait Eurométro.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Référentiel ──');
+
+verifie('mojibake réparé', repairMojibake('MÃ©tro'), 'Métro');
+verifie('libellé sain intact', repairMojibake('Métro'), 'Métro');
+verifie('normalisation : accents, casse, espaces', normalizeName('  MÉTRO   Cash '), 'metro cash');
+verifie('normalisation : mojibake puis accents', normalizeName('MÃ©tro'), 'metro');
+
+const FOURNISSEURS = [{ id: 'm', name: 'Métro' }, { id: 'e', name: 'Eurométro' }, { id: 'z', name: 'Mozzalat' }];
+verifie('« metro » retrouve Métro', findSupplierMatch('metro', FOURNISSEURS)?.id, 'm');
+verifie('« MÃ©tro » retrouve Métro (pas de doublon)', findSupplierMatch('MÃ©tro', FOURNISSEURS)?.id, 'm');
+verifie('« Métro » ne capte pas Eurométro', findSupplierMatch('Métro', FOURNISSEURS)?.id, 'm');
+verifie('« Métro Cash » inconnu → null (pas d\'inclusion)', findSupplierMatch('Métro Cash', FOURNISSEURS), null);
+verifie('nom vide → null', findSupplierMatch('  ', FOURNISSEURS), null);
+
+const INGREDIENTS = [{ id: 't', name: 'Tomate' }, { id: 'c', name: 'Concentré de tomate' }, { id: 'f', name: 'Farine' }];
+const ALIAS = [{ alias: normalizeName('FARINE CAPUTO NUVOLA 25KG'), ingredient_id: 'f' }];
+verifie('nom exact → ingrédient', matchIngredient('tomate', INGREDIENTS, [])?.id, 't');
+verifie('« Concentré de tomate » ne va pas à Tomate', matchIngredient('Concentré de tomate', INGREDIENTS, [])?.id, 'c');
+verifie('« TOMATE PELEE 4/4 » : inconnue, pas d\'inclusion', matchIngredient('TOMATE PELEE 4/4', INGREDIENTS, []), null);
+verifie('alias validé → ingrédient', matchIngredient('Farine Caputo Nuvola 25kg', INGREDIENTS, ALIAS)?.id, 'f');
+
+const LIGNES = [
+  { designation: 'Tomate', unit: 'kg', unit_price_ht: 2 },
+  { designation: 'TOMATE PELEE 4/4', unit: 'unité', unit_price_ht: 1.2 },
+  { designation: 'Tomate pelée 4/4', unit: 'unité', unit_price_ht: 1.3 },
+  { designation: 'FARINE CAPUTO NUVOLA 25KG', unit: 'kg', unit_price_ht: 1.1 },
+  { designation: 'Basilic frais', unit: 'kg', unit_price_ht: 9 },
+];
+const orphelines = unmatchedDesignations(LIGNES, INGREDIENTS, ALIAS);
+verifie('désignations orphelines : 2 groupes', orphelines.length, 2);
+verifie('regroupées sans accents ni casse', orphelines[0].count, 2);
+verifie('la plus achetée d\'abord', orphelines[0].designation, 'TOMATE PELEE 4/4');
+verifie('dernier prix conservé', orphelines[0].lastPrice, 1.3);
+
+declenche('3 désignations orphelines → à vérifier',
+  { unmatchedDesignations: { count: 3, sample: ['TOMATE PELEE 4/4', 'x', 'y'] } }, 'designations-non-rattachees');
+silence('2 orphelines : bruit normal, silence',
+  { unmatchedDesignations: { count: 2, sample: ['a', 'b'] } }, 'designations-non-rattachees');
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Compte courant d'associé : jamais débiteur
+//
+//  Miroir du trigger Postgres (db/migration_cca_verrou.sql). Les deux doivent
+//  dire la même chose : si une règle change ici, elle change là.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Compte courant d\'associé ──');
+
+const CCA = [
+  { id: 'a1', date: '2026-03-01', associe: 'yohan', sens: 'apport', montant: 1000 },
+  { id: 'r1', date: '2026-04-10', associe: 'yohan', sens: 'remboursement', montant: 400 },
+  { id: 'a2', date: '2026-06-01', associe: 'yohan', sens: 'apport', montant: 500 },
+  { id: 'j1', date: '2026-03-01', associe: 'justine', sens: 'apport', montant: 200 },
+];
+const rembourse = (date, montant, associe = 'yohan') =>
+  checkCcaOperation(CCA, { type: 'insert', movement: { date, associe, sens: 'remboursement', montant } });
+
+verifie('compte sain : aucun creux', firstDebitDay(CCA, 'yohan', '2026-01-01'), null);
+verifie('remboursement couvert : accepté', rembourse('2026-05-01', 600), null);
+verifie('remboursement trop grand : refusé', rembourse('2026-05-01', 601)?.date, '2026-05-01');
+verifie('solde signalé au centime', rembourse('2026-05-01', 601)?.solde, -1);
+verifie('rembourser en avril avec l\'apport de juin : refusé', rembourse('2026-04-15', 700)?.date, '2026-04-15');
+verifie('le même montant en juillet : accepté', rembourse('2026-07-15', 700), null);
+verifie('le même jour qu\'un apport : l\'apport compte d\'abord', rembourse('2026-06-01', 1100), null);
+verifie('le même jour, un euro de trop : refusé', rembourse('2026-06-01', 1101)?.date, '2026-06-01');
+verifie('les comptes ne se compensent pas entre associés', rembourse('2026-05-01', 201, 'justine')?.date, '2026-05-01');
+
+verifie('ajouter un apport : jamais contrôlé',
+  checkCcaOperation(CCA, { type: 'insert', movement: { date: '2026-01-01', associe: 'yohan', sens: 'apport', montant: 1 } }), null);
+verifie('supprimer un remboursement : jamais contrôlé',
+  checkCcaOperation(CCA, { type: 'delete', movement: CCA[1] }), null);
+verifie('supprimer l\'apport initial : refusé dès le remboursement',
+  checkCcaOperation(CCA, { type: 'delete', movement: CCA[0] })?.date, '2026-04-10');
+verifie('supprimer l\'apport de juin : accepté (rien après lui)',
+  checkCcaOperation(CCA, { type: 'delete', movement: CCA[2] }), null);
+
+// Un creux historique n'est pas la faute d'une opération postérieure.
+const CREUX = [
+  { id: 'x1', date: '2026-02-01', associe: 'yohan', sens: 'remboursement', montant: 100 },
+  { id: 'x2', date: '2026-03-01', associe: 'yohan', sens: 'apport', montant: 1000 },
+];
+verifie('creux ancien détecté', firstDebitDay(CREUX, 'yohan', '2026-01-01')?.date, '2026-02-01');
+verifie('remboursement postérieur au creux : accepté quand même',
+  checkCcaOperation(CREUX, { type: 'insert', movement: { date: '2026-04-01', associe: 'yohan', sens: 'remboursement', montant: 500 } }), null);
+
+
+console.log('\n── P&L : écritures ex-masquées ──');
+declenche('écritures autrefois masquées → à relire', { legacyMaskedItems: 3 }, 'ecritures-ex-masquees');
+silence('rien de masqué : silence', { legacyMaskedItems: 0 }, 'ecritures-ex-masquees');
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Coût matières : achats ± variation de stock
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Coût matières ──');
+
+const COMPTAGES = [
+  // Inventaire du 31 mai : farine 100 kg à 1 €, mozza 20 kg à 8 €
+  { ingredient_id: 'farine', quantity: 100, unit_price: 1, counted_at: '2026-05-31T20:00:00Z' },
+  { ingredient_id: 'mozza',  quantity: 20,  unit_price: 8, counted_at: '2026-05-31T20:05:00Z' },
+  // Deux saisies le même soir : la dernière l'emporte
+  { ingredient_id: 'mozza',  quantity: 25,  unit_price: 8, counted_at: '2026-05-31T20:30:00Z' },
+  // Inventaire du 30 juin : farine 60 kg, mozza 25 kg, et un produit nouveau
+  { ingredient_id: 'farine', quantity: 60,  unit_price: 1, counted_at: '2026-06-30T21:00:00Z' },
+  { ingredient_id: 'mozza',  quantity: 25,  unit_price: 8, counted_at: '2026-06-30T21:02:00Z' },
+  { ingredient_id: 'huile',  quantity: 10,  unit_price: 5, counted_at: '2026-06-30T21:04:00Z' },
+];
+const SESSIONS = inventorySessions(COMPTAGES);
+verifie('deux journées d\'inventaire', SESSIONS.length, 2);
+verifie('la plus récente d\'abord', SESSIONS[0].day, '2026-06-30');
+verifie('la dernière saisie du soir l\'emporte (mozza 25)', SESSIONS[1].items.get('mozza').quantity, 25);
+verifie('valorisation du 31 mai : 100 + 200', SESSIONS[1].valorisation, 300);
+verifie('valorisation du 30 juin : 60 + 200 + 50', SESSIONS[0].valorisation, 310);
+
+verifie('borne 30/06 → inventaire du 30/06', sessionAtBoundary(SESSIONS, '2026-06-30')?.day, '2026-06-30');
+verifie('borne 03/07 (3 jours) → inventaire du 30/06', sessionAtBoundary(SESSIONS, '2026-07-03')?.day, '2026-06-30');
+verifie('borne 15/07 (15 jours) → aucun', sessionAtBoundary(SESSIONS, '2026-07-15'), null);
+
+const juin = computeCogs({ purchases: 1000, sessions: SESSIONS, start: '2026-06-01', end: '2026-06-30' });
+verifie('juin : méthode inventaire', juin.method, 'inventaire');
+verifie('variation sur les produits communs (farine −40, mozza 0) = −40', juin.stockVariation, -40);
+verifie('l\'huile, comptée une seule fois, n\'entre pas', juin.commonProducts, 2);
+verifie('consommé = achats − variation = 1000 + 40', juin.cogs, 1040);
+verifie('stock initial = inventaire du 31/05', juin.opening?.day, '2026-05-31');
+
+const juillet = computeCogs({ purchases: 900, sessions: SESSIONS, start: '2026-07-01', end: '2026-07-31' });
+verifie('juillet sans inventaire de fin : repli achats', juillet.method, 'achats');
+verifie('repli : cogs = achats', juillet.cogs, 900);
+verifie('repli expliqué', typeof juillet.reason, 'string');
+
+const semaine = computeCogs({ purchases: 200, sessions: SESSIONS, start: '2026-06-28', end: '2026-06-30' });
+verifie('période courte : un seul inventaire aux deux bornes → repli', semaine.method, 'achats');
+
+verifie('aucun comptage → repli', computeCogs({ purchases: 10, sessions: [], start: '2026-06-01', end: '2026-06-30' }).method, 'achats');
+
+declenche('mois écoulé sans inventaire de fin → à vérifier',
+  { inventoryClosing: { found: false, day: null } }, 'inventaire-fin-de-periode');
+silence('inventaire présent : silence',
+  { inventoryClosing: { found: true, day: '2026-06-30' } }, 'inventaire-fin-de-periode');
+silence('mois en cours : on ne réclame pas encore',
+  { inventoryClosing: { found: false, day: null }, end: '2026-07-31', today: '2026-07-10' }, 'inventaire-fin-de-periode');
+silence('une semaine : pas d\'inventaire hebdomadaire réclamé',
+  { inventoryClosing: { found: false, day: null }, start: '2026-06-22', end: '2026-06-28' }, 'inventaire-fin-de-periode');
+
+
+console.log('\n── Mois ──');
+verifie('bornes de février 2028 (bissextile)', monthBounds('2028-02').end, '2028-02-29');
+verifie('bornes de septembre', monthBounds('2026-09').start, '2026-09-01');
+verifie('mois invalide refusé', (() => { try { monthBounds('2026-13'); return 'accepté'; } catch { return 'refusé'; } })(), 'refusé');
+verifie('12 mois récents, le plus récent d\'abord', recentMonths('2026-09-03', 12)[0], '2026-09');
+verifie('le douzième remonte à octobre 2025', recentMonths('2026-09-03', 12)[11], '2025-10');
+verifie('août 2026 est écoulé le 3 septembre', isMonthOver('2026-08', '2026-09-03'), true);
+verifie('septembre 2026 ne l\'est pas', isMonthOver('2026-09', '2026-09-03'), false);
+verifie('un mois se termine le dernier jour inclus', isMonthOver('2026-08', '2026-08-31'), false);
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Export comptable (FEC)
+//
+//  Chaque écriture doit tomber juste au centime, la TVA déductible ne doit
+//  venir que des factures, et un paiement sans facture part en charge TTC.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Export comptable ──');
+
+const FEC_INPUT = {
+  month: '2026-08',
+  orders: [
+    // 33 € TTC : 30 € HT à 10 % (3 € de TVA)
+    { id: 'o1', service: '2026-08-05', net_amount: 33, raw_data: {
+      total_tax_money: { amount: 300 },
+      line_items: [{ total_money: { amount: 3300 }, total_tax_money: { amount: 300 }, taxes: [{ percentage: '10.0', applied_money: { amount: 300 } }] }],
+    } },
+    // Même jour : 12 € TTC à 20 % (10 € HT, 2 € TVA) → une seule écriture pour la journée
+    { id: 'o2', service: '2026-08-05', net_amount: 12, raw_data: {
+      total_tax_money: { amount: 200 },
+      line_items: [{ total_money: { amount: 1200 }, total_tax_money: { amount: 200 }, taxes: [{ percentage: '20.0', applied_money: { amount: 200 } }] }],
+    } },
+  ],
+  invoices: [
+    { id: 'i1', date: '2026-08-03', invoice_number: 'F-1', accounting_ref: 'FAC-202608-AAAA', accounting_class: '601',
+      total_ht: 100, total_ttc: 110, tva_recoverable: true, supplier: { name: 'Métro' },
+      lines: [{ category: 'alimentaire', total_ht: 80 }, { category: 'materiel', total_ht: 15 }] }, // 5 € d'écart lignes/total
+    { id: 'i2', date: '2026-08-10', invoice_number: null, accounting_ref: 'FAC-202608-BBBB', accounting_class: '606',
+      total_ht: 50, total_ttc: 60, tva_recoverable: false, supplier: { name: 'Leroy Merlin' }, lines: [] },
+  ],
+  bank: [
+    { id: 'b1', date: '2026-08-04', description: 'CB METRO', amount: -110, category: 'variable_fournisseur', invoice_id: 'i1' },
+    { id: 'b2', date: '2026-08-06', description: 'VIR SEPA SQUAREUP', amount: 44.10, category: 'recette', invoice_id: null },
+    { id: 'b3', date: '2026-08-07', description: 'PRLV LOYER', amount: -1332.65, category: 'fixe_loyer', invoice_id: null },
+    { id: 'b4', date: '2026-08-08', description: 'CB MOZZALAT', amount: -84.30, category: 'variable_fournisseur', invoice_id: null },
+    { id: 'b5', date: '2026-08-09', description: 'VIR YOHAN', amount: 500, category: 'flux_financier', invoice_id: null },
+  ],
+  cca: [
+    { id: 'c1', date: '2026-08-09', associe: 'yohan', sens: 'apport', sous_type: 'avance_tresorerie', montant: 500, note: null, bank_transaction_id: 'b5', invoice_id: null },
+    { id: 'c2', date: '2026-08-12', associe: 'justine', sens: 'apport', sous_type: 'facture_payee_perso', montant: 60, note: null, bank_transaction_id: null, invoice_id: 'i2' },
+  ],
+};
+const L = buildEntries(FEC_INPUT);
+const par = (pred) => L.filter(pred);
+const somme = (rows, k) => Math.round(rows.reduce((s, r) => s + r[k], 0) * 100) / 100;
+
+verifie('toutes les écritures sont équilibrées', unbalancedEntries(L).length, 0);
+verifie('débits = crédits sur le mois', somme(L, 'debit'), somme(L, 'credit'));
+
+// Ventes : une écriture pour la journée du 5, éclatée par taux
+const vt = par(l => l.journal === 'VT');
+verifie('ventes : une écriture pour la journée', new Set(vt.map(l => l.num)).size, 1);
+verifie('ventes : client Square débité du TTC', somme(par(l => l.compte === '411100' && l.journal === 'VT'), 'debit'), 45);
+verifie('ventes : HT à 10 %', somme(par(l => l.compte === '707100'), 'credit'), 30);
+verifie('ventes : HT à 20 %', somme(par(l => l.compte === '707300'), 'credit'), 10);
+verifie('ventes : TVA collectée', somme(par(l => l.compte === '445710'), 'credit'), 5);
+
+// Achats : facture ventilée, écart lignes/total sur la classe, TVA déductible
+const ac1 = par(l => l.journal === 'AC' && l.piece === 'FAC-202608-AAAA');
+verifie('achat : alimentaire 80', somme(ac1.filter(l => l.compte === '601000' && l.lib.includes('alimentaire')), 'debit'), 80);
+verifie('achat : matériel 15', somme(ac1.filter(l => l.compte === '606300'), 'debit'), 15);
+verifie('achat : écart 5 sur la classe 601', somme(ac1.filter(l => l.lib.includes('écart')), 'debit'), 5);
+verifie('achat : TVA déductible 10', somme(ac1.filter(l => l.compte === '445660'), 'debit'), 10);
+verifie('achat : fournisseur crédité du TTC', somme(ac1.filter(l => l.compte === '401000'), 'credit'), 110);
+verifie('achat : compte auxiliaire lisible', ac1.find(l => l.compte === '401000')?.aux, '401METRO');
+
+// Facture à TVA non récupérable : la TVA est un coût, pas une créance
+const ac2 = par(l => l.journal === 'AC' && l.piece === 'FAC-202608-BBBB');
+verifie('TVA non récupérable : aucune TVA déductible', ac2.filter(l => l.compte === '445660').length, 0);
+verifie('TVA non récupérable : charge = TTC', somme(ac2.filter(l => l.compte === '606300'), 'debit'), 60);
+
+// Banque : contreparties
+const bq = par(l => l.journal === 'BQ');
+verifie('paiement lettré → fournisseur (401), pas une charge', bq.find(l => l.lib === 'CB METRO' && l.debit > 0)?.compte, '401000');
+verifie('versement Square → clients Square', bq.find(l => l.lib === 'VIR SEPA SQUAREUP' && l.credit > 0)?.compte, '411100');
+verifie('loyer → 613200', bq.find(l => l.lib === 'PRLV LOYER' && l.debit > 0)?.compte, '613200');
+verifie('paiement sans facture → charge pour le TTC, sans TVA', bq.find(l => l.lib === 'CB MOZZALAT' && l.debit > 0)?.debit, 84.30);
+verifie('aucune TVA déductible hors journal des achats', par(l => l.compte === '445660' && l.journal !== 'AC').length, 0);
+verifie('apport adossé à la banque → 455', bq.find(l => l.lib === 'VIR YOHAN' && l.credit > 0)?.compte, '455000');
+
+// OD : l'apport adossé à la banque n'est pas doublé ; la facture payée perso l'est
+const od = par(l => l.journal === 'OD');
+verifie('OD : une seule écriture (facture payée perso)', new Set(od.map(l => l.num)).size, 1);
+verifie('OD : 401 fournisseur débité', od.find(l => l.compte === '401000')?.debit, 60);
+verifie('OD : 455 crédité', od.find(l => l.compte === '455000')?.credit, 60);
+
+// Format FEC
+const fec = toFec(L, '2026-09-02');
+const fecLines = fec.split('\r\n').filter(Boolean);
+verifie('FEC : 18 colonnes en en-tête', fecLines[0].split('\t').length, 18);
+verifie('FEC : chaque ligne a 18 colonnes', fecLines.every(l => l.split('\t').length === 18), true);
+verifie('FEC : dates AAAAMMJJ', /\t20260805\t/.test(fecLines.find(l => l.startsWith('VT'))), true);
+verifie('FEC : décimales à la virgule', fecLines.some(l => l.includes('\t1332,65\t')), true);
+verifie('FEC : date de validation posée', fecLines[1].split('\t')[15], '20260902');
+verifie('FEC : sans validation quand non clôturé', toFec(L, null).split('\r\n')[1].split('\t')[15], '');
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Frais kilométriques
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Frais kilométriques ──');
+
+const CFG7 = { ...DEFAULT_CONFIG, cv: '7+', electric: false };
+verifie('7 CV, 4 000 km : 4000 × 0,697', computeAllowance(4000, CFG7), 2788);
+verifie('7 CV, 6 000 km : 6000 × 0,394 + 1515 (tranche médiane)', computeAllowance(6000, CFG7), 3879);
+verifie('7 CV, 21 000 km : 21000 × 0,470', computeAllowance(21000, CFG7), 9870);
+verifie('5 000 km pile : encore la première tranche', computeAllowance(5000, CFG7), 3485);
+verifie('5 001 km : la tranche médiane s\'applique à TOUT le cumul', computeAllowance(5001, CFG7), 3485.39);
+verifie('électrique : +20 %', computeAllowance(1000, { ...CFG7, electric: true }), 836.4);
+verifie('0 km : rien', computeAllowance(0, CFG7), 0);
+
+const parts = allocateShares([56, 60, 56, 33], 205, 142.89);
+verifie('ventilation : la somme des lignes = le total au centime', Math.round(parts.reduce((a, b) => a + b, 0) * 100) / 100, 142.89);
+verifie('ventilation : au prorata (56/205)', Math.abs(parts[0] - 39.03) < 0.02, true);
+
+verifie('date d\'achat dans le libellé', tripDateFromLabel('CB42METRO FRANCE 04/06/26', '2026-06-05').date, '2026-06-04');
+verifie('jour/mois seul : année de l\'écriture', tripDateFromLabel('CB METRO 27/03', '2026-06-01').date, '2026-03-27');
+verifie('achat de décembre payé en janvier : année précédente', tripDateFromLabel('CB METRO 28/12', '2026-01-03').date, '2025-12-28');
+verifie('sans date : celle du paiement, signalée', tripDateFromLabel('VIR MOZZALAT', '2026-06-01').exact, false);
+
+verifie('« EURO CIBUS » → Mozzalat', matchDestination('EURO CIBUS', DEFAULT_CONFIG.destinations)?.key, 'mozzalat');
+verifie('« METRO FRANCE » → Metro', matchDestination('CB42METRO FRANCE', DEFAULT_CONFIG.destinations)?.key, 'metro');
+verifie('« CARREFOUR » → aucun trajet', matchDestination('CARREFOUR LOUVIERS', DEFAULT_CONFIG.destinations), null);
+
+verifie('plein Esso reconnu', isFuelPurchase('CB ESSO LOUVIERS 12/06'), true);
+verifie('station Total reconnue', isFuelPurchase('CB TOTAL EVREUX'), true);
+verifie('facture TotalEnergies (électricité) : pas un plein', isFuelPurchase('PRLV TOTALENERGIES ELECTRICITE'), false);
+verifie('Banque Populaire : pas une station BP', isFuelPurchase('VIR BANQUE POPULAIRE'), false);
+verifie('Metro : pas un plein', isFuelPurchase('CB42METRO FRANCE'), false);
+
+declenche('carburant payé par la société + trajets au barème → important',
+  { tripsInPeriod: 3, fuelDebits: { count: 1, amount: 82 } }, 'carburant-et-bareme');
+silence('carburant sans trajet : rien à signaler ici',
+  { tripsInPeriod: 0, fuelDebits: { count: 1, amount: 82 } }, 'carburant-et-bareme');
+silence('trajets sans carburant : normal',
+  { tripsInPeriod: 3, fuelDebits: { count: 0, amount: 0 } }, 'carburant-et-bareme');
 
 console.log(`\n${echecs === 0 ? '✓ Tous les contrôles comptables passent.' : `✗ ${echecs} contrôle(s) en échec.`}\n`);
 process.exit(echecs === 0 ? 0 : 1);
