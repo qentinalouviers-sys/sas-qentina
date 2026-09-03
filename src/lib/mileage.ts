@@ -367,3 +367,25 @@ export function mergeConfig(stored: unknown): MileageConfig {
       : DEFAULT_CONFIG.destinations,
   };
 }
+
+/**
+ * Un libellé bancaire qui ressemble à un plein de carburant.
+ *
+ * Le barème kilométrique couvre DÉJÀ le carburant, l'assurance et l'usure du
+ * véhicule. Si la société paie en plus un plein sur son compte, la dépense est
+ * déduite deux fois : une fois au réel, une fois dans l'indemnité. C'est le
+ * genre de doublon qu'un contrôleur cherche en premier sur une note de frais.
+ *
+ * Heuristique par enseignes et mots-clés ; « TotalEnergies » seul est un
+ * fournisseur d'électricité, pas une station : on exige « total » suivi
+ * d'autre chose qu'« energies ».
+ */
+export function isFuelPurchase(description: string): boolean {
+  const l = normalize(description);
+  if (!l) return false;
+  const tight = l.replace(/[\s-]/g, '');
+  if (/(^|[^a-z])(esso|shell|avia|agip|dyneff|as24|carbur|station[\s-]?service|relais)([^a-z]|$)/.test(l)) return true;
+  if (/(^|[^a-z])bp([^a-z]|$)/.test(l) && !/bpce|bp\s*rives|banque populaire/.test(l)) return true;
+  if (/(^|[^a-z])total(?!energies)([^a-z]|$)/.test(l) && !tight.includes('totalenergies')) return true;
+  return false;
+}

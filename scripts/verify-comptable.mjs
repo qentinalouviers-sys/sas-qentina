@@ -33,6 +33,10 @@ import { checkCcaOperation, firstDebitDay } from '../src/lib/cca.ts';
 import { inventorySessions, sessionAtBoundary, computeCogs } from '../src/lib/cogs.ts';
 import { monthBounds, recentMonths, isMonthOver } from '../src/lib/months.ts';
 import { buildEntries, unbalancedEntries, toFec } from '../src/lib/fec.ts';
+import {
+  computeAllowance, allocateShares, tripDateFromLabel, matchDestination, isFuelPurchase,
+  DEFAULT_CONFIG,
+} from '../src/lib/mileage.ts';
 
 /**
  * Faux client Supabase, qui applique réellement les filtres utilisés.
@@ -256,6 +260,8 @@ const faits = (o = {}) => ({
   mojibakeSuppliers: [],
   ccaBalances: [{ associe: 'yohan', balance: 1200 }],
   tripsNotInCca: { count: 0 },
+  tripsInPeriod: 0,
+  fuelDebits: { count: 0, amount: 0 },
   unmatchedDesignations: { count: 0, sample: [] },
   legacyMaskedItems: 0,
   inventoryClosing: { found: true, day: '2026-06-30' },
@@ -462,7 +468,11 @@ const factsBase = await collectInterventionFacts(fakeSupabase({
     { associe: 'yohan', sens: 'remboursement', montant: 900 },
     { associe: 'justine', sens: 'apport', montant: 300 },
   ],
-  mileage_trips: [{ id: 't1', cca_movement_id: null }, { id: 't2', cca_movement_id: 'm1' }],
+  mileage_trips: [
+    { id: 't1', date: '2026-03-10', cca_movement_id: null },   // ancien, non porté → compte
+    { id: 't2', date: '2026-03-12', cca_movement_id: 'm1' },   // porté
+    { id: 't3', date: '2026-06-28', cca_movement_id: null },   // récent : pas encore dû
+  ],
 }), { start: '2026-06-01', end: '2026-06-30', today: '2026-07-05',
       foodCostPercent: 41, foodCostBankSharePercent: 88 });
 
@@ -1045,6 +1055,47 @@ verifie('FEC : dates AAAAMMJJ', /\t20260805\t/.test(fecLines.find(l => l.startsW
 verifie('FEC : décimales à la virgule', fecLines.some(l => l.includes('\t1332,65\t')), true);
 verifie('FEC : date de validation posée', fecLines[1].split('\t')[15], '20260902');
 verifie('FEC : sans validation quand non clôturé', toFec(L, null).split('\r\n')[1].split('\t')[15], '');
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Frais kilométriques
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Frais kilométriques ──');
+
+const CFG7 = { ...DEFAULT_CONFIG, cv: '7+', electric: false };
+verifie('7 CV, 4 000 km : 4000 × 0,697', computeAllowance(4000, CFG7), 2788);
+verifie('7 CV, 6 000 km : 6000 × 0,394 + 1515 (tranche médiane)', computeAllowance(6000, CFG7), 3879);
+verifie('7 CV, 21 000 km : 21000 × 0,470', computeAllowance(21000, CFG7), 9870);
+verifie('5 000 km pile : encore la première tranche', computeAllowance(5000, CFG7), 3485);
+verifie('5 001 km : la tranche médiane s\'applique à TOUT le cumul', computeAllowance(5001, CFG7), 3485.39);
+verifie('électrique : +20 %', computeAllowance(1000, { ...CFG7, electric: true }), 836.4);
+verifie('0 km : rien', computeAllowance(0, CFG7), 0);
+
+const parts = allocateShares([56, 60, 56, 33], 205, 142.89);
+verifie('ventilation : la somme des lignes = le total au centime', Math.round(parts.reduce((a, b) => a + b, 0) * 100) / 100, 142.89);
+verifie('ventilation : au prorata (56/205)', Math.abs(parts[0] - 39.03) < 0.02, true);
+
+verifie('date d\'achat dans le libellé', tripDateFromLabel('CB42METRO FRANCE 04/06/26', '2026-06-05').date, '2026-06-04');
+verifie('jour/mois seul : année de l\'écriture', tripDateFromLabel('CB METRO 27/03', '2026-06-01').date, '2026-03-27');
+verifie('achat de décembre payé en janvier : année précédente', tripDateFromLabel('CB METRO 28/12', '2026-01-03').date, '2025-12-28');
+verifie('sans date : celle du paiement, signalée', tripDateFromLabel('VIR MOZZALAT', '2026-06-01').exact, false);
+
+verifie('« EURO CIBUS » → Mozzalat', matchDestination('EURO CIBUS', DEFAULT_CONFIG.destinations)?.key, 'mozzalat');
+verifie('« METRO FRANCE » → Metro', matchDestination('CB42METRO FRANCE', DEFAULT_CONFIG.destinations)?.key, 'metro');
+verifie('« CARREFOUR » → aucun trajet', matchDestination('CARREFOUR LOUVIERS', DEFAULT_CONFIG.destinations), null);
+
+verifie('plein Esso reconnu', isFuelPurchase('CB ESSO LOUVIERS 12/06'), true);
+verifie('station Total reconnue', isFuelPurchase('CB TOTAL EVREUX'), true);
+verifie('facture TotalEnergies (électricité) : pas un plein', isFuelPurchase('PRLV TOTALENERGIES ELECTRICITE'), false);
+verifie('Banque Populaire : pas une station BP', isFuelPurchase('VIR BANQUE POPULAIRE'), false);
+verifie('Metro : pas un plein', isFuelPurchase('CB42METRO FRANCE'), false);
+
+declenche('carburant payé par la société + trajets au barème → important',
+  { tripsInPeriod: 3, fuelDebits: { count: 1, amount: 82 } }, 'carburant-et-bareme');
+silence('carburant sans trajet : rien à signaler ici',
+  { tripsInPeriod: 0, fuelDebits: { count: 1, amount: 82 } }, 'carburant-et-bareme');
+silence('trajets sans carburant : normal',
+  { tripsInPeriod: 3, fuelDebits: { count: 0, amount: 0 } }, 'carburant-et-bareme');
 
 console.log(`\n${echecs === 0 ? '✓ Tous les contrôles comptables passent.' : `✗ ${echecs} contrôle(s) en échec.`}\n`);
 process.exit(echecs === 0 ? 0 : 1);

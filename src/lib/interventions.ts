@@ -25,6 +25,7 @@
 import { SupabaseClient } from '@supabase/supabase-js';
 import { unmatchedDesignations } from '@/lib/referentiel';
 import { inventorySessions, sessionAtBoundary } from '@/lib/cogs';
+import { isFuelPurchase } from '@/lib/mileage';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { foldLabel, isFinancialFlow, round2 } from './accounting';
 import { computeTva, TvaResult } from './tva';
@@ -136,8 +137,16 @@ export interface InterventionFacts {
   /** Solde du compte courant par associé (positif = la société lui doit). */
   ccaBalances: { associe: string; balance: number }[];
 
-  /** Trajets non portés au compte courant d'associé. */
+  /**
+   * Trajets non portés au compte courant d'associé, parmi ceux qui datent
+   * d'au moins 45 jours : une note de frais se fait au mois ou au trimestre,
+   * pas le lendemain de la course.
+   */
   tripsNotInCca: { count: number };
+  /** Trajets (barème kilométrique) enregistrés dans la période. */
+  tripsInPeriod: number;
+  /** Pleins de carburant payés par la société dans la période. */
+  fuelDebits: { count: number; amount: number };
   /**
    * Désignations alimentaires de factures qui ne correspondent à aucun
    * ingrédient ni alias : leurs prix ne mettent à jour aucune fiche.
@@ -588,6 +597,27 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     });
   }
 
+  // ── 14 bis. Carburant payé par la société ET barème kilométrique ──────────
+  // Le barème couvre déjà le carburant. Un plein sur le compte de la société
+  // le même mois qu'une indemnité kilométrique déduit la même dépense deux
+  // fois — c'est ce qu'un contrôleur cherche en premier sur une note de frais.
+  if (f.tripsInPeriod > 0 && f.fuelDebits.count > 0) {
+    out.push({
+      id: 'carburant-et-bareme',
+      severity: 'important',
+      title: `${eur(f.fuelDebits.amount)} de carburant payés par la société, avec ${f.tripsInPeriod} trajet(s) au barème`,
+      impact:
+        `L'indemnité kilométrique couvre déjà le carburant, l'assurance et l'usure du ` +
+        `véhicule. Un plein payé par la société en plus est déduit deux fois : au réel ` +
+        `dans les charges, et dans l'indemnité. En contrôle, c'est la première chose ` +
+        `qu'on reprend sur une note de frais.`,
+      action: 'Soit le plein est un frais personnel (à porter en remboursement au compte courant), soit le trajet du jour sort de la note de frais.',
+      href: '/banque',
+      hrefLabel: 'Banque → pleins de carburant',
+      amount: f.fuelDebits.amount,
+    });
+  }
+
   // ── 15. Désignations de factures non rattachées à un ingrédient ──────────
   // Un prix d'achat qui ne met à jour aucune fiche laisse les coûts des
   // recettes à leur ancienne valeur : le food cost par plat vieillit sans que
@@ -735,8 +765,8 @@ export async function collectInterventionFacts(
         .select('name').range(f0, f1)),
       fetchAllRows<any>((f0, f1) => supabase.from('mouvements_cca')
         .select('associe, sens, montant').range(f0, f1)),
-      fetchAllRows<any>((f0, f1) => supabase.from('mileage_trips')
-        .select('id, cca_movement_id').range(f0, f1)),
+      fetchAllRows<{ id: string; date: string | null; cca_movement_id: string | null }>((f0, f1) => supabase.from('mileage_trips')
+        .select('id, date, cca_movement_id').range(f0, f1)),
       computeTva(supabase, start, end),
       fetchAllRows<{ designation: string | null }>((f0, f1) => supabase.from('invoice_lines')
         .select('designation')
@@ -814,7 +844,20 @@ export async function collectInterventionFacts(
     balances.set(m.associe, round2((balances.get(m.associe) || 0) + signed));
   }
 
-  const tripsNotInCca = trips.filter((t: any) => !t.cca_movement_id).length;
+  // Trajets à porter au compte courant : ceux d'au moins 45 jours. Une note
+  // de frais se fait au mois ou au trimestre, pas le lendemain de la course.
+  const olderThan45 = addDays(today, -45);
+  const tripsNotInCca = trips.filter(t => !t.cca_movement_id && String(t.date ?? '') <= olderThan45).length;
+  const tripsInPeriod = trips.filter(t => { const d = String(t.date ?? ''); return d >= start && d <= end; }).length;
+
+  // Pleins de carburant payés par la société sur la période.
+  let fuelCount = 0;
+  let fuelAmount = 0;
+  for (const t of bank) {
+    if ((t.amount || 0) >= 0) continue;
+    if (isFinancialFlow(t.description || '', t.category)) continue;
+    if (isFuelPurchase(t.description || '')) { fuelCount++; fuelAmount += Math.abs(t.amount || 0); }
+  }
 
   // ── Mercuriale : désignations orphelines ─────────────────────────────────
   const orphans = unmatchedDesignations(foodLines, ingredients, aliases);
@@ -870,6 +913,8 @@ export async function collectInterventionFacts(
     mojibakeSuppliers: mojibake,
     ccaBalances: [...balances].map(([associe, balance]) => ({ associe, balance })),
     tripsNotInCca: { count: tripsNotInCca },
+    tripsInPeriod,
+    fuelDebits: { count: fuelCount, amount: round2(fuelAmount) },
     unmatchedDesignations: {
       count: orphans.length,
       sample: orphans.slice(0, 5).map(o => o.designation),

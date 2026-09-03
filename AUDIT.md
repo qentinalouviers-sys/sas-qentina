@@ -877,6 +877,7 @@ l'être, et exige un contrôle humain là où une donnée fausse coûterait cher
 | « Stock valorisé » du tableau de bord additionnait tous les comptages jamais saisis | Dernier inventaire seulement |
 | Le passé restait modifiable : le P&L de mars pouvait changer en septembre | Clôture mensuelle : instantané + trigger lecture seule, réouverture motivée et journalisée |
 | Rien d'exploitable par le cabinet : ressaisie | Export FEC / CSV des quatre journaux, équilibre au centime testé, plan de comptes unique |
+| Frais kilométriques : lectures plafonnées à 1 000 lignes, achat de décembre payé en janvier perdu, trajet supprimable après avoir crédité l'associé, plein de carburant + barème non détecté | Lectures paginées, fenêtre bancaire jusqu'au 15 février, refus de supprimer un trajet porté au CCA (trop-perçu signalé), intervention « carburant et barème », mois clôturés ignorés à la détection et date de repli pour le CCA |
 
 ### Ce qu'il faut savoir
 
@@ -887,15 +888,10 @@ l'être, et exige un contrôle humain là où une donnée fausse coûterait cher
   une politique « tout utilisateur authentifié ». Un verrou côté client se contourne ;
   seuls le trigger CCA et les routes API sont réellement contraignants. C'est le prochain
   chantier structurel si l'outil doit accueillir d'autres comptes que les deux associés.
-- **`verify:compta` passe de 171 à 293 contrôles.** Chaque verrou est testé dans les deux
+- **`verify:compta` passe de 171 à 317 contrôles.** Chaque verrou est testé dans les deux
   sens : il refuse ce qu'il faut, et il se tait sur une facture normale.
 
 ## 8. Pistes pour la suite (non faites, à discuter)
-
-**Signalées et non corrigées :**
-- **Carburant et barème kilométrique** : l'un exclut l'autre. Un plein Esso et
-  une indemnité kilométrique sur le même mois est une double déduction, à
-  détecter.
 
 **Chantiers de fond :**
 - **Écritures via routes API** plutôt que depuis le navigateur, pour que chaque
