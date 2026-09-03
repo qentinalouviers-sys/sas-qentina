@@ -30,7 +30,11 @@ npm run dev
 | `NEXT_PUBLIC_SUPABASE_URL` | URL du projet Supabase |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Clé publique Supabase |
 | `SUPABASE_SERVICE_ROLE_KEY` | Clé serveur Supabase (jamais côté client) |
-| `ANTHROPIC_API_KEY` | Clé API Claude (scanner, banque, Fuego, audits) |
+| `ANTHROPIC_API_KEY` | Clé API Claude (banque, Fuego, audits, chat) |
+| `GEMINI_API_KEY` | Clé API Google Gemini — moteur d'OCR des factures ([AI Studio](https://aistudio.google.com/apikey)) |
+| `OCR_PROVIDER` | `gemini` ou `anthropic`. Vide = Gemini si sa clé existe, sinon Claude |
+| `GEMINI_MODEL` | Modèle Gemini. Vide = `gemini-2.5-flash` |
+| `GEMINI_THINKING_BUDGET` | Budget de raisonnement Gemini. `0` par défaut (économie) |
 | `SQUARE_ACCESS_TOKEN` | Jeton d'accès Square |
 | `SQUARE_LOCATION_ID` | Identifiant du point de vente Square |
 | `SQUARE_WEBHOOK_SECRET` | **Important** : secret de signature du webhook (Square Developer Dashboard) |
@@ -38,6 +42,31 @@ npm run dev
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OAuth Google Business (réponses aux avis) |
 | `GOOGLE_PLACES_API_KEY` / `GOOGLE_PLACE_ID` | Lecture des avis Google |
 | `CRON_SECRET` | **Obligatoire** : authentifie la synchro Square nocturne. Absente, elle refuse de tourner |
+
+### Moteur d'OCR des factures
+
+Le scanner de factures tourne sur **Gemini** (Google), sensiblement moins cher que
+Claude à qualité comparable sur de l'extraction structurée. Claude reste en place
+pour tout le reste : catégorisation bancaire, Fuego, audits, chat.
+
+Trois choses à savoir :
+
+1. **La bascule est une variable, pas un déploiement.** `OCR_PROVIDER=anthropic`
+   ramène le scanner sur Claude sans toucher au code — utile si Gemini se révèle
+   moins fiable sur un fournisseur donné.
+2. **Le raisonnement est coupé** (`GEMINI_THINKING_BUDGET=0`). Les modèles 2.5
+   « réfléchissent » par défaut et facturent ces tokens comme de la sortie : lire
+   une facture n'en a aucun besoin. C'est là que se fait l'essentiel de l'économie.
+3. **Le prompt est strictement identique** dans les deux moteurs
+   (`INVOICE_OCR_PROMPT`, un seul exemplaire). Une différence de résultat vient
+   donc du modèle, jamais de la consigne.
+
+Le moteur réellement utilisé est visible à trois endroits : la pastille d'état en
+haut de l'application, le champ `ocr_engine` renvoyé par `/api/scanner`, et
+`config.ocr_provider` dans `/api/scanner/health`.
+
+Gemini accepte en plus le **HEIC/HEIF** des iPhone, que Claude refusait : les
+photos prises sans changer les réglages de l'appareil passent désormais.
 
 ### Base de données
 

@@ -7,6 +7,16 @@ interface HealthData {
   status: 'green' | 'orange' | 'red';
   message: string;
   latency_ms?: number;
+  /** Moteur d'OCR effectivement utilisé (« gemini » ou « anthropic »). */
+  provider?: string;
+  model?: string;
+}
+
+/** Nom lisible du moteur, pour que l'étiquette dise la vérité après bascule. */
+function engineLabel(provider?: string): string {
+  if (provider === 'gemini') return 'Gemini IA';
+  if (provider === 'anthropic') return 'Claude IA';
+  return 'Moteur IA';
 }
 
 export default function ClaudeStatusIndicator() {
@@ -47,7 +57,7 @@ export default function ClaudeStatusIndicator() {
     return (
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--text-muted, #6B7280)', background: 'var(--cream-light, #F9FAFB)', padding: '5px 10px', borderRadius: 100, border: '1px solid var(--border-light, #E5E7EB)' }}>
         <Loader2 size={10} style={{ animation: 'spin 1s linear infinite' }} />
-        <span>Claude IA : Vérification...</span>
+        <span>Moteur IA : Vérification...</span>
       </div>
     );
   }
@@ -57,7 +67,10 @@ export default function ClaudeStatusIndicator() {
 
   return (
     <div
-      title={health?.latency_ms ? `Latence : ${health.latency_ms}ms` : undefined}
+      title={[
+        health?.model ? `Modèle : ${health.model}` : null,
+        health?.latency_ms ? `Latence : ${health.latency_ms} ms` : null,
+      ].filter(Boolean).join(' — ') || undefined}
       style={{
         display: 'flex',
         alignItems: 'center',
@@ -80,7 +93,7 @@ export default function ClaudeStatusIndicator() {
         boxShadow: `0 0 6px ${current.color}`,
         animation: health?.status === 'red' ? 'pulse 1.5s ease-in-out infinite' : undefined,
       }} />
-      <span style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.3px', color: 'var(--text-muted)' }}>Claude IA :</span>
+      <span style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.3px', color: 'var(--text-muted)' }}>{engineLabel(health?.provider)} :</span>
       <span style={{ color: current.color }}>{label}</span>
     </div>
   );

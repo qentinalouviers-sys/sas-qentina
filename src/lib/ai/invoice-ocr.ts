@@ -1,12 +1,20 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages';
 import { createClaudeMessage } from '@/lib/anthropic';
+import { callGemini, getGeminiModel, type GeminiPart } from '@/lib/ai/gemini';
 import { extractJson } from '@/lib/ai/json';
 
 /**
- * invoice-ocr.ts — OCR de factures par Claude (prompt + appel + règles TVA).
+ * invoice-ocr.ts — OCR de factures (prompt + appel + règles TVA).
  * Utilisé par /api/scanner ET /api/invoices/extract : un seul prompt,
  * une seule logique, des résultats identiques quel que soit le point d'entrée.
+ *
+ * Deux moteurs possibles, choisis par la variable OCR_PROVIDER :
+ *  - « gemini » (Google) — nettement moins cher, c'est le moteur retenu ;
+ *  - « anthropic » (Claude) — conservé comme repli immédiat, sans redéploiement
+ *    de code, si Gemini se révèle moins fiable sur les tickets.
+ * Le prompt est rigoureusement le même dans les deux cas : les résultats
+ * restent comparables, et seul le moteur change.
  */
 
 export const INVOICE_OCR_PROMPT = `Tu es un assistant OCR expert pour un restaurant.
@@ -82,11 +90,28 @@ export interface ExtractedInvoiceData {
 }
 
 /** Formats d'image acceptés par l'API Claude. */
-const SUPPORTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'] as const;
-type SupportedImageType = typeof SUPPORTED_IMAGE_TYPES[number];
+const ANTHROPIC_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'] as const;
 
-function isSupportedImage(mime: string): mime is SupportedImageType {
-  return (SUPPORTED_IMAGE_TYPES as readonly string[]).includes(mime);
+/**
+ * Formats acceptés par Gemini. Le HEIC/HEIF des iPhone y passe directement,
+ * là où Claude le refuse : les photos prises sans changer les réglages de
+ * l'appareil ne sont plus rejetées.
+ */
+const GEMINI_IMAGE_TYPES = [
+  'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif',
+] as const;
+
+/** `image/jpg` n'est pas un type MIME valide : les deux API attendent `image/jpeg`. */
+function normalizeMime(mime: string): string {
+  return mime === 'image/jpg' ? 'image/jpeg' : mime;
+}
+
+function assertSupportedImage(mime: string, accepted: readonly string[], hint: string): void {
+  if (accepted.includes(mime)) return;
+  throw new Error(
+    `Format d'image non pris en charge (${mime}). Utilisez ${hint}. `
+    + `Sur iPhone : Réglages → Appareil photo → Formats → « Le plus compatible ».`
+  );
 }
 
 function toContentBlock(f: OcrFile): ContentBlockParam {
@@ -97,21 +122,25 @@ function toContentBlock(f: OcrFile): ContentBlockParam {
     };
   }
 
-  // Normalisation : les photos iPhone arrivent parfois en HEIC/HEIF, que
-  // l'API refuse. On le signale clairement plutôt que d'échouer côté Claude.
-  const mime = f.mimeType === 'image/jpg' ? 'image/jpeg' : f.mimeType;
-  if (!isSupportedImage(mime)) {
-    throw new Error(
-      `Format d'image non pris en charge (${f.mimeType}). ` +
-      `Utilisez un PDF, JPG, PNG, GIF ou WEBP. ` +
-      `Sur iPhone : Réglages → Appareil photo → Formats → « Le plus compatible ».`
-    );
-  }
+  const mime = normalizeMime(f.mimeType);
+  assertSupportedImage(mime, ANTHROPIC_IMAGE_TYPES, 'un PDF, JPG, PNG, GIF ou WEBP');
 
   return {
     type: 'image',
-    source: { type: 'base64', media_type: mime, data: f.fileBase64 },
+    source: {
+      type: 'base64',
+      media_type: mime as typeof ANTHROPIC_IMAGE_TYPES[number],
+      data: f.fileBase64,
+    },
   };
+}
+
+function toGeminiPart(f: OcrFile): GeminiPart {
+  const mime = f.mimeType.includes('pdf') ? 'application/pdf' : normalizeMime(f.mimeType);
+  if (mime !== 'application/pdf') {
+    assertSupportedImage(mime, GEMINI_IMAGE_TYPES, 'un PDF, JPG, PNG, WEBP ou HEIC');
+  }
+  return { inlineData: { mimeType: mime, data: f.fileBase64 } };
 }
 
 /**
@@ -129,39 +158,127 @@ export function computeTvaRecoverable(extracted: ExtractedInvoiceData): boolean 
   return true;
 }
 
-/** Lance l'OCR Claude sur une ou plusieurs pages du même document. */
-export async function runInvoiceOcr(files: OcrFile[]): Promise<ExtractedInvoiceData> {
+/** Instruction utilisateur, identique pour les deux moteurs. */
+const USER_INSTRUCTION = 'Extrais les données de ces pages faisant partie du même document.';
+
+/**
+ * Budget de sortie. Une facture Metro peut compter plus de cent lignes : à
+ * 4 096 tokens (l'ancienne valeur) la réponse était tronquée, et le parseur la
+ * « réparait » en coupant les dernières lignes — la facture entrait alors en
+ * base incomplète, faussant le stock et la TVA sans aucun signal.
+ */
+const MAX_OUTPUT_TOKENS = 32000;
+
+const TRUNCATED_MESSAGE =
+  'Facture trop longue pour être lue en une fois. Scanne-la en deux parties : '
+  + 'mieux vaut deux imports que des lignes manquantes sans avertissement.';
+
+export type OcrProvider = 'gemini' | 'anthropic';
+
+/**
+ * Moteur d'OCR retenu pour cet appel.
+ *
+ * Ordre de résolution :
+ *  1. OCR_PROVIDER, la consigne explicite (« gemini » ou « anthropic ») ;
+ *  2. à défaut, Gemini dès lors que GEMINI_API_KEY est renseignée ;
+ *  3. sinon Claude, comme avant.
+ *
+ * Cet ordre permet d'installer le code sans rien casser : tant que la clé
+ * Google n'est pas posée, l'application continue de tourner sur Claude.
+ */
+export function resolveOcrProvider(): OcrProvider {
+  const explicit = process.env.OCR_PROVIDER?.trim().toLowerCase();
+  if (explicit === 'gemini' || explicit === 'anthropic') return explicit;
+  if (explicit) {
+    throw new Error(
+      `OCR_PROVIDER vaut « ${explicit} », valeur inconnue. `
+      + 'Les seules valeurs acceptées sont « gemini » et « anthropic ».'
+    );
+  }
+  return process.env.GEMINI_API_KEY?.trim() ? 'gemini' : 'anthropic';
+}
+
+/** OCR par Claude (Anthropic). */
+async function ocrWithClaude(files: OcrFile[]): Promise<string> {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
   const response = await createClaudeMessage(anthropic, {
     system: INVOICE_OCR_PROMPT,
     messages: [{
       role: 'user',
-      content: [
-        ...files.map(toContentBlock),
-        { type: 'text', text: 'Extrais les données de ces pages faisant partie du même document.' },
-      ],
+      content: [...files.map(toContentBlock), { type: 'text', text: USER_INSTRUCTION }],
     }],
-    // Une facture Metro peut compter plus de cent lignes : à 4 096 tokens
-    // (l'ancienne valeur) la réponse était tronquée, et le parseur la
-    // « réparait » en coupant les dernières lignes — la facture entrait alors
-    // en base incomplète, faussant le stock et la TVA sans aucun signal.
-    max_tokens: 32000,
+    max_tokens: MAX_OUTPUT_TOKENS,
   });
 
-  if (response.stop_reason === 'max_tokens') {
-    throw new Error(
-      'Facture trop longue pour être lue en une fois. Scanne-la en deux parties : '
-      + 'mieux vaut deux imports que des lignes manquantes sans avertissement.'
-    );
-  }
+  if (response.stop_reason === 'max_tokens') throw new Error(TRUNCATED_MESSAGE);
 
   const textContent = response.content.find((c: any) => c.type === 'text');
   if (!textContent || textContent.type !== 'text') {
     throw new Error('Réponse Claude invalide');
   }
+  return textContent.text;
+}
 
-  const extracted = extractJson<ExtractedInvoiceData>(textContent.text);
+/**
+ * Taille maximale des fichiers envoyés d'un bloc à Gemini.
+ *
+ * L'API plafonne la requête entière à 20 Mo ; au-delà il faut passer par son
+ * service de téléversement, complication inutile ici. On refuse donc en amont,
+ * avec un message actionnable, plutôt que de laisser tomber un 400 opaque.
+ * La valeur est en caractères base64, soit environ 13,5 Mo de fichiers réels.
+ */
+const GEMINI_INLINE_LIMIT = 18 * 1024 * 1024;
+
+/** OCR par Gemini (Google). */
+async function ocrWithGemini(files: OcrFile[]): Promise<string> {
+  const totalBase64 = files.reduce((sum, f) => sum + f.fileBase64.length, 0);
+  if (totalBase64 > GEMINI_INLINE_LIMIT) {
+    throw new Error(
+      `Document trop volumineux pour être envoyé en une fois `
+      + `(${Math.round(totalBase64 / 1024 / 1024)} Mo, limite 13 Mo). `
+      + `Scanne-le en deux fois, ou réduis la résolution des photos.`
+    );
+  }
+
+  const result = await callGemini({
+    system: INVOICE_OCR_PROMPT,
+    parts: [...files.map(toGeminiPart), { text: USER_INSTRUCTION }],
+    maxOutputTokens: MAX_OUTPUT_TOKENS,
+    // Sortie JSON imposée côté Google : plus de markdown parasite autour de
+    // l'objet, donc plus de réparation approximative à faire ici.
+    responseJson: true,
+  });
+
+  if (result.truncated) throw new Error(TRUNCATED_MESSAGE);
+
+  if (result.usage) {
+    console.log(
+      `[OCR] Gemini ${result.model} — ${result.usage.input} tokens en entrée, `
+      + `${result.usage.output} en sortie.`
+    );
+  }
+  return result.text;
+}
+
+/**
+ * Lance l'OCR sur une ou plusieurs pages du même document, avec le moteur
+ * configuré. Le résultat a exactement la même forme quel que soit le moteur.
+ */
+export async function runInvoiceOcr(files: OcrFile[]): Promise<ExtractedInvoiceData> {
+  const provider = resolveOcrProvider();
+  const raw = provider === 'gemini' ? await ocrWithGemini(files) : await ocrWithClaude(files);
+
+  const extracted = extractJson<ExtractedInvoiceData>(raw);
   extracted.tva_recoverable = computeTvaRecoverable(extracted);
   return extracted;
+}
+
+/** Moteur et modèle actifs, pour l'affichage et le diagnostic. */
+export function describeOcrEngine(): { provider: OcrProvider; model: string } {
+  const provider = resolveOcrProvider();
+  return {
+    provider,
+    model: provider === 'gemini' ? getGeminiModel() : 'claude-sonnet-5',
+  };
 }
