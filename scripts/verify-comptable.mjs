@@ -26,6 +26,9 @@ import { detectInterventions, collectInterventionFacts } from '../src/lib/interv
 import { categoryFromRules } from '../src/lib/bank-csv.ts';
 import { suggestInvoicesForTransaction, sumDebits } from '../src/lib/reconciliation.ts';
 import { checkInvoice, assertInvoiceAccepted } from '../src/lib/invoice-checks.ts';
+import {
+  repairMojibake, normalizeName, findSupplierMatch, matchIngredient, unmatchedDesignations,
+} from '../src/lib/referentiel.ts';
 
 /**
  * Faux client Supabase, qui applique réellement les filtres utilisés.
@@ -249,6 +252,7 @@ const faits = (o = {}) => ({
   mojibakeSuppliers: [],
   ccaBalances: [{ associe: 'yohan', balance: 1200 }],
   tripsNotInCca: { count: 0 },
+  unmatchedDesignations: { count: 0, sample: [] },
   ...o,
 });
 
@@ -776,6 +780,53 @@ verifie('sans numéro, non acquittée : refusée', tente({ numero_facture: null 
 verifie('sans numéro, acquittée : acceptée', tente({ numero_facture: null }, ['numero-manquant']), 'acceptée');
 verifie('bloquant acquitté quand même : refusée', tente({ date: null }, ['date-manquante']), 'refusée');
 verifie('acquittement d\'un autre code : refusée', tente({ numero_facture: null }, ['sans-tva']), 'refusée');
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Référentiel : fournisseurs et ingrédients
+//
+//  La règle est l'égalité après normalisation, jamais l'inclusion. Chaque cas
+//  ci-dessous est une confusion qui s'est produite : « Tomate » qui capte le
+//  concentré, « MÃ©tro » qui dédouble Métro, « Métro » qui capterait Eurométro.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Référentiel ──');
+
+verifie('mojibake réparé', repairMojibake('MÃ©tro'), 'Métro');
+verifie('libellé sain intact', repairMojibake('Métro'), 'Métro');
+verifie('normalisation : accents, casse, espaces', normalizeName('  MÉTRO   Cash '), 'metro cash');
+verifie('normalisation : mojibake puis accents', normalizeName('MÃ©tro'), 'metro');
+
+const FOURNISSEURS = [{ id: 'm', name: 'Métro' }, { id: 'e', name: 'Eurométro' }, { id: 'z', name: 'Mozzalat' }];
+verifie('« metro » retrouve Métro', findSupplierMatch('metro', FOURNISSEURS)?.id, 'm');
+verifie('« MÃ©tro » retrouve Métro (pas de doublon)', findSupplierMatch('MÃ©tro', FOURNISSEURS)?.id, 'm');
+verifie('« Métro » ne capte pas Eurométro', findSupplierMatch('Métro', FOURNISSEURS)?.id, 'm');
+verifie('« Métro Cash » inconnu → null (pas d\'inclusion)', findSupplierMatch('Métro Cash', FOURNISSEURS), null);
+verifie('nom vide → null', findSupplierMatch('  ', FOURNISSEURS), null);
+
+const INGREDIENTS = [{ id: 't', name: 'Tomate' }, { id: 'c', name: 'Concentré de tomate' }, { id: 'f', name: 'Farine' }];
+const ALIAS = [{ alias: normalizeName('FARINE CAPUTO NUVOLA 25KG'), ingredient_id: 'f' }];
+verifie('nom exact → ingrédient', matchIngredient('tomate', INGREDIENTS, [])?.id, 't');
+verifie('« Concentré de tomate » ne va pas à Tomate', matchIngredient('Concentré de tomate', INGREDIENTS, [])?.id, 'c');
+verifie('« TOMATE PELEE 4/4 » : inconnue, pas d\'inclusion', matchIngredient('TOMATE PELEE 4/4', INGREDIENTS, []), null);
+verifie('alias validé → ingrédient', matchIngredient('Farine Caputo Nuvola 25kg', INGREDIENTS, ALIAS)?.id, 'f');
+
+const LIGNES = [
+  { designation: 'Tomate', unit: 'kg', unit_price_ht: 2 },
+  { designation: 'TOMATE PELEE 4/4', unit: 'unité', unit_price_ht: 1.2 },
+  { designation: 'Tomate pelée 4/4', unit: 'unité', unit_price_ht: 1.3 },
+  { designation: 'FARINE CAPUTO NUVOLA 25KG', unit: 'kg', unit_price_ht: 1.1 },
+  { designation: 'Basilic frais', unit: 'kg', unit_price_ht: 9 },
+];
+const orphelines = unmatchedDesignations(LIGNES, INGREDIENTS, ALIAS);
+verifie('désignations orphelines : 2 groupes', orphelines.length, 2);
+verifie('regroupées sans accents ni casse', orphelines[0].count, 2);
+verifie('la plus achetée d\'abord', orphelines[0].designation, 'TOMATE PELEE 4/4');
+verifie('dernier prix conservé', orphelines[0].lastPrice, 1.3);
+
+declenche('3 désignations orphelines → à vérifier',
+  { unmatchedDesignations: { count: 3, sample: ['TOMATE PELEE 4/4', 'x', 'y'] } }, 'designations-non-rattachees');
+silence('2 orphelines : bruit normal, silence',
+  { unmatchedDesignations: { count: 2, sample: ['a', 'b'] } }, 'designations-non-rattachees');
 
 console.log(`\n${echecs === 0 ? '✓ Tous les contrôles comptables passent.' : `✗ ${echecs} contrôle(s) en échec.`}\n`);
 process.exit(echecs === 0 ? 0 : 1);

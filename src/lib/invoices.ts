@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { ExtractedInvoiceData } from '@/lib/ai/invoice-ocr';
 import { assertInvoiceAccepted } from '@/lib/invoice-checks';
+import { cleanName, findSupplierMatch, matchIngredient } from '@/lib/referentiel';
 
 /**
  * invoices.ts — Enregistrement d'une facture extraite par l'IA.
@@ -20,25 +21,29 @@ export function generateAccountingRef(date?: string | null): string {
   return `FAC-${ym}-${suffix}`;
 }
 
-/** Retrouve un fournisseur par nom approchant, ou le crée. */
+/**
+ * Retrouve un fournisseur par son nom, ou le crée.
+ *
+ * La correspondance est une égalité après normalisation (accents, casse,
+ * encodage cassé), jamais une inclusion : l'ancien `ilike '%Métro%'` ne
+ * retrouvait pas « MÃ©tro » et aurait capté un « Eurométro ». La table est
+ * petite (quelques dizaines de fiches) : on la lit entière plutôt que de
+ * déléguer la comparaison à SQL, qui ne sait pas normaliser comme nous.
+ */
 export async function findOrCreateSupplier(
   supabase: SupabaseClient,
   name: string | null | undefined
 ): Promise<string | null> {
-  if (!name) return null;
+  const clean = cleanName(name ?? '');
+  if (!clean) return null;
 
-  const { data: found } = await supabase
-    .from('suppliers')
-    .select('id')
-    .ilike('name', `%${name}%`)
-    .limit(1)
-    .maybeSingle();
-
+  const { data: all } = await supabase.from('suppliers').select('id, name');
+  const found = findSupplierMatch(clean, (all ?? []) as { id: string; name: string }[]);
   if (found) return found.id;
 
   const { data: created } = await supabase
     .from('suppliers')
-    .insert({ name })
+    .insert({ name: clean })
     .select('id')
     .single();
   return created?.id ?? null;
@@ -125,45 +130,52 @@ export async function saveInvoice(
 
 /**
  * Met à jour le prix des ingrédients (mercuriale) à partir des lignes
- * alimentaire/boisson. Une seule requête de lecture (plus de N+1).
+ * alimentaire/boisson d'une facture.
+ *
+ * Seules les désignations qui correspondent EXACTEMENT à un ingrédient — par
+ * son nom ou par un alias validé dans Réglages — mettent un prix à jour. Plus
+ * aucune création automatique : chaque ligne inconnue créait un ingrédient à
+ * son libellé brut, et « le nom contient » faisait porter le prix du concentré
+ * à la tomate. Les désignations non reconnues attendent dans Réglages →
+ * Ingrédients, où un humain les rattache.
  */
 export async function updateIngredientPrices(
   supabase: SupabaseClient,
   lignes: NonNullable<ExtractedInvoiceData['lignes']>
-): Promise<void> {
+): Promise<{ updated: number; unmatched: string[] }> {
   const foodLines = lignes.filter(l => l.categorie === 'alimentaire' || l.categorie === 'boisson');
-  if (foodLines.length === 0) return;
+  if (foodLines.length === 0) return { updated: 0, unmatched: [] };
 
-  const { data: ingredients } = await supabase.from('ingredients').select('id, name');
-  const all = ingredients || [];
+  const [{ data: ingredients }, { data: aliases }] = await Promise.all([
+    supabase.from('ingredients').select('id, name, last_unit_price'),
+    supabase.from('ingredient_aliases').select('alias, ingredient_id'),
+  ]);
+  const all = (ingredients ?? []) as { id: string; name: string; last_unit_price: number | null }[];
   const now = new Date().toISOString();
+  const unmatched: string[] = [];
+  let updated = 0;
 
   for (const l of foodLines) {
-    const needle = (l.designation || '').toLowerCase();
-    const match = all.find(
-      (ing: { id: string; name: string }) =>
-        needle.includes(ing.name.toLowerCase()) || ing.name.toLowerCase().includes(needle)
-    );
-
-    if (match) {
-      await supabase
-        .from('ingredients')
-        .update({ last_unit_price: l.prix_unitaire_ht, last_updated: now })
-        .eq('id', match.id);
-    } else {
-      const { data: created } = await supabase
-        .from('ingredients')
-        .insert({
-          name: l.designation,
-          unit: l.unite || 'kg',
-          last_unit_price: l.prix_unitaire_ht,
-          last_updated: now,
-        })
-        .select('id, name')
-        .single();
-      if (created) all.push(created);
+    const match = matchIngredient(l.designation ?? '', all, aliases ?? []);
+    if (!match) {
+      unmatched.push(l.designation);
+      continue;
     }
+    const price = Number(l.prix_unitaire_ht);
+    if (!Number.isFinite(price) || price <= 0 || price === match.last_unit_price) continue;
+
+    await supabase
+      .from('ingredients')
+      .update({ last_unit_price: price, last_updated: now })
+      .eq('id', match.id);
+    match.last_unit_price = price;
+    updated++;
   }
+
+  if (unmatched.length > 0) {
+    console.log(`[Mercuriale] ${updated} prix mis à jour, ${unmatched.length} désignation(s) non rattachée(s) : ${unmatched.slice(0, 5).join(' | ')}`);
+  }
+  return { updated, unmatched };
 }
 
 /** Marque une transaction bancaire comme rapprochée avec une facture. */

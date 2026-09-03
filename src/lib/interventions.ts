@@ -23,6 +23,7 @@
  */
 
 import { SupabaseClient } from '@supabase/supabase-js';
+import { unmatchedDesignations } from '@/lib/referentiel';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { foldLabel, isFinancialFlow, round2 } from './accounting';
 import { computeTva, TvaResult } from './tva';
@@ -136,6 +137,11 @@ export interface InterventionFacts {
 
   /** Trajets non portés au compte courant d'associé. */
   tripsNotInCca: { count: number };
+  /**
+   * Désignations alimentaires de factures qui ne correspondent à aucun
+   * ingrédient ni alias : leurs prix ne mettent à jour aucune fiche.
+   */
+  unmatchedDesignations: { count: number; sample: string[] };
 }
 
 const SEVERITY_RANK: Record<Severity, number> = {
@@ -565,9 +571,29 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
         `Le même fournisseur existe donc deux fois sous deux orthographes, et ses ` +
         `achats sont répartis entre les deux fiches : aucun des deux totaux n'est ` +
         `exploitable.`,
-      action: 'Renomme la fiche fautive, puis fusionne-la avec la fiche correcte.',
-      href: '/factures',
-      hrefLabel: 'Factures → fournisseurs',
+      action: 'Fusionne la fiche fautive dans la fiche correcte.',
+      href: '/reglages?tab=suppliers',
+      hrefLabel: 'Réglages → Fournisseurs',
+    });
+  }
+
+  // ── 15. Désignations de factures non rattachées à un ingrédient ──────────
+  // Un prix d'achat qui ne met à jour aucune fiche laisse les coûts des
+  // recettes à leur ancienne valeur : le food cost par plat vieillit sans que
+  // rien ne le dise. Seuil : une ou deux désignations orphelines, c'est le
+  // bruit normal d'une facture ; au-delà, la mercuriale décroche.
+  if (f.unmatchedDesignations.count >= 3) {
+    out.push({
+      id: 'designations-non-rattachees',
+      severity: 'a_verifier',
+      title: `${f.unmatchedDesignations.count} désignations de factures sans ingrédient`,
+      impact:
+        `« ${f.unmatchedDesignations.sample[0]} » et ${f.unmatchedDesignations.count - 1} autres libellés ` +
+        `achetés ne correspondent à aucun ingrédient : leurs prix ne mettent rien à jour, ` +
+        `et le coût des fiches techniques date du dernier libellé reconnu.`,
+      action: 'Rattache chaque désignation à son ingrédient, ou crée l\'ingrédient manquant.',
+      href: '/reglages?tab=ingredients',
+      hrefLabel: 'Réglages → Ingrédients',
     });
   }
 
@@ -628,7 +654,7 @@ export async function collectInterventionFacts(
   // tronque à 1 000 lignes sans le dire. Sur un exercice de 1 788 commandes, ce
   // module comparait les versements bancaires à un CA amputé de 44 % — et
   // annonçait « des ventes manquantes » en désignant la mauvaise cause.
-  const [orders, lastRes, firstRes, bank, invoices, suppliers, cca, trips, tva] =
+  const [orders, lastRes, firstRes, bank, invoices, suppliers, cca, trips, tva, foodLines, ingredients, aliases] =
     await Promise.all([
       fetchAllRows<any>((f0, f1) => supabase.from('square_orders')
         .select('service, net_amount, raw_data')
@@ -656,6 +682,14 @@ export async function collectInterventionFacts(
       fetchAllRows<any>((f0, f1) => supabase.from('mileage_trips')
         .select('id, cca_movement_id').range(f0, f1)),
       computeTva(supabase, start, end),
+      fetchAllRows<{ designation: string | null }>((f0, f1) => supabase.from('invoice_lines')
+        .select('designation')
+        .in('category', ['alimentaire', 'boisson'])
+        .range(f0, f1)),
+      fetchAllRows<{ id: string; name: string }>((f0, f1) => supabase.from('ingredients')
+        .select('id, name').range(f0, f1)),
+      fetchAllRows<{ alias: string; ingredient_id: string }>((f0, f1) => supabase.from('ingredient_aliases')
+        .select('alias, ingredient_id').range(f0, f1)),
     ]);
 
   let caSquareTtc = 0;
@@ -721,6 +755,9 @@ export async function collectInterventionFacts(
 
   const tripsNotInCca = trips.filter((t: any) => !t.cca_movement_id).length;
 
+  // ── Mercuriale : désignations orphelines ─────────────────────────────────
+  const orphans = unmatchedDesignations(foodLines, ingredients, aliases);
+
   // Bornes réelles des relevés importés à l'intérieur de la fenêtre. Sert à
   // dire si les achats couvrent la même durée que les ventes.
   const bankDates = bank
@@ -760,5 +797,9 @@ export async function collectInterventionFacts(
     mojibakeSuppliers: mojibake,
     ccaBalances: [...balances].map(([associe, balance]) => ({ associe, balance })),
     tripsNotInCca: { count: tripsNotInCca },
+    unmatchedDesignations: {
+      count: orphans.length,
+      sample: orphans.slice(0, 5).map(o => o.designation),
+    },
   };
 }
