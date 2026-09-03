@@ -111,6 +111,8 @@ savoir qu'une clé est bonne sans l'apprendre au milieu d'un scan de facture.
 3. Créer le bucket Storage **`invoice-files`** (public) pour les fichiers de factures.
 4. Module frais kilométriques : exécuter `db/migration_trajets.sql`.
 5. Clés IA gérées depuis l'application : exécuter `db/migration_ai_settings.sql`.
+6. Correspondances désignation → ingrédient : exécuter `db/migration_referentiel.sql`.
+7. Verrou du compte courant d'associé : exécuter `db/migration_cca_verrou.sql`.
 
 > ⚠️ La migration consolidée est à **ré-exécuter** après une mise à jour qui
 > ajoute une catégorie bancaire : la contrainte `CHECK` de `bank_transactions`
@@ -181,10 +183,12 @@ base et consomme l'API Square.
 npm run verify:compta
 ```
 
-171 contrôles de non-régression sur les calculs de TVA, la classification des
-écritures, le lettrage et la détection des anomalies. **À lancer après toute
+233 contrôles de non-régression sur les calculs de TVA, la classification des
+écritures, le lettrage, la détection des anomalies, les verrous à
+l'enregistrement d'une facture, le référentiel et la règle du compte courant. **À lancer après toute
 modification touchant `src/lib/tva.ts`, `src/lib/accounting.ts`,
 `src/lib/bank-csv.ts`, `src/lib/interventions.ts`, `src/lib/reconciliation.ts`,
+`src/lib/invoice-checks.ts`, `src/lib/referentiel.ts`, `src/lib/cca.ts`,
 le P&L ou le tableau de bord.** Chaque contrôle correspond à une erreur qui a
 réellement été commise : TVA déduite sans facture, ventilation par taux ne
 réconciliant pas avec son total, taux à 7 % classé en 5,5 %, encaissement traité
@@ -209,6 +213,30 @@ contournées :
    `lib/accounting.ts`) sont le seul passage autorisé d'une base à l'autre — le
    P&L et le tableau de bord affichaient sinon deux food cost différents pour le
    même mois.
+
+## Verrous : ce qui n'entre pas sans un humain
+
+L'outil est un outil de comptabilité autant que de pilotage : un chiffre faux
+qui entre en base contamine tout ce qui en découle, et personne ne s'en aperçoit
+avant la déclaration de TVA. Quatre verrous, du plus au moins strict :
+
+| Verrou | Où | Ce qu'il refuse |
+|---|---|---|
+| **Compte courant d'associé** | Trigger Postgres (`db/migration_cca_verrou.sql`), miroir `lib/cca.ts` | Tout mouvement qui rend un solde débiteur à partir de sa date, quel que soit le chemin (écran, API, SQL). Art. L.225-43 C. com. |
+| **Facture incohérente** | `lib/invoice-checks.ts`, appliqué par `saveInvoice` | Pas de date, date future, HT > TTC, montants nuls, fournisseur absent. Refus sec. |
+| **Facture inhabituelle** | idem | 1er janvier, plus de 18 mois, pas de numéro, HT + TVA ≠ TTC, lignes qui ne somment pas, HT = TTC, plus de 5 000 €. Chaque point exige une coche « j'ai vérifié » ; le serveur recompte et refuse ce qui n'est pas acquitté. |
+| **Référentiel** | `lib/referentiel.ts` | Un libellé de facture ne met à jour un prix que s'il correspond **exactement** à un ingrédient ou à un alias validé. Plus de création automatique ; les orphelins attendent dans Réglages. |
+
+Trois principes derrière ces verrous :
+
+1. **Le serveur ne fait pas confiance à l'écran.** Une case à cocher est une
+   promesse ; la route API recompte et refuse ce qui n'est pas tenu.
+2. **Une seule porte d'entrée par donnée.** Toute facture passe par le Scanner ;
+   l'import « en un clic » a été retiré. Une écriture du P&L ne se masque pas :
+   sa catégorie se corrige dans le détail du poste, et la TVA suit.
+3. **Pas de chiffre qu'on ne sait pas mesurer.** Le stock théorique (cumul
+   depuis toujours, sans inventaire de départ) et le menu engineering
+   (recettes appariées par nom exact) ont été retirés plutôt qu'affichés faux.
 
 ## Module « À faire » (interventions)
 
