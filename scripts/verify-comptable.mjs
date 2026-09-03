@@ -29,6 +29,7 @@ import { checkInvoice, assertInvoiceAccepted } from '../src/lib/invoice-checks.t
 import {
   repairMojibake, normalizeName, findSupplierMatch, matchIngredient, unmatchedDesignations,
 } from '../src/lib/referentiel.ts';
+import { checkCcaOperation, firstDebitDay } from '../src/lib/cca.ts';
 
 /**
  * Faux client Supabase, qui applique réellement les filtres utilisés.
@@ -253,6 +254,7 @@ const faits = (o = {}) => ({
   ccaBalances: [{ associe: 'yohan', balance: 1200 }],
   tripsNotInCca: { count: 0 },
   unmatchedDesignations: { count: 0, sample: [] },
+  legacyMaskedItems: 0,
   ...o,
 });
 
@@ -827,6 +829,57 @@ declenche('3 désignations orphelines → à vérifier',
   { unmatchedDesignations: { count: 3, sample: ['TOMATE PELEE 4/4', 'x', 'y'] } }, 'designations-non-rattachees');
 silence('2 orphelines : bruit normal, silence',
   { unmatchedDesignations: { count: 2, sample: ['a', 'b'] } }, 'designations-non-rattachees');
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Compte courant d'associé : jamais débiteur
+//
+//  Miroir du trigger Postgres (db/migration_cca_verrou.sql). Les deux doivent
+//  dire la même chose : si une règle change ici, elle change là.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Compte courant d\'associé ──');
+
+const CCA = [
+  { id: 'a1', date: '2026-03-01', associe: 'yohan', sens: 'apport', montant: 1000 },
+  { id: 'r1', date: '2026-04-10', associe: 'yohan', sens: 'remboursement', montant: 400 },
+  { id: 'a2', date: '2026-06-01', associe: 'yohan', sens: 'apport', montant: 500 },
+  { id: 'j1', date: '2026-03-01', associe: 'justine', sens: 'apport', montant: 200 },
+];
+const rembourse = (date, montant, associe = 'yohan') =>
+  checkCcaOperation(CCA, { type: 'insert', movement: { date, associe, sens: 'remboursement', montant } });
+
+verifie('compte sain : aucun creux', firstDebitDay(CCA, 'yohan', '2026-01-01'), null);
+verifie('remboursement couvert : accepté', rembourse('2026-05-01', 600), null);
+verifie('remboursement trop grand : refusé', rembourse('2026-05-01', 601)?.date, '2026-05-01');
+verifie('solde signalé au centime', rembourse('2026-05-01', 601)?.solde, -1);
+verifie('rembourser en avril avec l\'apport de juin : refusé', rembourse('2026-04-15', 700)?.date, '2026-04-15');
+verifie('le même montant en juillet : accepté', rembourse('2026-07-15', 700), null);
+verifie('le même jour qu\'un apport : l\'apport compte d\'abord', rembourse('2026-06-01', 1100), null);
+verifie('le même jour, un euro de trop : refusé', rembourse('2026-06-01', 1101)?.date, '2026-06-01');
+verifie('les comptes ne se compensent pas entre associés', rembourse('2026-05-01', 201, 'justine')?.date, '2026-05-01');
+
+verifie('ajouter un apport : jamais contrôlé',
+  checkCcaOperation(CCA, { type: 'insert', movement: { date: '2026-01-01', associe: 'yohan', sens: 'apport', montant: 1 } }), null);
+verifie('supprimer un remboursement : jamais contrôlé',
+  checkCcaOperation(CCA, { type: 'delete', movement: CCA[1] }), null);
+verifie('supprimer l\'apport initial : refusé dès le remboursement',
+  checkCcaOperation(CCA, { type: 'delete', movement: CCA[0] })?.date, '2026-04-10');
+verifie('supprimer l\'apport de juin : accepté (rien après lui)',
+  checkCcaOperation(CCA, { type: 'delete', movement: CCA[2] }), null);
+
+// Un creux historique n'est pas la faute d'une opération postérieure.
+const CREUX = [
+  { id: 'x1', date: '2026-02-01', associe: 'yohan', sens: 'remboursement', montant: 100 },
+  { id: 'x2', date: '2026-03-01', associe: 'yohan', sens: 'apport', montant: 1000 },
+];
+verifie('creux ancien détecté', firstDebitDay(CREUX, 'yohan', '2026-01-01')?.date, '2026-02-01');
+verifie('remboursement postérieur au creux : accepté quand même',
+  checkCcaOperation(CREUX, { type: 'insert', movement: { date: '2026-04-01', associe: 'yohan', sens: 'remboursement', montant: 500 } }), null);
+
+
+console.log('\n── P&L : écritures ex-masquées ──');
+declenche('écritures autrefois masquées → à relire', { legacyMaskedItems: 3 }, 'ecritures-ex-masquees');
+silence('rien de masqué : silence', { legacyMaskedItems: 0 }, 'ecritures-ex-masquees');
 
 console.log(`\n${echecs === 0 ? '✓ Tous les contrôles comptables passent.' : `✗ ${echecs} contrôle(s) en échec.`}\n`);
 process.exit(echecs === 0 ? 0 : 1);

@@ -6,6 +6,7 @@ import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate } from '@/lib/utils';
 import { KpiCard } from '@/components/ui';
 import { suggestInvoicesForTransaction, sumDebits } from '@/lib/reconciliation';
+import { checkCcaOperation, describeCcaViolation } from '@/lib/cca';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { Upload, Landmark, AlertCircle, CheckCircle, Filter, ScanLine, Scissors, Plus, Trash2 } from 'lucide-react';
 
@@ -383,44 +384,30 @@ export default function BanquePage() {
   const handleCreateCcaReimbursementAuto = async (tx: any, partner: 'justine' | 'yohan') => {
     setLoading(true);
     try {
-      // 1. Solde de l'associé À LA DATE du mouvement.
+      // 1. Le compte tient-il, à partir de la date du remboursement ?
       //
-      // Le contrôle portait sur le solde TOTAL, tous mouvements confondus —
-      // apports postérieurs inclus. Un remboursement daté d'avril passait donc
-      // sans alerte parce qu'un apport de juin le couvrait : le compte était
-      // pourtant débiteur en avril. On ne peut pas rembourser aujourd'hui avec
-      // l'argent apporté demain.
+      // On recalcule le solde courant sur TOUS les mouvements de l'associé,
+      // pas seulement ceux antérieurs : un remboursement daté d'avril peut
+      // rendre le compte débiteur en mai, quand un remboursement déjà saisi
+      // s'ajoute au sien. La base refusera de toute façon (trigger) ; on le
+      // dit avant, avec la date et le montant, et sans « enregistrer quand
+      // même » — la règle n'est pas négociable au clic.
       const { data: movements, error: fetchErr } = await supabase
         .from('mouvements_cca')
-        .select('sens, montant, date')
-        .eq('associe', partner)
-        .lte('date', tx.date);
+        .select('id, date, associe, sens, montant, created_at')
+        .eq('associe', partner);
 
       if (fetchErr) throw fetchErr;
 
-      const balance = (movements || []).reduce(
-        (sum: number, m: any) => sum + (m.sens === 'apport' ? Number(m.montant) : -Number(m.montant)),
-        0
-      );
-
       const reimbursementAmount = Math.abs(tx.amount);
-      if (balance - reimbursementAmount < 0) {
-        const confirmDebit = confirm(
-          `⚠️ Au ${formatDate(tx.date)}, cette opération rend le compte de ${
-            partner === 'justine' ? 'Justine' : 'Yohan'
-          } débiteur.\n\n`
-          + `Solde à cette date : ${formatCurrency(balance)}\n`
-          + `Remboursement : ${formatCurrency(reimbursementAmount)}\n`
-          + `Solde après : ${formatCurrency(balance - reimbursementAmount)}\n\n`
-          + `Un compte courant d'associé débiteur est interdit au dirigeant `
-          + `(art. L.225-43 du code de commerce) et qualifiable d'abus de biens `
-          + `sociaux. Si un apport de la même date le couvre, saisis-le d'abord.\n\n`
-          + `Enregistrer quand même ?`
-        );
-        if (!confirmDebit) {
-          setLoading(false);
-          return;
-        }
+      const violation = checkCcaOperation(movements || [], {
+        type: 'insert',
+        movement: { date: tx.date, associe: partner, sens: 'remboursement', montant: reimbursementAmount },
+      });
+      if (violation) {
+        alert(describeCcaViolation(violation));
+        setLoading(false);
+        return;
       }
 
       // 2. Insert movement
@@ -455,7 +442,7 @@ export default function BanquePage() {
       await loadData();
     } catch (e) {
       console.error(e);
-      alert("Erreur lors de la création du remboursement.");
+      alert((e as { message?: string })?.message || "Erreur lors de la création du remboursement.");
     } finally {
       setLoading(false);
     }

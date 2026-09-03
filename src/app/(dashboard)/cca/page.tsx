@@ -9,6 +9,7 @@ import {
   toISODate,
   downloadCSV
 } from '@/lib/utils';
+import { checkCcaOperation, describeCcaViolation } from '@/lib/cca';
 import { Modal } from '@/components/ui';
 import {
   Coins,
@@ -239,7 +240,7 @@ export default function CcaPage() {
       loadData();
     } catch (e) {
       console.error(e);
-      alert("Erreur lors de l'enregistrement de l'apport.");
+      alert((e as { message?: string })?.message || "Erreur lors de l'enregistrement de l'apport.");
     } finally {
       setSaving(false);
     }
@@ -254,23 +255,14 @@ export default function CcaPage() {
 
     setLoading(true);
     try {
-      // Guard: Deleting an apport reduces the associate's balance. Check if balance - amount < 0.
-      if (mouvement.sens === 'apport') {
-        const partner = mouvement.associe;
-        // Soldes déjà calculés en mémoire (useMemo) — inutile de refaire un fetch
-        const currentBal = partner === 'justine' ? justineBal : yohanBal;
-
-        if (currentBal - Number(mouvement.montant) < 0) {
-          const confirmDebit = confirm(
-            `⚠️ Cette suppression rend le compte de ${
-              partner === 'justine' ? 'Justine' : 'Yohan'
-            } débiteur (solde : ${formatCurrency(currentBal - Number(mouvement.montant))}).\nUn CCA ne doit pas être débiteur en SAS — à régulariser ou à vérifier avec le comptable.\n\nSouhaitez-vous supprimer quand même ?`
-          );
-          if (!confirmDebit) {
-            setLoading(false);
-            return;
-          }
-        }
+      // Supprimer un apport peut rendre le compte débiteur à partir de sa
+      // date. La base le refusera (trigger) ; on le dit avant, clairement, et
+      // sans « quand même » : la règle n'est pas négociable au clic.
+      const violation = checkCcaOperation(movements, { type: 'delete', movement: mouvement });
+      if (violation) {
+        alert(describeCcaViolation(violation));
+        setLoading(false);
+        return;
       }
 
       // If linked to a bank transaction, reset its status to pending_invoice and nullify class/invoice
@@ -297,7 +289,8 @@ export default function CcaPage() {
       loadData();
     } catch (e) {
       console.error(e);
-      alert("Erreur lors de la suppression.");
+      // Le message du trigger dit la date et le montant : on le montre tel quel.
+      alert((e as { message?: string })?.message || "Erreur lors de la suppression.");
       setLoading(false);
     }
   };
