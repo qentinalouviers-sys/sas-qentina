@@ -873,17 +873,21 @@ l'être, et exige un contrôle humain là où une donnée fausse coûterait cher
 | Stock théorique = achats depuis toujours − conso depuis toujours | Retiré. Inventaire physique, date, valorisation, historique des comptages |
 | Menu engineering : recettes appariées aux produits Square par nom exact → « poids morts » fictifs | Module retiré, à reconstruire sur un appariement explicite |
 | Liste de courses (dépend de la mercuriale polluée), Avis Google (hors pilotage) | Retirés de l'application, tables conservées |
+| Food cost = achats ÷ CA : une commande le 30 fausse deux mois | Coût matières consommé = stock initial + achats − stock final (`lib/cogs.ts`), quand deux inventaires encadrent la période ; sinon achats, et c'est écrit |
+| « Stock valorisé » du tableau de bord additionnait tous les comptages jamais saisis | Dernier inventaire seulement |
+| Le passé restait modifiable : le P&L de mars pouvait changer en septembre | Clôture mensuelle : instantané + trigger lecture seule, réouverture motivée et journalisée |
+| Rien d'exploitable par le cabinet : ressaisie | Export FEC / CSV des quatre journaux, équilibre au centime testé, plan de comptes unique |
 
 ### Ce qu'il faut savoir
 
-- **Trois migrations à jouer** : `migration_ai_settings.sql`, `migration_referentiel.sql`,
-  `migration_cca_verrou.sql`. La dernière affiche le point le plus bas de chaque compte
+- **Quatre migrations à jouer** : `migration_ai_settings.sql`, `migration_referentiel.sql`,
+  `migration_cca_verrou.sql`, `migration_clotures.sql`. La dernière affiche le point le plus bas de chaque compte
   courant : un creux historique n'est pas bloqué, il est à régulariser.
 - **Toutes les pages écrivent encore directement en base** depuis le navigateur, avec
   une politique « tout utilisateur authentifié ». Un verrou côté client se contourne ;
   seuls le trigger CCA et les routes API sont réellement contraignants. C'est le prochain
   chantier structurel si l'outil doit accueillir d'autres comptes que les deux associés.
-- **`verify:compta` passe de 171 à 233 contrôles.** Chaque verrou est testé dans les deux
+- **`verify:compta` passe de 171 à 293 contrôles.** Chaque verrou est testé dans les deux
   sens : il refuse ce qu'il faut, et il se tait sur une facture normale.
 
 ## 8. Pistes pour la suite (non faites, à discuter)
@@ -898,7 +902,14 @@ l'être, et exige un contrôle humain là où une donnée fausse coûterait cher
   verrou soit réellement contraignant et que le rôle `comptable` ne puisse pas
   modifier une table hors de son périmètre via l'API Supabase.
 - **Stock théorique repartant du dernier inventaire**, quand les fiches
-  techniques seront complètes et la mercuriale propre.
+  techniques seront complètes et la mercuriale propre. Le coût matières
+  consommé (achats ± variation de stock) est fait ; le théorique par produit
+  ne l'est pas.
+- **Dérive d'un mois clôturé** : comparer l'instantané de clôture au CA Square
+  actuel et le signaler dans « À faire » si une commande tardive l'a modifié.
+- **Point mort par service et trésorerie prévisionnelle** : charges fixes ÷
+  taux de marge brute ÷ services ; solde + encaissements attendus − échéances.
+- **Journal de caisse** (espèces Square ↔ dépôts en banque).
 - **Menu engineering sur appariement explicite** recette ↔ produit Square
   (colonne `square_item_name` sur `recipes`), plutôt que par nom.
 - Réglages : rendre configurables les seuils (food cost cible…).

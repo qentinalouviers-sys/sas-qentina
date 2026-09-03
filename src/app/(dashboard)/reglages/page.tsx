@@ -47,6 +47,9 @@ export default function ReglagesPage() {
   const [savingContext, setSavingContext] = useState(false);
   const [openingHours, setOpeningHours] = useState<Record<string, { Midi: boolean; Soir: boolean }>>({ ...DEFAULT_OPENING_HOURS });
   const [savingHours, setSavingHours] = useState(false);
+  // Identité de la société : sert à nommer le fichier des écritures comptables.
+  const [siren, setSiren] = useState('');
+  const [savingSiren, setSavingSiren] = useState(false);
   const [syncDays, setSyncDays] = useState(365);
   const [syncing, setSyncing] = useState(false);
   const [syncReport, setSyncReport] = useState<string | null>(null);
@@ -215,10 +218,12 @@ export default function ReglagesPage() {
     const [, , { data: settings }] = await Promise.all([
       loadSuppliers(),
       loadIngredients(),
-      supabase.from('app_settings').select('key, value').in('key', ['fuego_context', 'opening_hours']),
+      supabase.from('app_settings').select('key, value').in('key', ['fuego_context', 'opening_hours', 'siren']),
     ]);
     const ctx = settings?.find((s: any) => s.key === 'fuego_context');
     if (ctx?.value) setFuegoContext(ctx.value);
+    const sirenRow = settings?.find((s: { key: string; value: string | null }) => s.key === 'siren');
+    if (sirenRow?.value) setSiren(sirenRow.value);
     const hours = settings?.find((s: any) => s.key === 'opening_hours');
     if (hours?.value) {
       try {
@@ -233,6 +238,16 @@ export default function ReglagesPage() {
   }, [supabase, loadSuppliers, loadIngredients]);
 
   useEffect(() => { loadData(); }, [loadData]);
+
+  const saveSiren = async () => {
+    const digits = siren.replace(/\D/g, '');
+    if (digits.length !== 9) { alert('Le SIREN compte exactement 9 chiffres.'); return; }
+    setSavingSiren(true);
+    const { error } = await supabase.from('app_settings').upsert({ key: 'siren', value: digits, updated_at: new Date().toISOString() });
+    setSavingSiren(false);
+    if (error) alert(`Enregistrement impossible : ${error.message}`);
+    else setSiren(digits);
+  };
 
   const saveOpeningHours = async () => {
     setSavingHours(true);
@@ -346,6 +361,29 @@ export default function ReglagesPage() {
                   <Save size={18} /> {savingHours ? 'Sauvegarde...' : 'Sauvegarder'}
                 </button>
               </div>
+            </div>
+          </div>
+        )}
+
+        {tab === 'services' && (
+          <div className="card" style={{ marginTop: 20 }}>
+            <div className="card-header">
+              <div>
+                <div className="card-title">Société</div>
+                <div className="card-subtitle">
+                  Le SIREN nomme le fichier des écritures comptables (FEC) exporté depuis les clôtures :
+                  c&apos;est le format que le cabinet et l&apos;administration attendent.
+                </div>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap', padding: '12px 0 0' }}>
+              <div className="form-group" style={{ marginBottom: 0, minWidth: 220 }}>
+                <label className="form-label">SIREN (9 chiffres)</label>
+                <input className="form-input" value={siren} onChange={e => setSiren(e.target.value)} placeholder="123 456 789" inputMode="numeric" />
+              </div>
+              <button className="btn btn-primary" onClick={saveSiren} disabled={savingSiren}>
+                <Save size={18} /> {savingSiren ? 'Enregistrement…' : 'Enregistrer'}
+              </button>
             </div>
           </div>
         )}

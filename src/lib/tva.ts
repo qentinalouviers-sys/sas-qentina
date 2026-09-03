@@ -114,6 +114,108 @@ function percentageOf(tax: any): number | null {
 }
 
 /**
+ * TVA d'une commande Square, en centimes, ventilée par tranche.
+ *
+ * Extrait de computeTva pour servir aussi à l'export comptable, où chaque
+ * journée de ventes doit être éclatée par taux : une seule lecture des données
+ * Square, un seul résultat. Le résidu (remise ou frais au niveau commande,
+ * taux hors tranches) reste en `nonVentile` plutôt que d'être forcé.
+ */
+interface SquareTax { uid?: string; percentage?: string | number; applied_money?: { amount?: number } }
+interface SquareAppliedTax { tax_uid?: string; applied_money?: { amount?: number } }
+interface SquareLineItem {
+  taxes?: SquareTax[];
+  applied_taxes?: SquareAppliedTax[];
+  total_tax_money?: { amount?: number };
+  total_money?: { amount?: number };
+}
+interface SquareRaw { total_tax_money?: { amount?: number }; line_items?: SquareLineItem[]; taxes?: SquareTax[] }
+
+export function orderTaxCentsByRate(order: { net_amount?: number | null; raw_data?: unknown }): {
+  cents: Record<keyof TvaBreakdown, number>;
+  /** Vrai si Square ne donnait aucune taxe : montant estimé au taux dominant. */
+  estimated: boolean;
+} {
+  const cents: Record<keyof TvaBreakdown, number> = { '5.5%': 0, '10%': 0, '20%': 0, nonVentile: 0 };
+  const raw = (order.raw_data ?? {}) as SquareRaw;
+  const orderTaxCents: number | undefined = raw.total_tax_money?.amount;
+
+  if (orderTaxCents === undefined) {
+    // Aucune donnée de taxe Square : on estime au taux dominant de la
+    // restauration sur place, et on le compte pour que ce soit visible.
+    cents.nonVentile += Math.round((order.net_amount || 0) * (0.10 / 1.10) * 100);
+    return { cents, estimated: true };
+  }
+
+  const items: SquareLineItem[] = Array.isArray(raw.line_items) ? raw.line_items : [];
+
+  // Taxes définies au niveau de la commande, référencées par les lignes via
+  // `applied_taxes[].tax_uid`. Square utilise indifféremment les deux formes.
+  const orderTaxRates = new Map<string, number>();
+  for (const t of (Array.isArray(raw.taxes) ? raw.taxes : [])) {
+    const pct = percentageOf(t);
+    if (t?.uid && pct !== null) orderTaxRates.set(t.uid, pct);
+  }
+
+  let allocated = 0;
+
+  for (const item of items) {
+    // 1er choix : la taxe portée par la ligne, avec son taux déclaré.
+    const itemTaxes: SquareTax[] = Array.isArray(item.taxes) ? item.taxes : [];
+    let ventileParTaxe = false;
+
+    for (const t of itemTaxes) {
+      const applied: number = t?.applied_money?.amount ?? 0;
+      if (applied <= 0) continue;
+      const pct = percentageOf(t);
+      const bucket = pct !== null ? bucketForPercentage(pct) : null;
+      if (bucket) {
+        cents[bucket] += applied;
+        allocated += applied;
+        ventileParTaxe = true;
+      }
+    }
+
+    // 2e choix : taxe définie au niveau commande et appliquée à la ligne.
+    if (!ventileParTaxe) {
+      for (const at of (Array.isArray(item.applied_taxes) ? item.applied_taxes : [])) {
+        const applied: number = at?.applied_money?.amount ?? 0;
+        if (applied <= 0) continue;
+        const pct = at?.tax_uid !== undefined ? orderTaxRates.get(at.tax_uid) : undefined;
+        const bucket = pct !== undefined ? bucketForPercentage(pct) : null;
+        if (bucket) {
+          cents[bucket] += applied;
+          allocated += applied;
+          ventileParTaxe = true;
+        }
+      }
+    }
+
+    // Dernier recours : déduire le taux du rapport taxe/HT de la ligne.
+    if (!ventileParTaxe) {
+      const itemTax: number = item.total_tax_money?.amount || 0;
+      if (itemTax <= 0) continue;
+      const itemTotal: number = item.total_money?.amount || 0;
+      const bucket = bucketForRatio(itemTax, itemTotal - itemTax);
+      if (bucket) {
+        cents[bucket] += itemTax;
+        allocated += itemTax;
+      }
+      // Taux hors tranches connues : laissé au résidu plutôt que forcé.
+    }
+  }
+
+  // Le total de la commande peut dépasser la somme de ses lignes (remise ou
+  // frais de service au niveau commande). L'écart est conservé tel quel :
+  // c'est ce résidu que l'ancienne version perdait, d'où une ventilation
+  // qui ne réconciliait pas avec le total affiché.
+  const residual = orderTaxCents - allocated;
+  if (residual !== 0) cents.nonVentile += residual;
+
+  return { cents, estimated: false };
+}
+
+/**
  * Balance de TVA pour une période.
  *
  * @param startStr / @param endStr bornes ISO incluses (YYYY-MM-DD)
@@ -158,81 +260,12 @@ export async function computeTva(
   let estimatedOrdersCount = 0;
 
   for (const order of orders) {
-    const orderTaxCents: number | undefined = order.raw_data?.total_tax_money?.amount;
-
-    if (orderTaxCents === undefined) {
-      // Aucune donnée de taxe Square : on estime au taux dominant de la
-      // restauration sur place, et on le compte pour que ce soit visible.
-      const estimated = Math.round((order.net_amount || 0) * (0.10 / 1.10) * 100);
-      cents.nonVentile += estimated;
-      estimatedOrdersCount++;
-      continue;
-    }
-
-    const items = Array.isArray(order.raw_data?.line_items) ? order.raw_data.line_items : [];
-
-    // Taxes définies au niveau de la commande, référencées par les lignes via
-    // `applied_taxes[].tax_uid`. Square utilise indifféremment les deux formes.
-    const orderTaxRates = new Map<string, number>();
-    for (const t of (Array.isArray(order.raw_data?.taxes) ? order.raw_data.taxes : [])) {
-      const pct = percentageOf(t);
-      if (t?.uid && pct !== null) orderTaxRates.set(t.uid, pct);
-    }
-
-    let allocated = 0;
-
-    for (const item of items) {
-      // 1er choix : la taxe portée par la ligne, avec son taux déclaré.
-      const itemTaxes = Array.isArray(item.taxes) ? item.taxes : [];
-      let ventileParTaxe = false;
-
-      for (const t of itemTaxes) {
-        const applied: number = t?.applied_money?.amount ?? 0;
-        if (applied <= 0) continue;
-        const pct = percentageOf(t);
-        const bucket = pct !== null ? bucketForPercentage(pct) : null;
-        if (bucket) {
-          cents[bucket] += applied;
-          allocated += applied;
-          ventileParTaxe = true;
-        }
-      }
-
-      // 2e choix : taxe définie au niveau commande et appliquée à la ligne.
-      if (!ventileParTaxe) {
-        for (const at of (Array.isArray(item.applied_taxes) ? item.applied_taxes : [])) {
-          const applied: number = at?.applied_money?.amount ?? 0;
-          if (applied <= 0) continue;
-          const pct = at?.tax_uid !== undefined ? orderTaxRates.get(at.tax_uid) : undefined;
-          const bucket = pct !== undefined ? bucketForPercentage(pct) : null;
-          if (bucket) {
-            cents[bucket] += applied;
-            allocated += applied;
-            ventileParTaxe = true;
-          }
-        }
-      }
-
-      // Dernier recours : déduire le taux du rapport taxe/HT de la ligne.
-      if (!ventileParTaxe) {
-        const itemTax: number = item.total_tax_money?.amount || 0;
-        if (itemTax <= 0) continue;
-        const itemTotal: number = item.total_money?.amount || 0;
-        const bucket = bucketForRatio(itemTax, itemTotal - itemTax);
-        if (bucket) {
-          cents[bucket] += itemTax;
-          allocated += itemTax;
-        }
-        // Taux hors tranches connues : laissé au résidu plutôt que forcé.
-      }
-    }
-
-    // Le total de la commande peut dépasser la somme de ses lignes (remise ou
-    // frais de service au niveau commande). L'écart est conservé tel quel :
-    // c'est ce résidu que l'ancienne version perdait, d'où une ventilation
-    // qui ne réconciliait pas avec le total affiché.
-    const residual = orderTaxCents - allocated;
-    if (residual !== 0) cents.nonVentile += residual;
+    const split = orderTaxCentsByRate(order);
+    if (split.estimated) estimatedOrdersCount++;
+    cents['5.5%'] += split.cents['5.5%'];
+    cents['10%'] += split.cents['10%'];
+    cents['20%'] += split.cents['20%'];
+    cents.nonVentile += split.cents.nonVentile;
   }
 
   // Le total EST la somme des tranches : l'égalité est structurelle.

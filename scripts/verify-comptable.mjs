@@ -32,6 +32,7 @@ import {
 import { checkCcaOperation, firstDebitDay } from '../src/lib/cca.ts';
 import { inventorySessions, sessionAtBoundary, computeCogs } from '../src/lib/cogs.ts';
 import { monthBounds, recentMonths, isMonthOver } from '../src/lib/months.ts';
+import { buildEntries, unbalancedEntries, toFec } from '../src/lib/fec.ts';
 
 /**
  * Faux client Supabase, qui applique réellement les filtres utilisés.
@@ -948,6 +949,102 @@ verifie('le douzième remonte à octobre 2025', recentMonths('2026-09-03', 12)[1
 verifie('août 2026 est écoulé le 3 septembre', isMonthOver('2026-08', '2026-09-03'), true);
 verifie('septembre 2026 ne l\'est pas', isMonthOver('2026-09', '2026-09-03'), false);
 verifie('un mois se termine le dernier jour inclus', isMonthOver('2026-08', '2026-08-31'), false);
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Export comptable (FEC)
+//
+//  Chaque écriture doit tomber juste au centime, la TVA déductible ne doit
+//  venir que des factures, et un paiement sans facture part en charge TTC.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Export comptable ──');
+
+const FEC_INPUT = {
+  month: '2026-08',
+  orders: [
+    // 33 € TTC : 30 € HT à 10 % (3 € de TVA)
+    { id: 'o1', service: '2026-08-05', net_amount: 33, raw_data: {
+      total_tax_money: { amount: 300 },
+      line_items: [{ total_money: { amount: 3300 }, total_tax_money: { amount: 300 }, taxes: [{ percentage: '10.0', applied_money: { amount: 300 } }] }],
+    } },
+    // Même jour : 12 € TTC à 20 % (10 € HT, 2 € TVA) → une seule écriture pour la journée
+    { id: 'o2', service: '2026-08-05', net_amount: 12, raw_data: {
+      total_tax_money: { amount: 200 },
+      line_items: [{ total_money: { amount: 1200 }, total_tax_money: { amount: 200 }, taxes: [{ percentage: '20.0', applied_money: { amount: 200 } }] }],
+    } },
+  ],
+  invoices: [
+    { id: 'i1', date: '2026-08-03', invoice_number: 'F-1', accounting_ref: 'FAC-202608-AAAA', accounting_class: '601',
+      total_ht: 100, total_ttc: 110, tva_recoverable: true, supplier: { name: 'Métro' },
+      lines: [{ category: 'alimentaire', total_ht: 80 }, { category: 'materiel', total_ht: 15 }] }, // 5 € d'écart lignes/total
+    { id: 'i2', date: '2026-08-10', invoice_number: null, accounting_ref: 'FAC-202608-BBBB', accounting_class: '606',
+      total_ht: 50, total_ttc: 60, tva_recoverable: false, supplier: { name: 'Leroy Merlin' }, lines: [] },
+  ],
+  bank: [
+    { id: 'b1', date: '2026-08-04', description: 'CB METRO', amount: -110, category: 'variable_fournisseur', invoice_id: 'i1' },
+    { id: 'b2', date: '2026-08-06', description: 'VIR SEPA SQUAREUP', amount: 44.10, category: 'recette', invoice_id: null },
+    { id: 'b3', date: '2026-08-07', description: 'PRLV LOYER', amount: -1332.65, category: 'fixe_loyer', invoice_id: null },
+    { id: 'b4', date: '2026-08-08', description: 'CB MOZZALAT', amount: -84.30, category: 'variable_fournisseur', invoice_id: null },
+    { id: 'b5', date: '2026-08-09', description: 'VIR YOHAN', amount: 500, category: 'flux_financier', invoice_id: null },
+  ],
+  cca: [
+    { id: 'c1', date: '2026-08-09', associe: 'yohan', sens: 'apport', sous_type: 'avance_tresorerie', montant: 500, note: null, bank_transaction_id: 'b5', invoice_id: null },
+    { id: 'c2', date: '2026-08-12', associe: 'justine', sens: 'apport', sous_type: 'facture_payee_perso', montant: 60, note: null, bank_transaction_id: null, invoice_id: 'i2' },
+  ],
+};
+const L = buildEntries(FEC_INPUT);
+const par = (pred) => L.filter(pred);
+const somme = (rows, k) => Math.round(rows.reduce((s, r) => s + r[k], 0) * 100) / 100;
+
+verifie('toutes les écritures sont équilibrées', unbalancedEntries(L).length, 0);
+verifie('débits = crédits sur le mois', somme(L, 'debit'), somme(L, 'credit'));
+
+// Ventes : une écriture pour la journée du 5, éclatée par taux
+const vt = par(l => l.journal === 'VT');
+verifie('ventes : une écriture pour la journée', new Set(vt.map(l => l.num)).size, 1);
+verifie('ventes : client Square débité du TTC', somme(par(l => l.compte === '411100' && l.journal === 'VT'), 'debit'), 45);
+verifie('ventes : HT à 10 %', somme(par(l => l.compte === '707100'), 'credit'), 30);
+verifie('ventes : HT à 20 %', somme(par(l => l.compte === '707300'), 'credit'), 10);
+verifie('ventes : TVA collectée', somme(par(l => l.compte === '445710'), 'credit'), 5);
+
+// Achats : facture ventilée, écart lignes/total sur la classe, TVA déductible
+const ac1 = par(l => l.journal === 'AC' && l.piece === 'FAC-202608-AAAA');
+verifie('achat : alimentaire 80', somme(ac1.filter(l => l.compte === '601000' && l.lib.includes('alimentaire')), 'debit'), 80);
+verifie('achat : matériel 15', somme(ac1.filter(l => l.compte === '606300'), 'debit'), 15);
+verifie('achat : écart 5 sur la classe 601', somme(ac1.filter(l => l.lib.includes('écart')), 'debit'), 5);
+verifie('achat : TVA déductible 10', somme(ac1.filter(l => l.compte === '445660'), 'debit'), 10);
+verifie('achat : fournisseur crédité du TTC', somme(ac1.filter(l => l.compte === '401000'), 'credit'), 110);
+verifie('achat : compte auxiliaire lisible', ac1.find(l => l.compte === '401000')?.aux, '401METRO');
+
+// Facture à TVA non récupérable : la TVA est un coût, pas une créance
+const ac2 = par(l => l.journal === 'AC' && l.piece === 'FAC-202608-BBBB');
+verifie('TVA non récupérable : aucune TVA déductible', ac2.filter(l => l.compte === '445660').length, 0);
+verifie('TVA non récupérable : charge = TTC', somme(ac2.filter(l => l.compte === '606300'), 'debit'), 60);
+
+// Banque : contreparties
+const bq = par(l => l.journal === 'BQ');
+verifie('paiement lettré → fournisseur (401), pas une charge', bq.find(l => l.lib === 'CB METRO' && l.debit > 0)?.compte, '401000');
+verifie('versement Square → clients Square', bq.find(l => l.lib === 'VIR SEPA SQUAREUP' && l.credit > 0)?.compte, '411100');
+verifie('loyer → 613200', bq.find(l => l.lib === 'PRLV LOYER' && l.debit > 0)?.compte, '613200');
+verifie('paiement sans facture → charge pour le TTC, sans TVA', bq.find(l => l.lib === 'CB MOZZALAT' && l.debit > 0)?.debit, 84.30);
+verifie('aucune TVA déductible hors journal des achats', par(l => l.compte === '445660' && l.journal !== 'AC').length, 0);
+verifie('apport adossé à la banque → 455', bq.find(l => l.lib === 'VIR YOHAN' && l.credit > 0)?.compte, '455000');
+
+// OD : l'apport adossé à la banque n'est pas doublé ; la facture payée perso l'est
+const od = par(l => l.journal === 'OD');
+verifie('OD : une seule écriture (facture payée perso)', new Set(od.map(l => l.num)).size, 1);
+verifie('OD : 401 fournisseur débité', od.find(l => l.compte === '401000')?.debit, 60);
+verifie('OD : 455 crédité', od.find(l => l.compte === '455000')?.credit, 60);
+
+// Format FEC
+const fec = toFec(L, '2026-09-02');
+const fecLines = fec.split('\r\n').filter(Boolean);
+verifie('FEC : 18 colonnes en en-tête', fecLines[0].split('\t').length, 18);
+verifie('FEC : chaque ligne a 18 colonnes', fecLines.every(l => l.split('\t').length === 18), true);
+verifie('FEC : dates AAAAMMJJ', /\t20260805\t/.test(fecLines.find(l => l.startsWith('VT'))), true);
+verifie('FEC : décimales à la virgule', fecLines.some(l => l.includes('\t1332,65\t')), true);
+verifie('FEC : date de validation posée', fecLines[1].split('\t')[15], '20260902');
+verifie('FEC : sans validation quand non clôturé', toFec(L, null).split('\r\n')[1].split('\t')[15], '');
 
 console.log(`\n${echecs === 0 ? '✓ Tous les contrôles comptables passent.' : `✗ ${echecs} contrôle(s) en échec.`}\n`);
 process.exit(echecs === 0 ? 0 : 1);
