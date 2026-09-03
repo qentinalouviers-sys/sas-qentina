@@ -6,8 +6,8 @@ import { extractJson } from '@/lib/ai/json';
 
 /**
  * invoice-ocr.ts — OCR de factures (prompt + appel + règles TVA).
- * Utilisé par /api/scanner ET /api/invoices/extract : un seul prompt,
- * une seule logique, des résultats identiques quel que soit le point d'entrée.
+ * Un seul point d'entrée, /api/scanner : le résultat est toujours relu par
+ * un humain avant d'être enregistré (/api/scanner/confirm).
  *
  * Deux moteurs possibles, choisis dans Réglages → Moteurs IA (ou, à défaut,
  * par la variable d'environnement OCR_PROVIDER) :

@@ -1,12 +1,13 @@
 'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate } from '@/lib/utils';
 import { KpiCard } from '@/components/ui';
 import { suggestInvoicesForTransaction, sumDebits } from '@/lib/reconciliation';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
-import { Upload, Landmark, AlertCircle, CheckCircle, Filter, Camera, Scissors, Plus, Trash2 } from 'lucide-react';
+import { Upload, Landmark, AlertCircle, CheckCircle, Filter, ScanLine, Scissors, Plus, Trash2 } from 'lucide-react';
 
 const CATEGORIES: Record<string, string> = {
   fixe_loyer: 'Loyer & Charges',
@@ -68,6 +69,8 @@ export default function BanquePage() {
   [ccaMovements]);
 
   const supabase = createClient();
+
+  const router = useRouter();
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -280,43 +283,14 @@ export default function BanquePage() {
     }
   };
 
-  const handleLinkInvoice = async (transaction: any, file: File) => {
-    if (!file) return;
-    setUploading(true);
-
-    const reader = new FileReader();
-    reader.onerror = () => {
-      setUploading(false);
-      alert('Erreur de lecture du fichier.');
-    };
-    reader.onload = async () => {
-      try {
-        const base64 = (reader.result as string).split(',')[1];
-        const res = await fetch('/api/invoices/extract', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            fileBase64: base64,
-            mimeType: file.type,
-            // Le serveur rapproche lui-même cette transaction (status, invoice_id, accounting_class)
-            bank_tx_id: transaction.id,
-          }),
-        });
-        const data = await res.json();
-        if (data.success) {
-          alert('Facture analysée, rattachée et comptabilisée avec succès !');
-          loadData();
-        } else {
-          alert('Erreur : ' + (data.error || 'Inconnu'));
-        }
-      } catch (e) {
-        console.error(e);
-        alert('Erreur lors du traitement du fichier.');
-      } finally {
-        setUploading(false);
-      }
-    };
-    reader.readAsDataURL(file);
+  /**
+   * Joindre une facture à ce mouvement = l'analyser dans le Scanner, avec le
+   * mouvement pré-sélectionné. L'ancien chemin enregistrait la facture sans
+   * relecture, en un clic : le Scanner, lui, montre ce que l'IA a lu et exige
+   * une confirmation sur chaque point inhabituel avant d'écrire en base.
+   */
+  const openScannerFor = (transaction: any) => {
+    router.push(`/scanner?bank_tx=${encodeURIComponent(transaction.id)}`);
   };
 
   const handleLinkInvoiceDirect = async (transactionId: string, invoice: any) => {
@@ -1240,10 +1214,10 @@ export default function BanquePage() {
                               {(t.status === 'pending_invoice' || t.status === 'facture_ok') && (
                                 <button
                                   className="btn btn-secondary btn-sm"
-                                  title="Joindre la facture (PDF ou Photo)"
-                                  onClick={() => pickFile('.pdf,image/*', f => handleLinkInvoice(t, f))}
+                                  title="Joindre la facture : l'analyser dans le Scanner, ce mouvement pré-sélectionné"
+                                  onClick={() => openScannerFor(t)}
                                 >
-                                  <Upload size={14} />
+                                  <ScanLine size={14} />
                                 </button>
                               )}
 
@@ -1335,19 +1309,10 @@ export default function BanquePage() {
                       <button
                         className="mobile-action-btn-full"
                         style={{ background: 'var(--teal)', color: 'white' }}
-                        onClick={() => pickFile('image/*', f => handleLinkInvoice(t, f), 'environment')}
+                        onClick={() => openScannerFor(t)}
                       >
-                        <Camera size={16} />
-                        Prendre une photo
-                      </button>
-
-                      <button
-                        className="mobile-action-btn-full"
-                        style={{ background: 'var(--surface)', color: 'var(--text-primary)', border: '1px solid var(--border)' }}
-                        onClick={() => pickFile('.pdf,image/*', f => handleLinkInvoice(t, f))}
-                      >
-                        <Upload size={16} />
-                        Importer fichier
+                        <ScanLine size={16} />
+                        Joindre la facture (Scanner)
                       </button>
 
                       {t.status === 'pending_invoice' && (

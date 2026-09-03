@@ -4,7 +4,11 @@ import { assertInvoiceAccepted } from '@/lib/invoice-checks';
 
 /**
  * invoices.ts — Enregistrement d'une facture extraite par l'IA.
- * Logique unique partagée par /api/invoices/extract et /api/scanner/confirm.
+ *
+ * Un seul chemin d'entrée : /api/scanner/confirm, après relecture humaine.
+ * L'import « en un clic » (analyse + enregistrement + rapprochement au
+ * premier montant approchant) a été retiré : deux factures Metro de 84,30 €
+ * la même semaine se lettaient sur la mauvaise transaction, en silence.
  *
  * Prérequis : le schéma consolidé (db/migration_consolidee.sql) doit être
  * appliqué — plus aucun "fallback schéma legacy" ici.
@@ -160,39 +164,6 @@ export async function updateIngredientPrices(
       if (created) all.push(created);
     }
   }
-}
-
-/**
- * Rapprochement bancaire automatique : cherche une transaction en attente
- * au même montant (±0,50 €) dans les ±10 jours et la lie à la facture.
- */
-export async function autoReconcileBankTx(
-  supabase: SupabaseClient,
-  invoiceId: string,
-  extracted: ExtractedInvoiceData
-): Promise<string | null> {
-  if (!extracted.total_ttc || !extracted.date) return null;
-
-  const targetAmount = -Math.abs(extracted.total_ttc);
-  const invoiceDate = new Date(extracted.date);
-  const minDate = new Date(invoiceDate); minDate.setDate(invoiceDate.getDate() - 10);
-  const maxDate = new Date(invoiceDate); maxDate.setDate(invoiceDate.getDate() + 10);
-
-  const { data: bankTx } = await supabase
-    .from('bank_transactions')
-    .select('id')
-    .eq('status', 'pending_invoice')
-    .gte('amount', targetAmount - 0.5)
-    .lte('amount', targetAmount + 0.5)
-    .gte('date', minDate.toISOString().split('T')[0])
-    .lte('date', maxDate.toISOString().split('T')[0])
-    .limit(1)
-    .maybeSingle();
-
-  if (!bankTx) return null;
-
-  await linkBankTransaction(supabase, bankTx.id, invoiceId, extracted.compte_comptable);
-  return bankTx.id;
 }
 
 /** Marque une transaction bancaire comme rapprochée avec une facture. */

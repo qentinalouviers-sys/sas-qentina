@@ -245,7 +245,6 @@ src/
 │   ├── api/
 │   │   ├── square/           # sync (rattrapage), webhook (signé HMAC), import-catalog
 │   │   ├── scanner/          # Analyse (étape 1) + confirm (étape 2) + health
-│   │   ├── invoices/extract  # Import direct (analyse + enregistrement en 1 appel)
 │   │   ├── bank/             # extract (relevé → transactions), recategorize (réapplique les règles)
 │   │   ├── cron/             # Travaux planifiés (synchro Square nocturne, CRON_SECRET)
 │   │   ├── ai/               # Insights ventes, audit stock, réponses aux avis
@@ -259,7 +258,7 @@ src/
 └── lib/
     ├── supabase/             # Clients + requireUser() + fetch-all (pagination)
     ├── square.ts             # API Square + écriture des commandes (sync ET webhook)
-    ├── invoices.ts           # Enregistrement de facture unifié (scanner + import direct)
+    ├── invoices.ts           # Enregistrement de facture (un seul chemin : le Scanner)
     ├── ai/                   # Prompt OCR unique, parseur JSON robuste
     ├── accounting.ts         # Flux financiers, taux indicatifs, conversions HT
     ├── interventions.ts      # Ce qui empêche les chiffres d'être justes (fonction pure)

@@ -834,6 +834,13 @@ export default function ScannerPage() {
 
   const isProcessingRef  = useRef(false);
   const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Mouvement bancaire désigné par la page Banque (« joindre la facture »).
+  // Lu dans window.location plutôt que via useSearchParams : cette page est
+  // pré-rendue statiquement, et useSearchParams y exigerait une frontière
+  // Suspense pour un simple paramètre optionnel.
+  const [pinnedTx, setPinnedTx] = useState<BankCandidate | null>(null);
+  const pinnedTxRef = useRef<BankCandidate | null>(null);
   const cameraRef        = useRef<HTMLInputElement>(null);
   const fileRef          = useRef<HTMLInputElement>(null);
   const supabase         = createClient();
@@ -841,6 +848,31 @@ export default function ScannerPage() {
   // Nettoyage du timer de progression au démontage du composant
   useEffect(() => () => {
     if (progressTimerRef.current) clearInterval(progressTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get('bank_tx');
+    if (!id) return;
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase
+        .from('bank_transactions')
+        .select('id, date, description, amount, status')
+        .eq('id', id)
+        .maybeSingle();
+      if (cancelled || !data) return;
+      const tx: BankCandidate = { ...data, score: 100, amount_diff: 0, date_diff: 0 };
+      pinnedTxRef.current = tx;
+      setPinnedTx(tx);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- lecture unique de l'URL au montage
+  }, []);
+
+  const unpinTx = useCallback(() => {
+    pinnedTxRef.current = null;
+    setPinnedTx(null);
+    window.history.replaceState(null, '', '/scanner');
   }, []);
 
   // ── Queue helpers ──────────────────────────────────────────────────────────
@@ -957,6 +989,15 @@ export default function ScannerPage() {
 
       // Step 4 — matching
       upd({ status: 'matching', progress: 90, step: 'Recherche de rapprochement bancaire...' });
+
+      // Le mouvement désigné depuis la page Banque passe en tête des
+      // candidats : c'est lui que l'utilisateur est venu rattacher. Il reste
+      // libre de choisir autrement si la lecture montre que ce n'est pas lui.
+      const pinned = pinnedTxRef.current;
+      if (pinned && !data.is_duplicate) {
+        data.bank_candidates = [pinned, ...(data.bank_candidates ?? []).filter((c: BankCandidate) => c.id !== pinned.id)];
+        data.match_confidence = 'high';
+      }
 
       // Step 5 — result
       if (data.is_duplicate) {
@@ -1098,6 +1139,30 @@ export default function ScannerPage() {
       </div>
 
       <div className="page-body">
+
+        {/* ── Mouvement bancaire à rattacher (venu de la page Banque) ── */}
+        {pinnedTx && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+            background: 'rgba(42,125,123,0.07)', border: '1px solid rgba(42,125,123,0.3)',
+            borderRadius: 12, padding: '12px 16px', marginBottom: 20,
+          }}>
+            <Link2 size={16} style={{ color: 'var(--teal)', flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 200, fontSize: 13 }}>
+              <div style={{ fontWeight: 800, color: 'var(--teal)' }}>Facture à rattacher à ce mouvement bancaire</div>
+              <div style={{ color: 'var(--text-secondary)', marginTop: 2 }}>
+                {formatDate(pinnedTx.date)} · {pinnedTx.description} ·{' '}
+                <strong style={{ color: 'var(--red)' }}>{formatCurrency(pinnedTx.amount)}</strong>
+              </div>
+              <div style={{ color: 'var(--text-muted)', fontSize: 12, marginTop: 2 }}>
+                Il sera proposé en premier après la lecture. Si le montant lu ne correspond pas, ne le lie pas.
+              </div>
+            </div>
+            <button className="btn btn-ghost btn-sm" onClick={unpinTx} style={{ fontSize: 12 }}>
+              <X size={13} /> Ne pas pré-sélectionner
+            </button>
+          </div>
+        )}
 
         {/* ── KPI strip ───────────────────────────────────────────────── */}
         {total > 0 && (
