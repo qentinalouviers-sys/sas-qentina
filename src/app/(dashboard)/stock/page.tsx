@@ -2,11 +2,12 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { formatCurrency, downloadCSV } from '@/lib/utils';
-import { UNITS, convertQuantity } from '@/lib/recipes';
+import { formatCurrency, formatDate, downloadCSV } from '@/lib/utils';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
+import { UNITS } from '@/lib/recipes';
 import {
   Package, Search, Save, Download, CheckCircle2, Clock,
-  AlertTriangle, X, RefreshCw, Layers, Zap, Flame, Edit2, Check
+  X, RefreshCw, Layers, Zap, Flame, Edit2, Check, History
 } from 'lucide-react';
 import type { Ingredient } from '@/lib/types';
 
@@ -30,13 +31,26 @@ interface Anomaly {
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+/**
+ * Une ligne de stock = le dernier comptage physique d'un ingrédient.
+ *
+ * Il n'y a plus de « stock théorique » ici. Il se calculait comme tous les
+ * achats depuis toujours moins toute la consommation depuis toujours, sans
+ * jamais repartir d'un inventaire : il ne pouvait pas être juste, et il
+ * s'affichait pourtant comme un chiffre. Le seul stock qu'on connaît est
+ * celui qu'on a compté.
+ */
 interface StockRow {
   ingredient: Ingredient;
-  achats: number;
-  consoTheorique: number;
-  stockTheorique: number;
   stockPhysique: number | null;
-  ecart: number | null;
+  countedAt: string | null;
+  valorisation: number;
+}
+
+/** Un inventaire = tous les comptages saisis le même jour. */
+interface InventorySession {
+  day: string;
+  products: number;
   valorisation: number;
 }
 
@@ -58,9 +72,6 @@ function getRayon(name: string): string {
   }
   return 'autre';
 }
-
-// Seuil unique d'alerte d'écart (KPI + couleurs racontent la même histoire)
-const ECART_ALERT = 2;
 
 // ─── Local UI components ─────────────────────────────────────────────────────
 
@@ -114,6 +125,7 @@ function RayonPill({ label, emoji, count, active, color, activeBg, completed, on
 
 export default function StockPage() {
   const [stockData, setStockData] = useState<StockRow[]>([]);
+  const [history, setHistory] = useState<InventorySession[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -147,76 +159,48 @@ export default function StockPage() {
   const loadData = useCallback(async () => {
     setLoading(true);
 
-    const [
-      { data: ingredients },
-      { data: invoiceLines },
-      { data: recipeIngredients },
-      { data: squareItems },
-      { data: inventoryCounts },
-    ] = await Promise.all([
+    const [{ data: ingredients }, inventoryCounts] = await Promise.all([
       supabase.from('ingredients').select('*').order('name'),
-      supabase.from('invoice_lines').select('designation, quantity, unit').eq('category', 'alimentaire'),
-      supabase.from('recipe_ingredients').select('ingredient_id, quantity, unit, recipe:recipes(id, name)'),
-      supabase.from('square_items').select('name, quantity'),
-      supabase.from('inventory_counts').select('ingredient_id, quantity, unit_price').order('counted_at', { ascending: false }),
+      // Les comptages s'accumulent à chaque inventaire : paginé, comme toute
+      // lecture dont le volume grandit avec le temps.
+      fetchAllRows<{ ingredient_id: string; quantity: number; unit_price: number | null; counted_at: string }>(
+        (f0, f1) => supabase.from('inventory_counts')
+          .select('ingredient_id, quantity, unit_price, counted_at')
+          .order('counted_at', { ascending: false })
+          .range(f0, f1)),
     ]);
     if (!ingredients) { setLoading(false); return; }
 
-    // Map id → ingredient (pour connaître l'unité cible lors des conversions)
-    const ingredientById = new Map<string, Ingredient>();
-    ingredients.forEach((ing: any) => ingredientById.set(ing.id, ing));
-
-    // Sales map
-    const recipeSold: Record<string, number> = {};
-    squareItems?.forEach((si: any) => {
-      if (si.name) {
-        const key = si.name.trim().toLowerCase();
-        recipeSold[key] = (recipeSold[key] || 0) + (si.quantity || 0);
+    // Dernier comptage par ingrédient (la liste est triée du plus récent au plus ancien)
+    const latest: Record<string, { quantity: number; unit_price: number; counted_at: string }> = {};
+    for (const ic of inventoryCounts) {
+      if (!latest[ic.ingredient_id]) {
+        latest[ic.ingredient_id] = { quantity: ic.quantity, unit_price: ic.unit_price || 0, counted_at: ic.counted_at };
       }
+    }
+
+    const rows: StockRow[] = ingredients.map((ing: Ingredient) => {
+      const last = latest[ing.id];
+      const physique = last?.quantity ?? null;
+      const price = ing.last_unit_price || last?.unit_price || 0;
+      return {
+        ingredient: ing,
+        stockPhysique: physique,
+        countedAt: last?.counted_at ?? null,
+        valorisation: (physique ?? 0) * price,
+      };
     });
 
-    // Theoretical consumption — chaque quantité de recette est convertie
-    // de l'unité de la ligne de recette vers l'unité de l'ingrédient
-    const consoMap: Record<string, number> = {};
-    (recipeIngredients as any[] || []).forEach((ri: any) => {
-      if (!ri.recipe) return;
-      const ing = ingredientById.get(ri.ingredient_id);
-      if (!ing) return;
-      const sold = recipeSold[ri.recipe.name.trim().toLowerCase()] || 0;
-      const qtyInIngredientUnit = convertQuantity(ri.quantity || 0, ri.unit || '', ing.unit || '');
-      consoMap[ri.ingredient_id] = (consoMap[ri.ingredient_id] || 0) + qtyInIngredientUnit * sold;
-    });
-
-    // Purchases — quantités des factures converties vers l'unité de l'ingrédient
-    const achatsMap: Record<string, number> = {};
-    ingredients.forEach((ing: any) => {
-      const matched = invoiceLines?.filter((l: any) =>
-        l.designation?.toLowerCase().includes(ing.name.toLowerCase())
-      ) || [];
-      achatsMap[ing.id] = matched.reduce(
-        (s: number, l: any) => s + convertQuantity(l.quantity || 0, l.unit || '', ing.unit || ''),
-        0
-      );
-    });
-
-    // Latest inventory
-
-    const latestInventory: Record<string, { quantity: number; unit_price: number }> = {};
-    (inventoryCounts as any[] || []).forEach((ic: any) => {
-      if (!latestInventory[ic.ingredient_id])
-        latestInventory[ic.ingredient_id] = { quantity: ic.quantity, unit_price: ic.unit_price || 0 };
-    });
-
-    const rows: StockRow[] = ingredients.map((ing: any) => {
-      const achats = achatsMap[ing.id] || 0;
-      const conso = consoMap[ing.id] || 0;
-      const stockTheo = achats - conso;
-      const physique = latestInventory[ing.id]?.quantity ?? null;
-      const ecart = physique !== null ? physique - stockTheo : null;
-      const price = ing.last_unit_price || latestInventory[ing.id]?.unit_price || 0;
-      const valo = (physique !== null ? physique : stockTheo) * price;
-      return { ingredient: ing, achats, consoTheorique: conso, stockTheorique: stockTheo, stockPhysique: physique, ecart, valorisation: valo };
-    });
+    // Historique : un inventaire par jour de comptage, valorisé au prix saisi ce jour-là
+    const byDay = new Map<string, InventorySession>();
+    for (const ic of inventoryCounts) {
+      const day = String(ic.counted_at).slice(0, 10);
+      const session = byDay.get(day) ?? { day, products: 0, valorisation: 0 };
+      session.products++;
+      session.valorisation += (ic.quantity || 0) * (ic.unit_price || 0);
+      byDay.set(day, session);
+    }
+    setHistory([...byDay.values()].sort((a, b) => b.day.localeCompare(a.day)));
 
     setStockData(rows);
     setLoading(false);
@@ -353,11 +337,9 @@ export default function StockPage() {
       Ingrédient: r.ingredient.name,
       Rayon: RAYONS.find(ray => ray.id === getRayon(r.ingredient.name))?.label || 'Autre',
       Unité: r.ingredient.unit || '',
-      Achats: r.achats,
-      'Conso. théorique': r.consoTheorique,
-      'Stock théorique': r.stockTheorique,
       'Stock physique': r.stockPhysique ?? '',
-      Écart: r.ecart ?? '',
+      'Compté le': r.countedAt ? String(r.countedAt).slice(0, 10) : '',
+      'Prix unitaire': r.ingredient.last_unit_price ?? '',
       'Valorisation (€)': r.valorisation.toFixed(2),
     })), 'stock-qentina');
   };
@@ -570,9 +552,42 @@ export default function StockPage() {
               <div className="kpi-label"><CheckCircle2 size={16} /> Comptés</div>
               <div className="kpi-value">{stockData.filter(s => s.stockPhysique !== null).length}</div>
             </div>
-            <div className="kpi-card" style={{ borderLeft: stockData.some(s => s.ecart !== null && Math.abs(s.ecart) > ECART_ALERT) ? '4px solid var(--orange)' : undefined }}>
-              <div className="kpi-label"><AlertTriangle size={16} /> Écarts détectés</div>
-              <div className="kpi-value">{stockData.filter(s => s.ecart !== null && Math.abs(s.ecart) > ECART_ALERT).length}</div>
+            <div className="kpi-card">
+              <div className="kpi-label"><History size={16} /> Dernier inventaire</div>
+              <div className="kpi-value" style={{ fontSize: 18 }}>{history[0] ? formatDate(history[0].day) : '—'}</div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Historique des inventaires ─────────────────────────────────── */}
+        {mode === 'view' && history.length > 0 && (
+          <div className="card" style={{ marginBottom: 24 }}>
+            <div className="card-header">
+              <div>
+                <div className="card-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <History size={18} style={{ color: 'var(--teal)' }} /> Historique des inventaires
+                </div>
+                <div className="card-subtitle">
+                  Chaque ligne est une journée de comptage, valorisée aux prix du jour. La valorisation
+                  ci-dessus, elle, reprend le dernier comptage de chaque produit au prix d&apos;achat actuel.
+                </div>
+              </div>
+            </div>
+            <div className="table-container">
+              <table>
+                <thead>
+                  <tr><th>Date</th><th style={{ textAlign: 'right' }}>Produits comptés</th><th style={{ textAlign: 'right' }}>Valorisation</th></tr>
+                </thead>
+                <tbody>
+                  {history.slice(0, 12).map(h => (
+                    <tr key={h.day}>
+                      <td style={{ fontWeight: 600 }}>{formatDate(h.day)}</td>
+                      <td style={{ textAlign: 'right' }}>{h.products}</td>
+                      <td style={{ textAlign: 'right', fontWeight: 600 }}>{formatCurrency(h.valorisation)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           </div>
         )}
@@ -730,11 +745,9 @@ export default function StockPage() {
                             <tr>
                               <th>Produit</th>
                               <th>Unité</th>
-                              <th style={{ textAlign: 'right' }}>Achats</th>
-                              <th style={{ textAlign: 'right' }}>Conso. théo.</th>
-                              <th style={{ textAlign: 'right' }}>Stock théo.</th>
-                              <th style={{ textAlign: 'right' }}>Stock phys.</th>
-                              <th style={{ textAlign: 'right' }}>Écart</th>
+                              <th style={{ textAlign: 'right' }}>Stock compté</th>
+                              <th style={{ textAlign: 'right' }}>Compté le</th>
+                              <th style={{ textAlign: 'right' }}>Prix unitaire</th>
                               <th style={{ textAlign: 'right' }}>Valorisation</th>
                             </tr>
                           </thead>
@@ -755,24 +768,16 @@ export default function StockPage() {
                                   </div>
                                 </td>
                                 <td style={{ color: 'var(--text-muted)', fontSize: 12 }}>{row.ingredient.unit || '—'}</td>
-                                <td style={{ textAlign: 'right', fontSize: 13 }}>{row.achats > 0 ? row.achats.toFixed(2) : '—'}</td>
-                                <td style={{ textAlign: 'right', fontSize: 13 }}>{row.consoTheorique > 0 ? row.consoTheorique.toFixed(2) : '—'}</td>
-                                <td style={{ textAlign: 'right', fontWeight: 500 }}>{row.stockTheorique.toFixed(2)}</td>
                                 <td style={{ textAlign: 'right', fontWeight: 600, color: row.stockPhysique !== null ? 'var(--teal)' : 'var(--text-muted)' }}>
-                                  {row.stockPhysique !== null ? row.stockPhysique.toFixed(2) : '—'}
+                                  {row.stockPhysique !== null ? row.stockPhysique.toFixed(2) : 'Non compté'}
                                 </td>
-                                <td style={{ textAlign: 'right' }}>
-                                  {row.ecart !== null ? (
-                                    <span style={{
-                                      color: Math.abs(row.ecart) > ECART_ALERT ? 'var(--red)' : 'var(--green)',
-                                      fontWeight: 700,
-                                      fontSize: 13,
-                                    }}>
-                                      {row.ecart > 0 ? '+' : ''}{row.ecart.toFixed(2)}
-                                    </span>
-                                  ) : <span style={{ color: 'var(--text-muted)' }}>—</span>}
+                                <td style={{ textAlign: 'right', fontSize: 12, color: 'var(--text-muted)' }}>
+                                  {row.countedAt ? formatDate(String(row.countedAt).slice(0, 10)) : '—'}
                                 </td>
-                                <td style={{ textAlign: 'right', fontWeight: 600 }}>{formatCurrency(row.valorisation)}</td>
+                                <td style={{ textAlign: 'right', fontSize: 13 }}>
+                                  {row.ingredient.last_unit_price ? formatCurrency(row.ingredient.last_unit_price) : '—'}
+                                </td>
+                                <td style={{ textAlign: 'right', fontWeight: 600 }}>{row.stockPhysique !== null ? formatCurrency(row.valorisation) : '—'}</td>
                               </tr>
                             ))}
                           </tbody>
@@ -848,7 +853,9 @@ export default function StockPage() {
                                     {row.ingredient.name}
                                   </div>
                                   <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
-                                    Stock théo. : <strong>{row.stockTheorique.toFixed(2)} {row.ingredient.unit || ''}</strong>
+                                    {row.stockPhysique !== null
+                                      ? <>Dernier comptage : <strong>{row.stockPhysique.toFixed(2)} {row.ingredient.unit || ''}</strong>{row.countedAt ? ` le ${formatDate(String(row.countedAt).slice(0, 10))}` : ''}</>
+                                      : 'Jamais compté'}
                                   </div>
                                 </div>
                                 {isCounted
@@ -896,18 +903,13 @@ export default function StockPage() {
                                 )}
                               </div>
 
-                              {/* Écart preview */}
-                              {isCounted && (
-                                <div style={{ marginTop: 6, fontSize: 12 }}>
+                              {/* Variation depuis le dernier comptage : une information, pas une alerte */}
+                              {isCounted && row.stockPhysique !== null && (
+                                <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-muted)' }}>
                                   {(() => {
-                                    const ecart = parseFloat(value) - row.stockTheorique;
-                                    const sign = ecart >= 0 ? '+' : '';
-                                    const color = Math.abs(ecart) > ECART_ALERT ? 'var(--red)' : 'var(--green)';
-                                    return (
-                                      <span style={{ color, fontWeight: 600 }}>
-                                        Écart : {sign}{ecart.toFixed(2)} {row.ingredient.unit || ''}
-                                      </span>
-                                    );
+                                    const delta = parseFloat(value) - row.stockPhysique;
+                                    if (!Number.isFinite(delta) || Math.abs(delta) < 0.005) return 'Identique au dernier comptage';
+                                    return `${delta > 0 ? '+' : ''}${delta.toFixed(2)} ${row.ingredient.unit || ''} depuis le dernier comptage`;
                                   })()}
                                 </div>
                               )}
@@ -977,10 +979,8 @@ export default function StockPage() {
               {[
                 { label: 'Prix unitaire', value: formatCurrency(selectedRow.ingredient.last_unit_price), color: 'var(--teal)' },
                 { label: 'Unité', value: selectedRow.ingredient.unit || '—', color: 'var(--text-primary)' },
-                { label: 'Achats cumulés', value: selectedRow.achats > 0 ? `${selectedRow.achats.toFixed(2)} ${selectedRow.ingredient.unit || ''}` : '—', color: 'var(--text-primary)' },
-                { label: 'Conso. théorique', value: selectedRow.consoTheorique > 0 ? `${selectedRow.consoTheorique.toFixed(2)} ${selectedRow.ingredient.unit || ''}` : '—', color: 'var(--text-primary)' },
-                { label: 'Stock théorique', value: `${selectedRow.stockTheorique.toFixed(2)} ${selectedRow.ingredient.unit || ''}`, color: 'var(--text-secondary)' },
-                { label: 'Stock physique', value: selectedRow.stockPhysique !== null ? `${selectedRow.stockPhysique.toFixed(2)} ${selectedRow.ingredient.unit || ''}` : 'Non compté', color: selectedRow.stockPhysique !== null ? 'var(--teal)' : 'var(--text-muted)' },
+                { label: 'Stock compté', value: selectedRow.stockPhysique !== null ? `${selectedRow.stockPhysique.toFixed(2)} ${selectedRow.ingredient.unit || ''}` : 'Non compté', color: selectedRow.stockPhysique !== null ? 'var(--teal)' : 'var(--text-muted)' },
+                { label: 'Compté le', value: selectedRow.countedAt ? formatDate(String(selectedRow.countedAt).slice(0, 10)) : '—', color: 'var(--text-secondary)' },
               ].map(kpi => (
                 <div key={kpi.label} className="card" style={{ textAlign: 'center', padding: 12 }}>
                   <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, marginBottom: 4 }}>{kpi.label.toUpperCase()}</div>
@@ -989,24 +989,13 @@ export default function StockPage() {
               ))}
             </div>
 
-            {/* Valorisation + Écart */}
-            <div className="grid-2" style={{ gap: 12 }}>
-              <div className="card" style={{ textAlign: 'center', background: 'var(--teal-bg)', border: '1px solid var(--teal)' }}>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, marginBottom: 4 }}>VALORISATION</div>
-                <div style={{ fontWeight: 800, fontSize: 18, color: 'var(--teal)' }}>{formatCurrency(selectedRow.valorisation)}</div>
+            {/* Valorisation : dernier comptage × prix d'achat actuel */}
+            <div className="card" style={{ textAlign: 'center', background: 'var(--teal-bg)', border: '1px solid var(--teal)' }}>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, marginBottom: 4 }}>VALORISATION</div>
+              <div style={{ fontWeight: 800, fontSize: 18, color: 'var(--teal)' }}>
+                {selectedRow.stockPhysique !== null ? formatCurrency(selectedRow.valorisation) : '—'}
               </div>
-              {selectedRow.ecart !== null && (
-                <div className="card" style={{
-                  textAlign: 'center',
-                  background: Math.abs(selectedRow.ecart) > ECART_ALERT ? 'var(--red-light)' : 'var(--green-light)',
-                  border: `1px solid ${Math.abs(selectedRow.ecart) > ECART_ALERT ? 'var(--red)' : 'var(--green)'}`,
-                }}>
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, marginBottom: 4 }}>ÉCART</div>
-                  <div style={{ fontWeight: 800, fontSize: 18, color: Math.abs(selectedRow.ecart) > ECART_ALERT ? 'var(--red)' : 'var(--green)' }}>
-                    {selectedRow.ecart > 0 ? '+' : ''}{selectedRow.ecart.toFixed(2)} {selectedRow.ingredient.unit || ''}
-                  </div>
-                </div>
-              )}
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>dernier comptage × prix d&apos;achat actuel</div>
             </div>
 
             <div className="modal-footer">
