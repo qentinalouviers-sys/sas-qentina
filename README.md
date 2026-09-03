@@ -30,7 +30,12 @@ npm run dev
 | `NEXT_PUBLIC_SUPABASE_URL` | URL du projet Supabase |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Clé publique Supabase |
 | `SUPABASE_SERVICE_ROLE_KEY` | Clé serveur Supabase (jamais côté client) |
-| `ANTHROPIC_API_KEY` | Clé API Claude (scanner, banque, Fuego, audits) |
+| `ANTHROPIC_API_KEY` | Clé API Claude (banque, Fuego, audits, chat) |
+| `SETTINGS_ENCRYPTION_KEY` | Chiffre les clés API saisies dans Réglages → Moteurs IA. `openssl rand -hex 32`, une fois pour toutes |
+| `GEMINI_API_KEY` | Clé API Google Gemini — moteur d'OCR des factures ([AI Studio](https://aistudio.google.com/apikey)) |
+| `OCR_PROVIDER` | `gemini` ou `anthropic`. Vide = Gemini si sa clé existe, sinon Claude |
+| `GEMINI_MODEL` | Modèle Gemini. Vide = `gemini-2.5-flash` |
+| `GEMINI_THINKING_BUDGET` | Budget de raisonnement Gemini. `0` par défaut (économie) |
 | `SQUARE_ACCESS_TOKEN` | Jeton d'accès Square |
 | `SQUARE_LOCATION_ID` | Identifiant du point de vente Square |
 | `SQUARE_WEBHOOK_SECRET` | **Important** : secret de signature du webhook (Square Developer Dashboard) |
@@ -39,6 +44,64 @@ npm run dev
 | `GOOGLE_PLACES_API_KEY` / `GOOGLE_PLACE_ID` | Lecture des avis Google |
 | `CRON_SECRET` | **Obligatoire** : authentifie la synchro Square nocturne. Absente, elle refuse de tourner |
 
+### Moteur d'OCR des factures
+
+Le scanner de factures tourne sur **Gemini** (Google), sensiblement moins cher que
+Claude à qualité comparable sur de l'extraction structurée. Claude reste en place
+pour tout le reste : catégorisation bancaire, Fuego, audits, chat.
+
+Trois choses à savoir :
+
+1. **La bascule est une variable, pas un déploiement.** `OCR_PROVIDER=anthropic`
+   ramène le scanner sur Claude sans toucher au code — utile si Gemini se révèle
+   moins fiable sur un fournisseur donné.
+2. **Le raisonnement est coupé** (`GEMINI_THINKING_BUDGET=0`). Les modèles 2.5
+   « réfléchissent » par défaut et facturent ces tokens comme de la sortie : lire
+   une facture n'en a aucun besoin. C'est là que se fait l'essentiel de l'économie.
+3. **Le prompt est strictement identique** dans les deux moteurs
+   (`INVOICE_OCR_PROMPT`, un seul exemplaire). Une différence de résultat vient
+   donc du modèle, jamais de la consigne.
+
+Le moteur réellement utilisé est visible à trois endroits : la pastille d'état en
+haut de l'application, le champ `ocr_engine` renvoyé par `/api/scanner`, et
+`config.ocr_provider` dans `/api/scanner/health`.
+
+Gemini accepte en plus le **HEIC/HEIF** des iPhone, que Claude refusait : les
+photos prises sans changer les réglages de l'appareil passent désormais.
+
+### Clés IA : écran Réglages ou variables Vercel
+
+Les clés Anthropic et Google se saisissent dans **Réglages → Moteurs IA**, ce qui
+évite un redéploiement à chaque rotation. Le même écran choisit le moteur d'OCR et
+le modèle Gemini.
+
+Comment c'est résolu, dans l'ordre : **la base d'abord, les variables
+d'environnement ensuite**. Une clé saisie à l'écran s'applique donc tout de suite ;
+les variables Vercel restent en repli pour ne jamais se retrouver enfermé
+dehors — base indisponible, table vidée par erreur, ou tout premier démarrage.
+
+Trois points de sécurité, qui expliquent la forme du code :
+
+- Les clés vivent dans la table **`ai_settings`**, et pas dans `app_settings` :
+  cette dernière est ouverte en lecture et en écriture à tout compte
+  authentifié (la page Réglages y écrit depuis le navigateur). `ai_settings`
+  n'a **aucune policy** — RLS activé sans policy signifie que personne n'y
+  accède, sauf la clé `service_role`, qui ne vit que côté serveur.
+- Les valeurs sont **chiffrées en AES-256-GCM** avec `SETTINGS_ENCRYPTION_KEY`.
+  Le RLS protège l'accès, le chiffrement protège le contenu si la base fuite :
+  ce sont deux portes différentes. Changer cette variable rend illisibles les
+  clés déjà enregistrées — l'application le signale et retombe sur les
+  variables d'environnement au lieu de tomber en panne.
+- Une clé enregistrée **ne ressort jamais**. L'API ne renvoie que son empreinte
+  (`••••3f2a`), sa provenance et sa date : à l'écran, elle est remplaçable,
+  jamais relisible.
+
+L'écran est réservé aux comptes standards : le rôle `comptable` n'atteint ni
+`/reglages` ni `/api/settings` (liste blanche dans `proxy.ts`).
+
+Le bouton **Tester** de chaque moteur envoie un ping à un token — de quoi
+savoir qu'une clé est bonne sans l'apprendre au milieu d'un scan de facture.
+
 ### Base de données
 
 1. Nouveau projet : exécuter `db/schema.sql` dans Supabase → SQL Editor.
@@ -46,6 +109,7 @@ npm run dev
    ré-exécutable sans risque). Elle crée toutes les colonnes/tables que le code attend.
 3. Créer le bucket Storage **`invoice-files`** (public) pour les fichiers de factures.
 4. Module frais kilométriques : exécuter `db/migration_trajets.sql`.
+5. Clés IA gérées depuis l'application : exécuter `db/migration_ai_settings.sql`.
 
 > ⚠️ La migration consolidée est à **ré-exécuter** après une mise à jour qui
 > ajoute une catégorie bancaire : la contrainte `CHECK` de `bank_transactions`

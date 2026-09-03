@@ -2,24 +2,47 @@ import { NextResponse } from 'next/server';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { requireUser } from '@/lib/supabase/api-auth';
 import { tryGetAppUrl } from '@/lib/env';
-import Anthropic from '@anthropic-ai/sdk';
+import { describeOcrEngine } from '@/lib/ai/invoice-ocr';
+import { callGemini } from '@/lib/ai/gemini';
+import { createAnthropicClient, getSettingSource } from '@/lib/ai/settings';
 
 /**
- * Contrôle des variables d'environnement : indique ce qui est configuré
- * sans jamais révéler la moindre valeur secrète.
+ * Contrôle de la configuration : indique ce qui manque sans jamais révéler
+ * la moindre valeur secrète.
+ *
+ * Les clés IA ne sont plus cherchées dans les seules variables
+ * d'environnement : elles peuvent venir de Réglages → Moteurs IA. Sans cette
+ * distinction, une clé parfaitement configurée à l'écran s'afficherait ici
+ * comme manquante — exactement le faux signal que cette page doit éviter.
  */
-function checkConfig() {
+async function checkConfig(engine: { provider: string; model: string }) {
   const required: { variable: string; impact: string }[] = [
     { variable: 'NEXT_PUBLIC_SUPABASE_URL', impact: 'Base de données' },
     { variable: 'NEXT_PUBLIC_SUPABASE_ANON_KEY', impact: 'Base de données' },
     { variable: 'SUPABASE_SERVICE_ROLE_KEY', impact: 'Base de données (serveur)' },
-    { variable: 'ANTHROPIC_API_KEY', impact: 'Scanner IA & Fuego' },
     { variable: 'SQUARE_ACCESS_TOKEN', impact: 'Ventes Square' },
     { variable: 'SQUARE_LOCATION_ID', impact: 'Ventes Square' },
     { variable: 'SQUARE_WEBHOOK_SECRET', impact: 'Ventes en temps réel' },
   ];
 
   const missing = required.filter(r => !process.env[r.variable]?.trim());
+
+  // Clés IA : base de données ou variable d'environnement, indifféremment.
+  if ((await getSettingSource('anthropic_api_key')) === 'absent') {
+    missing.push({
+      variable: 'Clé API Anthropic',
+      impact: 'Banque, Fuego, audits, chat — à renseigner dans Réglages → Moteurs IA',
+    });
+  }
+
+  // La clé Google n'est indispensable que si l'OCR tourne effectivement
+  // sur Gemini : inutile de la réclamer à qui est resté sur Claude.
+  if (engine.provider === 'gemini' && (await getSettingSource('gemini_api_key')) === 'absent') {
+    missing.push({
+      variable: 'Clé API Google Gemini',
+      impact: 'Scanner IA (OCR des factures) — à renseigner dans Réglages → Moteurs IA',
+    });
+  }
 
   const appUrl = tryGetAppUrl();
   if (!appUrl) {
@@ -36,6 +59,8 @@ function checkConfig() {
   return {
     ok: missing.length === 0,
     app_url: appUrl,
+    ocr_provider: engine.provider,
+    ocr_model: engine.model,
     missing_required: missing,
     missing_optional: optional,
   };
@@ -43,44 +68,75 @@ function checkConfig() {
 
 /**
  * Diagnostic du scanner (réservé aux utilisateurs connectés) :
- *  - disponibilité de l'API Claude (ping 1 token, mis en cache 5 min)
+ *  - disponibilité du moteur d'OCR actif (ping minimal, mis en cache 5 min)
  *  - existence du bucket de stockage + test d'upload
  *  - compteurs de factures
  */
 
-let cachedAiStatus: { status: 'green' | 'orange' | 'red'; latency_ms: number; message: string; timestamp: number } | null = null;
+interface AiHealth {
+  status: 'green' | 'orange' | 'red';
+  latency_ms: number;
+  message: string;
+  provider: string;
+  model: string;
+}
+
+// Cache indexé par moteur : changer de moteur ne doit pas renvoyer le
+// statut de l'autre pendant cinq minutes.
+const cachedAiStatus = new Map<string, AiHealth & { timestamp: number }>();
 const AI_CACHE_MS = 5 * 60 * 1000;
 
-async function checkAnthropicHealth(): Promise<{ status: 'green' | 'orange' | 'red'; latency_ms: number; message: string }> {
-  if (cachedAiStatus && (Date.now() - cachedAiStatus.timestamp < AI_CACHE_MS)) {
-    const { status, latency_ms, message } = cachedAiStatus;
-    return { status, latency_ms, message };
+/** Ping Claude : un token de sortie sur le modèle le moins cher. */
+async function pingAnthropic(): Promise<void> {
+  const anthropic = await createAnthropicClient();
+  await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 1,
+    messages: [{ role: 'user', content: 'Ping' }],
+  });
+}
+
+/** Ping Gemini : quelques tokens, sans fichier, donc au coût quasi nul. */
+async function pingGemini(): Promise<void> {
+  await callGemini({ parts: [{ text: 'Ping' }], maxOutputTokens: 8 });
+}
+
+async function checkAiHealth(engine: { provider: string; model: string }): Promise<AiHealth> {
+  const cached = cachedAiStatus.get(engine.provider);
+  if (cached && Date.now() - cached.timestamp < AI_CACHE_MS) {
+    const { timestamp, ...rest } = cached;
+    return rest;
   }
 
-  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const startTime = Date.now();
+  const base = { provider: engine.provider, model: engine.model };
 
   try {
-    // Ping le moins cher possible : Haiku, 1 token de sortie
-    await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1,
-      messages: [{ role: 'user', content: 'Ping' }],
-    });
+    if (engine.provider === 'gemini') await pingGemini();
+    else await pingAnthropic();
+
     const latency_ms = Date.now() - startTime;
-    const status = latency_ms > 2000 ? 'orange' : 'green';
-    const message = status === 'orange' ? 'Ralenti' : 'En ligne';
-    cachedAiStatus = { status, latency_ms, message, timestamp: Date.now() };
-    return { status, latency_ms, message };
+    // Gemini répond plus lentement qu'un ping Haiku : sans ce seuil distinct,
+    // un moteur parfaitement sain s'afficherait en permanence « Ralenti ».
+    const threshold = engine.provider === 'gemini' ? 4000 : 2000;
+    const status: AiHealth['status'] = latency_ms > threshold ? 'orange' : 'green';
+    const result = { ...base, status, latency_ms, message: status === 'orange' ? 'Ralenti' : 'En ligne' };
+    cachedAiStatus.set(engine.provider, { ...result, timestamp: Date.now() });
+    return result;
   } catch (e: any) {
     const latency_ms = Date.now() - startTime;
-    let message = 'Hors ligne';
+    let message: string;
     if (e.status === 529 || e.message?.includes('Overloaded')) message = 'Saturé (Erreur 529)';
-    else if (e.status === 429) message = 'Limite de débit atteinte (Erreur 429)';
+    else if (e.status === 429 || e.message?.includes('429')) message = 'Quota atteint (Erreur 429)';
+    else if (e.message?.includes('GEMINI_API_KEY')) message = 'Clé API absente';
+    else if (e.message?.includes('404')) message = 'Modèle introuvable';
+    else if (e.message?.includes('401') || e.message?.includes('403')) message = 'Clé API refusée';
     else message = `Erreur (${e.status || 'Inconnue'})`;
 
-    cachedAiStatus = { status: 'red', latency_ms, message, timestamp: Date.now() };
-    return { status: 'red', latency_ms, message };
+    console.error(`[Health] Moteur ${engine.provider} indisponible : ${e.message}`);
+    const result = { ...base, status: 'red' as const, latency_ms, message };
+    cachedAiStatus.set(engine.provider, { ...result, timestamp: Date.now() });
+    return result;
   }
 }
 
@@ -91,8 +147,21 @@ export async function GET() {
   const supabase = createServiceRoleClient();
   const results: Record<string, any> = {};
 
-  const config = checkConfig();
-  const aiHealth = await checkAnthropicHealth();
+  // OCR_PROVIDER mal orthographié ne doit pas faire tomber le diagnostic :
+  // c'est précisément la page où l'on vient chercher la cause de la panne.
+  let engine: { provider: string; model: string };
+  let engineError: string | null = null;
+  try {
+    engine = await describeOcrEngine();
+  } catch (e: any) {
+    engine = { provider: 'inconnu', model: 'inconnu' };
+    engineError = e.message;
+  }
+
+  const config = await checkConfig(engine);
+  const aiHealth = engineError
+    ? { status: 'red' as const, latency_ms: 0, message: engineError, provider: 'inconnu', model: 'inconnu' }
+    : await checkAiHealth(engine);
 
   // Bucket de stockage
   const { data: buckets, error: bucketsErr } = await supabase.storage.listBuckets();

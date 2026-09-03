@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { requireUser } from '@/lib/supabase/api-auth';
-import { runInvoiceOcr } from '@/lib/ai/invoice-ocr';
+import { runInvoiceOcr, describeOcrEngine } from '@/lib/ai/invoice-ocr';
 import {
   saveInvoice,
   updateIngredientPrices,
@@ -15,6 +15,10 @@ import {
  * (Le Scanner utilise le flux en deux temps /api/scanner → /api/scanner/confirm,
  * qui permet de vérifier les données avant enregistrement.)
  */
+// Même raison que dans /api/scanner : l'OCR d'un document long dépasse le
+// délai par défaut d'une fonction Vercel.
+export const maxDuration = 60;
+
 export async function POST(request: NextRequest) {
   const auth = await requireUser();
   if (auth.error) return auth.error;
@@ -29,7 +33,7 @@ export async function POST(request: NextRequest) {
     }
     const activeMimeType = mimeType || 'application/pdf';
 
-    // 1. OCR Claude
+    // 1. OCR (moteur configuré : Gemini ou Claude)
     let extracted;
     try {
       extracted = await runInvoiceOcr([{ fileBase64: activeBase64, mimeType: activeMimeType }]);
@@ -82,6 +86,7 @@ export async function POST(request: NextRequest) {
       invoice_id: saved.id,
       pdf_url: fileUrl,
       extracted,
+      ocr_engine: await describeOcrEngine(),
       reconciled_tx_id: reconciledTxId,
       accounting_ref: saved.accountingRef,
     });

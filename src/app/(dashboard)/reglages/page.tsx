@@ -2,7 +2,8 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { Plus, Trash2, Save, Settings, Flame, RefreshCw, Stethoscope } from 'lucide-react';
+import { Plus, Trash2, Save, Settings, Flame, RefreshCw, Stethoscope, KeyRound } from 'lucide-react';
+import AiSettingsPanel from '@/components/AiSettingsPanel';
 import { formatCurrency } from '@/lib/utils';
 import { UNITS } from '@/lib/recipes';
 import type { Supplier, Ingredient } from '@/lib/types';
@@ -20,7 +21,7 @@ export default function ReglagesPage() {
   const [loading, setLoading] = useState(true);
   const [newSupplier, setNewSupplier] = useState('');
   const [newIngredient, setNewIngredient] = useState({ name: '', unit: 'kg', last_unit_price: 0 });
-  const [tab, setTab] = useState<'suppliers' | 'ingredients' | 'ia' | 'services'>('ingredients');
+  const [tab, setTab] = useState<'suppliers' | 'ingredients' | 'ia' | 'services' | 'moteurs'>('ingredients');
   const [fuegoContext, setFuegoContext] = useState('');
   const [savingContext, setSavingContext] = useState(false);
   const [openingHours, setOpeningHours] = useState<Record<string, { Midi: boolean; Soir: boolean }>>({ ...DEFAULT_OPENING_HOURS });
@@ -222,7 +223,10 @@ export default function ReglagesPage() {
           <button className={`period-btn ${tab === 'suppliers' ? 'active' : ''}`} onClick={() => setTab('suppliers')}>Fournisseurs</button>
           <button className={`period-btn ${tab === 'services' ? 'active' : ''}`} onClick={() => setTab('services')}>Horaires & Services</button>
           <button className={`period-btn ${tab === 'ia' ? 'active' : ''}`} onClick={() => setTab('ia')}><Flame size={14} style={{ display: 'inline', marginRight: 4, verticalAlign: 'text-bottom' }} /> Fuego IA</button>
+          <button className={`period-btn ${tab === 'moteurs' ? 'active' : ''}`} onClick={() => setTab('moteurs')}><KeyRound size={14} style={{ display: 'inline', marginRight: 4, verticalAlign: 'text-bottom' }} /> Moteurs IA</button>
         </div>
+
+        {tab === 'moteurs' && <AiSettingsPanel />}
 
         {tab === 'services' && (
           <div className="card">

@@ -1,10 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { requireUser } from '@/lib/supabase/api-auth';
-import { runInvoiceOcr, type OcrFile } from '@/lib/ai/invoice-ocr';
+import { runInvoiceOcr, describeOcrEngine, type OcrFile } from '@/lib/ai/invoice-ocr';
 import { uploadInvoiceFile } from '@/lib/invoices';
 
 const rnd2 = (v: number) => Math.round(Number(v) * 100) / 100;
+
+// L'OCR d'une facture de plusieurs pages dépasse largement le délai par défaut
+// d'une fonction Vercel. L'appel Gemini n'est pas streamé : sans ce réglage,
+// une grosse facture se solde par un 504 avant toute réponse.
+export const maxDuration = 60;
 
 /**
  * Scanner IA — étape 1 : OCR + détection de doublons + candidats bancaires.
@@ -22,7 +27,7 @@ export async function POST(req: NextRequest) {
 
     const supabase = createServiceRoleClient();
 
-    // ── 1. OCR Claude (une ou plusieurs pages) ─────────────────────────────
+    // ── 1. OCR (une ou plusieurs pages) ────────────────────────────────────
     const ocrFiles: OcrFile[] =
       files && Array.isArray(files) && files.length > 0
         ? files
@@ -128,6 +133,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       success: true,
       extracted,
+      // Moteur ayant réellement produit la lecture : indispensable pour
+      // comparer Gemini et Claude sur les mêmes factures.
+      ocr_engine: await describeOcrEngine(),
       file_url: fileUrl,
       is_duplicate: isDuplicate,
       duplicate_invoice: duplicateInvoice,

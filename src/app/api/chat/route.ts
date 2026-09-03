@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import Anthropic from '@anthropic-ai/sdk';
 import { createServiceRoleClient } from '@/lib/supabase/server';
 import { fetchAllRows, fetchAllRowsIn } from '@/lib/supabase/fetch-all';
 import { createClaudeMessage } from '@/lib/anthropic';
+import { createAnthropicClient } from '@/lib/ai/settings';
 import { startOfMonth, endOfMonth, format } from 'date-fns';
 import { requireUser } from '@/lib/supabase/api-auth';
 
@@ -103,7 +103,7 @@ Règles importantes :
 - Si le Food Cost dépasse 32%, tire la sonnette d'alarme et propose des solutions (contrôle des portions, augmentation des prix, pertes).
 - Termine souvent par une question d'ouverture pour l'aider à creuser.`;
 
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const anthropic = await createAnthropicClient();
     
     const response = await createClaudeMessage(anthropic, {
       system: systemPrompt,
