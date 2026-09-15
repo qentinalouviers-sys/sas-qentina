@@ -360,6 +360,58 @@ rapprochés (important) et virement porté deux fois (critique).
 de créer l'index, c'est qu'un virement est déjà porté en double : la première requête
 du fichier les liste, à corriger depuis la page Comptes Associés avant de relancer.
 
+## 6 quinquies. Rendre le SaaS utilisable par un agent IA
+
+**Le point de départ : rien n'était appelable.** Toute l'application repose sur un
+cookie de session Supabase. Un agent n'a pas de cookie — il recevait donc un 401
+avant même d'avoir formulé sa demande. Il n'existait ni clé d'accès, ni description
+machine des données, ni contrat d'appel.
+
+**Le protocole retenu : MCP.** Hermes Agent (Nous Research) est un client MCP natif,
+comme Claude Desktop, Cursor et VS Code. Exposer un serveur MCP, c'est donc être
+utilisable par tous d'un coup, plutôt que d'écrire un connecteur par outil. Le
+serveur est écrit à la main (`/api/agent/mcp`) : le protocole tient en quatre
+méthodes, et une dépendance de plus à suivre coûterait plus cher que 120 lignes de
+JSON-RPC.
+
+**Ce qu'un agent attend d'une API, et qu'un écran ne donne pas.** Quatre règles,
+appliquées par chaque outil :
+
+| Règle | Pourquoi |
+|---|---|
+| Une **phrase de synthèse en français** dans chaque réponse | Un modèle qui reçoit `{ca_ht: 18234.55}` invente le commentaire ; celui qui reçoit la phrase la recopie |
+| Toute liste **bornée**, et qui annonce `truncated` | 4 000 lignes ne font pas déborder le contexte, elles le remplissent de bruit |
+| Les erreurs sont des **consignes** | « Mois clôturé : rouvre-le depuis le P&L ou date l'écriture du mois courant » se corrige au tour suivant ; « 500 Internal Error » fait inventer une réponse |
+| Les écritures sont **idempotentes et simulables** | Un agent réessaie. La clé d'idempotence (trajets) et l'unicité (virements) garantissent qu'un second appel ne duplique rien ; `dry_run` montre avant d'écrire |
+
+**Douze outils, dont deux seulement écrivent.** Lecture : santé du restaurant, chiffres
+du mois, TVA, factures et leurs lignes, relevé bancaire, comptes d'associés (avec le
+rapprochement), frais kilométriques (avec la couverture des justificatifs), état de
+clôture, fournisseurs. Écriture : enregistrer les trajets détectés, rattacher un
+virement au compte courant. La clôture d'un mois n'est **pas** exposée : elle fige un
+chiffre transmis au cabinet, c'est un geste humain.
+
+**La sécurité ne repose pas sur la docilité du modèle.**
+
+- La clé n'est pas stockée : seule son empreinte SHA-256 l'est. Une base qui fuite ne
+  livre aucune clé utilisable — et l'application ne peut donc pas la réafficher.
+- La **portée est portée par la clé**. Une clé de lecture ne se voit même pas proposer
+  les outils d'écriture : un modèle qui ne les voit pas ne perd pas un tour à les
+  essayer.
+- Les verrous restent en base. Un agent emprunte les mêmes chemins qu'un humain :
+  compte courant jamais débiteur, mois clôturé en lecture seule, un virement porté une
+  seule fois. Les tests le vérifient en exécutant les outils pour de vrai.
+- Chaque appel est journalisé (outil, arguments, résultat, durée) et lisible dans
+  Réglages → Agents IA. « L'agent a fait quelque chose » devient vérifiable.
+
+**Un skill livré avec.** `agent/skills/qentina-gestion/SKILL.md` (format agentskills.io)
+apprend à l'agent les règles métier et la méthode de travail. Sans lui, un modèle
+présente un coût matières estimé comme s'il était mesuré, ou insiste après un refus
+réglementaire.
+
+⚠️ **À faire une fois :** exécuter `db/migration_agent_api.sql`, puis créer une clé
+dans Réglages → Agents IA.
+
 ## 7. ⚠️ ACTION REQUISE DE TA PART
 
 1. **Exécute `db/migration_consolidee.sql`** dans Supabase → SQL Editor (une seule fois).

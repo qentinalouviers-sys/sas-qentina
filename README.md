@@ -103,6 +103,62 @@ L'écran est réservé aux comptes standards : le rôle `comptable` n'atteint ni
 Le bouton **Tester** de chaque moteur envoie un ping à un token — de quoi
 savoir qu'une clé est bonne sans l'apprendre au milieu d'un scan de facture.
 
+### Piloter QENTINA depuis un agent IA
+
+L'application expose ses données aux agents par un **serveur MCP** (Model Context
+Protocol) : `POST /api/agent/mcp`. C'est le protocole que parlent Hermes Agent,
+Claude Desktop, Cursor et VS Code.
+
+**1. Créer une clé** — Réglages → Agents IA. Elle n'est affichée qu'une fois : la
+base n'en garde que l'empreinte SHA-256. Choisir « lecture seule » tant qu'un agent
+n'a pas besoin d'écrire ; une clé de lecture ne voit même pas les outils d'écriture.
+
+**2. Brancher l'agent** (exemple Hermes Agent) :
+
+```bash
+echo 'QENTINA_AGENT_KEY=qk_live_…' >> ~/.hermes/.env
+hermes mcp add qentina --url "https://mon-app/api/agent/mcp" --auth header
+hermes mcp test qentina
+```
+
+ou dans `~/.hermes/config.yaml` :
+
+```yaml
+mcp_servers:
+  qentina:
+    url: "https://mon-app/api/agent/mcp"
+    headers:
+      Authorization: "Bearer ${env:QENTINA_AGENT_KEY}"
+    trust: untrusted   # les outils d'écriture passent par une approbation
+    timeout: 120
+```
+
+**3. Copier le skill** `agent/skills/qentina-gestion/SKILL.md` dans `~/.hermes/skills/` :
+il apprend à l'agent les règles métier (compte courant jamais débiteur, mois clôturé
+en lecture seule, barème kilométrique progressif) et la méthode — commencer par
+`get_business_health`, simuler toute écriture avec `dry_run`.
+
+**Trois portes, un seul moteur** — les contrôles (portée de la clé, validation des
+arguments, journalisation) sont partagés :
+
+| Route | Pour qui |
+|---|---|
+| `POST /api/agent/mcp` | Clients MCP (Hermes, Claude Desktop, Cursor…) |
+| `POST /api/agent/call` | `curl`, script, plugin Python — `{"tool": "...", "arguments": {...}}` |
+| `GET /api/agent/tools` | Découverte : schémas MCP **et** function-calling (`?format=functions`) |
+
+**Ce qu'un agent peut faire** : dix outils de lecture (santé du restaurant, chiffres
+du mois, TVA, factures, banque, comptes d'associés, frais kilométriques, état de
+clôture) et **deux** outils d'écriture, tous deux idempotents et simulables
+(`dry_run`) : enregistrer les trajets détectés, rattacher un virement au compte
+courant. La clôture d'un mois, la validation d'une facture et la suppression d'une
+écriture restent des gestes humains.
+
+**Ce qui le protège de lui-même** : les verrous sont en base, pas dans l'écran. Un
+agent emprunte exactement les mêmes chemins qu'un humain — compte courant jamais
+débiteur, mois clôturé en lecture seule, anti-doublon sur les virements. Chaque
+appel est journalisé (`agent_calls`) et visible dans Réglages → Agents IA.
+
 ### Base de données
 
 1. Nouveau projet : exécuter `db/schema.sql` dans Supabase → SQL Editor.
@@ -116,6 +172,7 @@ savoir qu'une clé est bonne sans l'apprendre au milieu d'un scan de facture.
 8. Clôture mensuelle : exécuter `db/migration_clotures.sql`.
 9. Rapprochement des virements associés : exécuter `db/migration_cca_rapprochement.sql`
    (un virement bancaire ne peut plus être porté deux fois au compte courant).
+10. Accès des agents IA : exécuter `db/migration_agent_api.sql` (clés d'accès + journal des appels).
 
 > ⚠️ La migration consolidée est à **ré-exécuter** après une mise à jour qui
 > ajoute une catégorie bancaire : la contrainte `CHECK` de `bank_transactions`
