@@ -389,3 +389,260 @@ export function isFuelPurchase(description: string): boolean {
   if (/(^|[^a-z])total(?!energies)([^a-z]|$)/.test(l) && !tight.includes('totalenergies')) return true;
   return false;
 }
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * Détection des déplacements et contrôle de couverture
+ *
+ * Un même achat laisse jusqu'à deux traces : la FACTURE (qui porte la date du
+ * passage en magasin) et la LIGNE BANCAIRE (qui porte la date du débit). Les
+ * additionner compterait le trajet deux fois ; n'en lire qu'une en perd une
+ * partie :
+ *
+ *   - une facture réglée en espèces ou sur la carte perso n'a AUCUNE ligne
+ *     sur le compte de la société — invisible pour la détection bancaire ;
+ *   - une course non scannée n'a aucune facture — invisible pour la détection
+ *     par factures.
+ *
+ * On construit donc une liste unique de déplacements candidats, dédupliquée
+ * par (date, destination) — exactement la clé d'idempotence de la base. Quand
+ * une facture existe à quelques jours d'un débit, c'est ELLE qui date le
+ * trajet : c'est la pièce qu'un contrôleur lira, et elle porte le jour réel.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Écart maximal, en jours, entre la date d'un débit et celle de la facture qui
+ * le justifie. Un paiement par carte est débité un à trois jours après le
+ * passage en caisse ; au-delà, on ne rapproche plus, faute de certitude.
+ */
+export const BANK_INVOICE_TOLERANCE_DAYS = 4;
+
+export interface InvoiceLike {
+  id: string;
+  date: string;
+  invoice_number: string | null;
+  supplier_name: string;
+  /** 'bank' | 'cash' | 'card_perso' — une facture hors banque n'a pas de débit. */
+  payment_method?: string | null;
+}
+
+export interface BankLineLike {
+  date: string;
+  description: string;
+}
+
+/** Un déplacement reconstitué, et les pièces qui l'attestent. */
+export interface TripCandidate {
+  /** Clé d'idempotence, identique à `mileage_trips.dedupe_key` : « 2026-08-02|metro ». */
+  key: string;
+  date: string;
+  dest: DestinationConfig;
+  invoiceId: string | null;
+  invoiceNumber: string | null;
+  bankLabel: string | null;
+  /** Vrai quand la date est celle du paiement, faute de mieux : à vérifier. */
+  approximate: boolean;
+  fromInvoice: boolean;
+  fromBank: boolean;
+}
+
+/** Décale une date ISO de `n` jours (UTC, donc sans piège d'heure d'été). */
+export function addDays(iso: string, n: number): string {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Nombre de jours de `a` à `b` (positif si `b` est postérieur). */
+export function daysBetween(a: string, b: string): number {
+  const ms = Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`);
+  return Math.round(ms / 86_400_000);
+}
+
+/**
+ * La facture la plus proche d'une date de débit, dans la fenêtre autorisée.
+ * `back` = jours d'antériorité admis (l'achat précède le débit), `forward` =
+ * marge d'avance, pour absorber un décalage de saisie d'un jour.
+ */
+function nearestInvoice(
+  invoices: InvoiceLike[],
+  date: string,
+  back: number,
+  forward: number
+): InvoiceLike | null {
+  let best: InvoiceLike | null = null;
+  let bestGap = Infinity;
+  for (const inv of invoices) {
+    const gap = daysBetween(inv.date, date); // > 0 : facture antérieure au débit
+    if (gap > back || gap < -forward) continue;
+    const distance = Math.abs(gap);
+    if (distance < bestGap) { best = inv; bestGap = distance; }
+  }
+  return best;
+}
+
+/**
+ * Reconstitue tous les déplacements de l'année à partir des factures ET du
+ * relevé. Le résultat est dédupliqué par (date, destination) : un trajet par
+ * jour et par destination, quel que soit le nombre de pièces.
+ *
+ * @param invoices  factures de l'année, ET du mois qui la précède (une facture
+ *                  de fin décembre est débitée en janvier : elle sert alors à
+ *                  dater correctement le débit, et le trajet reste sur son année).
+ * @param bankLines débits du relevé (montants négatifs déjà filtrés par l'appelant).
+ */
+export function buildTripCandidates(
+  invoices: InvoiceLike[],
+  bankLines: BankLineLike[],
+  config: MileageConfig,
+  year: number
+): TripCandidate[] {
+  const byKey = new Map<string, TripCandidate>();
+  const invoicesByDest = new Map<string, InvoiceLike[]>();
+
+  const put = (c: TripCandidate) => {
+    const existing = byKey.get(c.key);
+    if (!existing) { byKey.set(c.key, c); return; }
+    // Deux pièces pour le même déplacement : on les fusionne, sans jamais
+    // créer une seconde ligne.
+    existing.fromInvoice = existing.fromInvoice || c.fromInvoice;
+    existing.fromBank = existing.fromBank || c.fromBank;
+    existing.invoiceId = existing.invoiceId ?? c.invoiceId;
+    existing.invoiceNumber = existing.invoiceNumber ?? c.invoiceNumber;
+    existing.bankLabel = existing.bankLabel ?? c.bankLabel;
+    // Une pièce datée avec certitude lève le doute sur la date.
+    existing.approximate = existing.approximate && c.approximate;
+  };
+
+  // ── 1. Les factures : la date du passage en magasin, sans ambiguïté ──────
+  for (const inv of invoices) {
+    if (!inv?.date) continue;
+    const dest = matchDestination(inv.supplier_name || '', config.destinations);
+    if (!dest) continue;
+
+    const list = invoicesByDest.get(dest.key) ?? [];
+    list.push(inv);
+    invoicesByDest.set(dest.key, list);
+
+    if (inv.date.slice(0, 4) !== String(year)) continue;
+    put({
+      key: `${inv.date}|${dest.key}`,
+      date: inv.date,
+      dest,
+      invoiceId: inv.id,
+      invoiceNumber: inv.invoice_number ?? null,
+      bankLabel: null,
+      approximate: false,
+      fromInvoice: true,
+      fromBank: false,
+    });
+  }
+
+  // ── 2. Le relevé : plus complet, mais daté du débit ──────────────────────
+  for (const tx of bankLines) {
+    if (!tx?.date) continue;
+    const dest = matchDestination(tx.description || '', config.destinations);
+    if (!dest) continue;
+
+    const { date, exact } = tripDateFromLabel(tx.description || '', tx.date);
+
+    // La facture fait foi sur la date : quand il en existe une dans la fenêtre,
+    // le trajet prend SA date — ce qui évite au passage de créer un doublon à
+    // un jour d'écart de la ligne issue de la facture.
+    const snapped = nearestInvoice(
+      invoicesByDest.get(dest.key) ?? [],
+      date,
+      exact ? 1 : BANK_INVOICE_TOLERANCE_DAYS,
+      1
+    );
+    const tripDate = snapped ? snapped.date : date;
+    if (tripDate.slice(0, 4) !== String(year)) continue;
+
+    put({
+      key: `${tripDate}|${dest.key}`,
+      date: tripDate,
+      dest,
+      invoiceId: snapped?.id ?? null,
+      invoiceNumber: snapped?.invoice_number ?? null,
+      bankLabel: tx.description || null,
+      approximate: snapped ? false : !exact,
+      fromInvoice: Boolean(snapped),
+      fromBank: true,
+    });
+  }
+
+  return [...byKey.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/** Libellé du justificatif porté sur la note de frais. */
+export function candidateNote(c: TripCandidate): string {
+  const parts: string[] = [];
+  if (c.invoiceNumber) parts.push(`Facture n° ${c.invoiceNumber}`);
+  else if (c.fromInvoice) parts.push('Facture scannée');
+  if (c.bankLabel) parts.push(c.bankLabel);
+  if (c.approximate) parts.push('date de paiement');
+  return parts.join(' — ');
+}
+
+/** D'où vient un candidat, en clair. */
+export function candidateOrigin(c: TripCandidate): string {
+  if (c.fromInvoice && c.fromBank) return 'Facture + banque';
+  if (c.fromInvoice) return 'Facture seule';
+  return 'Banque seule';
+}
+
+export interface CoverageTrip {
+  id: string;
+  date: string;
+  destination_key: string;
+  label: string;
+  driver: string;
+  source: string;
+}
+
+export interface CoverageReport {
+  /** Tous les déplacements reconstitués sur l'année. */
+  candidates: TripCandidate[];
+  /** Ceux qui n'ont pas de trajet enregistré : ce sont les oublis. */
+  missing: TripCandidate[];
+  /** Trajets automatiques qu'aucune pièce ne justifie (date corrigée, faux positif…). */
+  unsupported: CoverageTrip[];
+  /** Factures dont le fournisseur n'a pas pu être identifié : non rattachables. */
+  unidentifiedInvoices: number;
+  counts: { both: number; invoiceOnly: number; bankOnly: number; covered: number };
+}
+
+/**
+ * Compare ce que les pièces racontent à ce qui est enregistré.
+ *
+ * Volontairement indépendant du conducteur sélectionné : la clé d'unicité en
+ * base ne l'est pas non plus. Un trajet saisi au nom de Justine couvre bien la
+ * facture, même si l'écran affiche Yohan.
+ */
+export function analyseCoverage(
+  candidates: TripCandidate[],
+  trips: CoverageTrip[],
+  year: number,
+  unidentifiedInvoices = 0
+): CoverageReport {
+  const yearTrips = trips.filter(t => t.date?.startsWith(String(year)));
+  const tripKeys = new Set(yearTrips.map(t => `${t.date}|${t.destination_key}`));
+  const candidateKeys = new Set(candidates.map(c => c.key));
+
+  const missing = candidates.filter(c => !tripKeys.has(c.key));
+  const unsupported = yearTrips.filter(
+    t => t.source !== 'manuel' && !candidateKeys.has(`${t.date}|${t.destination_key}`)
+  );
+
+  return {
+    candidates,
+    missing,
+    unsupported,
+    unidentifiedInvoices,
+    counts: {
+      both: candidates.filter(c => c.fromInvoice && c.fromBank).length,
+      invoiceOnly: candidates.filter(c => c.fromInvoice && !c.fromBank).length,
+      bankOnly: candidates.filter(c => !c.fromInvoice && c.fromBank).length,
+      covered: candidates.length - missing.length,
+    },
+  };
+}

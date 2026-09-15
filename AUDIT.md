@@ -272,6 +272,38 @@ un véhicule de tourisme, pas une camionnette « CTTE ». Le cas qui aurait impo
 lieu du barème ne s'applique donc pas. La puissance fiscale (P.6 = 7) est celle qui était déjà
 retenue : aucun montant n'est à recalculer.
 
+### Toutes les factures Metro et Mozzalat sont-elles comptées ? (contrôle de couverture)
+
+Le module ne lisait qu'**une** source à la fois — le relevé bancaire par défaut. C'était prudent
+(cumuler facture et débit compterait le trajet deux fois), mais trois courses réelles passaient à
+la trappe sans que rien ne le dise :
+
+| Cas | Ce qui se passait |
+|---|---|
+| Facture réglée en **espèces** ou sur la **carte perso** | Aucune ligne sur le compte de la société : la détection « banque » ne peut pas la voir. L'indemnité n'était jamais réclamée. |
+| Achat **réglé à terme** débité après le 15 février | La fenêtre de lecture bancaire s'arrêtait là. Une facture de décembre soldée en mars était perdue. |
+| Facture **sans fournisseur identifié** | Ignorée en silence par la détection sur factures. |
+
+**Ce qui change.** Les deux sources sont désormais lues *ensemble*, et fusionnées sur la clé
+« jour + destination » — celle-là même qui sert d'index anti-doublon en base. Un achat vu par sa
+facture ET par son débit ne produit donc qu'une ligne, par construction. Quand une facture existe à
+quelques jours d'un débit, c'est **elle** qui date le trajet : c'est la pièce qu'un contrôleur lira,
+et elle porte le jour du passage en magasin, pas celui du paiement. Au passage, les trajets détectés
+depuis la banque citent maintenant le numéro de la facture correspondante sur la note de frais.
+
+Un bloc **« Contrôle de couverture »** affiche, pour l'année : combien de déplacements sont attestés
+par une facture, par le relevé, ou par les deux ; ceux qui n'ont **pas** de trajet enregistré (avec
+un bouton pour les ajouter d'un clic) ; et l'inverse — les trajets automatiques qu'aucune pièce ne
+justifie plus, qui n'ont rien à faire sur une note de frais. La fenêtre bancaire va maintenant
+jusqu'à fin de l'année suivante : un règlement à terme est rattaché à l'exercice de l'achat, jamais
+à celui du débit.
+
+**Un doublon de compte courant corrigé au passage.** « Porter au compte courant » créait un mouvement
+même quand plus aucun trajet n'était à rattacher — cas atteint dès qu'on modifie une distance ou le
+barème après coup. Le mouvement ne se rattachant à rien, le « déjà porté » ne bougeait pas, l'écart
+restait affiché, et **chaque clic recréditait l'associé**. Le bouton refuse désormais ce cas et
+renvoie vers une saisie manuelle tracée.
+
 ## 7. ⚠️ ACTION REQUISE DE TA PART
 
 1. **Exécute `db/migration_consolidee.sql`** dans Supabase → SQL Editor (une seule fois).

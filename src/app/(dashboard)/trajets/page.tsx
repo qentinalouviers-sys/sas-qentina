@@ -10,9 +10,11 @@ import {
 } from 'lucide-react';
 import { KpiCard, SectionHeader, Modal, EmptyState, LoadingPage } from '@/components/ui';
 import {
-  DEFAULT_CONFIG, mergeConfig, computeTotals, allocateShares, matchDestination,
-  cvLabel, driverLabel, tripDateFromLabel,
+  DEFAULT_CONFIG, mergeConfig, computeTotals, allocateShares,
+  buildTripCandidates, analyseCoverage, candidateNote, candidateOrigin,
+  cvLabel, driverLabel,
   type MileageConfig, type CvBracket, type DetectionSource,
+  type TripCandidate, type InvoiceLike, type BankLineLike,
 } from '@/lib/mileage';
 
 interface Trip {
@@ -53,9 +55,10 @@ const EMPTY_FORM = {
  * désormais la cause, et à défaut on affiche l'erreur brute plutôt que de
  * la masquer.
  */
-function detectionErrorMessage(e: any): string {
-  const code = e?.code as string | undefined;
-  const msg = String(e?.message || '');
+function detectionErrorMessage(e: unknown): string {
+  const err = (e ?? {}) as { code?: string; message?: string };
+  const code = err.code;
+  const msg = String(err.message || '');
 
   // 42P01 undefined_table — la migration n'a pas été passée.
   if (code === '42P01' || msg.includes('mileage_trips')) {
@@ -85,6 +88,16 @@ export default function TrajetsPage() {
   // savoir avant d'essayer, et dire ce qui a été laissé de côté.
   const [closedMonths, setClosedMonths] = useState<Set<string>>(() => new Set());
   const [message, setMessage] = useState<{ type: 'success' | 'warning'; text: string } | null>(null);
+
+  // Pièces justificatives de l'année : factures scannées ET lignes bancaires.
+  // Les deux sont lues quelle que soit la source de détection retenue — c'est
+  // exactement ce qui permet de dire ce qu'une source seule laisse passer.
+  const [invoices, setInvoices] = useState<InvoiceLike[]>([]);
+  const [bankLines, setBankLines] = useState<BankLineLike[]>([]);
+  const [unidentifiedInvoices, setUnidentifiedInvoices] = useState(0);
+  const [loadingSources, setLoadingSources] = useState(true);
+  const [sourcesError, setSourcesError] = useState<string | null>(null);
+  const [fixing, setFixing] = useState(false);
 
   // ── Chargement ────────────────────────────────────────────────────────────
   const loadData = useCallback(async () => {
@@ -126,150 +139,204 @@ export default function TrajetsPage() {
     if (error) setMessage({ type: 'warning', text: 'Enregistrement des réglages impossible.' });
   };
 
+  /**
+   * Factures et lignes bancaires de l'année.
+   *
+   * La fenêtre bancaire déborde volontairement sur l'année suivante : un achat
+   * réglé à terme est débité des mois plus tard (une ligne « Metro 27/03 » a
+   * été débitée le 1ᵉʳ juin), et c'est la date lue dans le libellé qui rattache
+   * le trajet à son exercice, pas celle du débit. L'ancienne borne au 15 février
+   * perdait ces règlements-là en silence.
+   *
+   * Les factures débordent d'un mois en arrière : elles servent à dater
+   * correctement un débit de janvier qui solde un achat de fin décembre.
+   */
+  const loadSources = useCallback(async (targetYear: number) => {
+    setLoadingSources(true);
+    setSourcesError(null);
+    try {
+      const supabase = createClient();
+      const [invoiceRows, bankRows] = await Promise.all([
+        fetchAllRows<{ id: string; date: string; invoice_number: string | null; payment_method: string | null; supplier: unknown }>(
+          (f0, f1) => supabase
+            .from('invoices')
+            .select('id, date, invoice_number, payment_method, supplier:suppliers(name)')
+            .gte('date', `${targetYear - 1}-12-01`)
+            .lte('date', `${targetYear}-12-31`)
+            .order('date')
+            .range(f0, f1)),
+        fetchAllRows<{ date: string; description: string | null }>(
+          (f0, f1) => supabase
+            .from('bank_transactions')
+            .select('date, description')
+            .lt('amount', 0)
+            .gte('date', `${targetYear}-01-01`)
+            .lte('date', `${targetYear + 1}-12-31`)
+            .order('date')
+            .range(f0, f1)),
+      ]);
+
+      setInvoices(invoiceRows.map(r => ({
+        id: r.id,
+        date: r.date,
+        invoice_number: r.invoice_number,
+        payment_method: r.payment_method,
+        supplier_name: (r.supplier as { name?: string } | null)?.name || '',
+      })));
+      // Une facture dont le fournisseur n'a pas été identifié ne peut être
+      // rattachée à aucune destination : on la compte pour le dire, plutôt que
+      // de la laisser disparaître du contrôle.
+      setUnidentifiedInvoices(invoiceRows.filter(r =>
+        r.date?.startsWith(String(targetYear)) && !(r.supplier as { name?: string } | null)?.name
+      ).length);
+      setBankLines(bankRows.map(r => ({ date: r.date, description: r.description || '' })));
+    } catch (e) {
+      console.error('Lecture des pièces:', e);
+      setSourcesError(detectionErrorMessage(e));
+    } finally {
+      setLoadingSources(false);
+    }
+  }, []);
+
+  useEffect(() => { loadSources(year); }, [loadSources, year]);
+
+  /** « Metro ou Mozzalat » — les destinations sont paramétrables, le message aussi. */
+  const destinationNames = useMemo(() => {
+    const names = config.destinations.map(d => d.label.split('—')[0].trim()).filter(Boolean);
+    return names.length > 1
+      ? `${names.slice(0, -1).join(', ')} ou ${names[names.length - 1]}`
+      : names[0] || 'fournisseur';
+  }, [config.destinations]);
+
+  // Tous les déplacements que les pièces permettent de reconstituer — factures
+  // et banque confondues, dédupliqués par jour et par destination.
+  const candidates = useMemo(
+    () => buildTripCandidates(invoices, bankLines, config, year),
+    [invoices, bankLines, config, year]
+  );
+
+  // Ce qui est enregistré, comparé à ce que les pièces racontent.
+  const coverage = useMemo(
+    () => analyseCoverage(candidates, trips, year, unidentifiedInvoices),
+    [candidates, trips, year, unidentifiedInvoices]
+  );
+
+  /**
+   * Enregistre une liste de déplacements.
+   *
+   * La clé d'idempotence (jour + destination) rend l'opération rejouable : la
+   * relancer n'ajoute jamais de doublon, et `select()` après un
+   * « ON CONFLICT DO NOTHING » ne renvoie que les lignes réellement insérées —
+   * le compte annoncé est donc exact, sans recompter la table.
+   */
+  const insertCandidates = async (
+    list: TripCandidate[]
+  ): Promise<{ added: number; skippedClosed: number }> => {
+    // Un mois clôturé n'accepte plus d'écriture : on laisse ces trajets de côté
+    // et on le dit, plutôt que de faire échouer l'opération entière.
+    const open = list.filter(c => !closedMonths.has(c.date.slice(0, 7)));
+    const skippedClosed = list.length - open.length;
+    if (open.length === 0) return { added: 0, skippedClosed };
+
+    const supabase = createClient();
+    const { data, error } = await supabase
+      .from('mileage_trips')
+      .upsert(
+        open.map(c => ({
+          date: c.date,
+          destination_key: c.dest.key,
+          label: c.dest.label,
+          distance_km: c.dest.km,
+          toll_amount: c.dest.toll,
+          driver,
+          invoice_id: c.invoiceId,
+          source: 'auto',
+          note: candidateNote(c) || null,
+          dedupe_key: c.key,
+        })),
+        { onConflict: 'dedupe_key', ignoreDuplicates: true }
+      )
+      .select('id');
+
+    if (error) throw error;
+    await loadData();
+    return { added: data?.length ?? 0, skippedClosed };
+  };
+
   // ── Détection automatique ─────────────────────────────────────────────────
+  /**
+   * Crée les trajets à partir de la source configurée.
+   *
+   * La source décide de ce qu'on ENREGISTRE ; le contrôle de couverture, lui,
+   * regarde toujours les deux et signale ce que la source retenue laisse de
+   * côté — une facture payée en espèces ou sur la carte perso n'a aucune ligne
+   * bancaire, et resterait invisible sans cela.
+   */
   const detectTrips = async () => {
     setDetecting(true);
     setMessage(null);
     try {
-      const supabase = createClient();
       const fromBank = config.detectionSource === 'banque';
+      const selected = candidates.filter(c => (fromBank ? c.fromBank : c.fromInvoice));
 
-      // Un trajet par JOUR et par DESTINATION : deux achats Metro le même jour
-      // = un seul aller-retour (choix validé avec le restaurateur).
-      const candidates = new Map<string, {
-        date: string; dest: typeof config.destinations[0];
-        invoiceId: string | null; note: string | null;
-      }>();
-      let approximate = 0;
-
-      if (fromBank) {
-        // On ne retient que les DÉBITS : un encaissement n'est pas un achat.
-        // Paginé : un exercice dépasse vite les 1 000 lignes que Supabase rend
-        // sans prévenir. La fenêtre déborde sur janvier–février de l'année
-        // suivante : un achat du 28 décembre est débité en janvier, et sa date
-        // d'achat (lue dans le libellé) le rattache bien à l'année demandée.
-        const txs = await fetchAllRows<{ date: string; description: string | null; amount: number | null }>(
-          (f0, f1) => supabase
-            .from('bank_transactions')
-            .select('date, description, amount')
-            .lt('amount', 0)
-            .gte('date', `${year}-01-01`)
-            .lte('date', `${year + 1}-02-15`)
-            .order('date')
-            .range(f0, f1));
-
-        for (const tx of txs) {
-          const dest = matchDestination(tx.description || '', config.destinations);
-          if (!dest || !tx.date) continue;
-
-          // La date d'écriture n'est pas celle du déplacement — voir
-          // tripDateFromLabel : un règlement à terme arrive des mois après.
-          const { date, exact } = tripDateFromLabel(tx.description || '', tx.date);
-          if (date.slice(0, 4) !== String(year)) continue;
-          if (!exact) approximate++;
-
-          const key = `${date}|${dest.key}`;
-          if (!candidates.has(key)) {
-            candidates.set(key, {
-              date,
-              dest,
-              invoiceId: null,
-              note: `${tx.description}${exact ? '' : ' — date de paiement'}`,
-            });
-          }
-        }
-      } else {
-        const invoices = await fetchAllRows<{ id: string; date: string; invoice_number: string | null; supplier: unknown }>(
-          (f0, f1) => supabase
-            .from('invoices')
-            .select('id, date, invoice_number, supplier:suppliers(name)')
-            .gte('date', `${year}-01-01`)
-            .lte('date', `${year}-12-31`)
-            .order('date')
-            .range(f0, f1));
-
-        for (const inv of invoices) {
-          const supplierName = (inv.supplier as any)?.name || '';
-          if (!supplierName || !inv.date) continue;
-
-          const dest = matchDestination(supplierName, config.destinations);
-          if (!dest) continue;
-
-          const key = `${inv.date}|${dest.key}`;
-          if (!candidates.has(key)) {
-            candidates.set(key, {
-              date: inv.date,
-              dest,
-              invoiceId: inv.id,
-              note: inv.invoice_number ? `Facture n° ${inv.invoice_number}` : null,
-            });
-          }
-        }
-      }
-
-      if (candidates.size === 0) {
+      if (selected.length === 0) {
         setMessage({
           type: 'warning',
           text: fromBank
-            ? `Aucune opération Metro ou Mozzalat dans le relevé ${year}. Importe ton relevé depuis la page Banque.`
-            : `Aucune facture Metro ou Mozzalat trouvée sur ${year}. Scanne-les, ou bascule la détection sur le relevé bancaire dans les réglages.`,
+            ? `Aucune opération ${destinationNames} dans le relevé ${year}. Importe ton relevé depuis la page Banque.`
+            : `Aucune facture ${destinationNames} trouvée sur ${year}. Scanne-les, ou bascule la détection sur le relevé bancaire dans les réglages.`,
         });
         return;
       }
 
-      // Un mois clôturé n'accepte plus d'écriture : on laisse ces trajets de
-      // côté et on le dit, plutôt que de faire échouer toute la détection.
-      let skippedClosed = 0;
-      for (const [key, c] of [...candidates.entries()]) {
-        if (closedMonths.has(c.date.slice(0, 7))) { candidates.delete(key); skippedClosed++; }
-      }
-      if (candidates.size === 0) {
-        setMessage({ type: 'warning', text: `${skippedClosed} déplacement(s) trouvé(s), tous dans des mois clôturés : rouvre le mois depuis le P&L pour les ajouter.` });
-        return;
-      }
+      const approximate = selected.filter(c => c.approximate).length;
+      const { added, skippedClosed } = await insertCandidates(selected);
 
-      const rows = [...candidates.entries()].map(([dedupeKey, c]) => ({
-        date: c.date,
-        destination_key: c.dest.key,
-        label: c.dest.label,
-        distance_km: c.dest.km,
-        toll_amount: c.dest.toll,
-        driver,
-        invoice_id: c.invoiceId,
-        source: 'auto',
-        note: c.note,
-        dedupe_key: dedupeKey,
-      }));
-
-      // ignoreDuplicates : l'index unique sur dedupe_key garantit qu'une
-      // relance de la détection n'ajoute jamais de doublon.
-      const before = trips.length;
-      const { error: insertError } = await supabase
-        .from('mileage_trips')
-        .upsert(rows, { onConflict: 'dedupe_key', ignoreDuplicates: true });
-
-      if (insertError) throw insertError;
-
-      await loadData();
-      const { count: afterCount } = await supabase.from('mileage_trips').select('id', { count: 'exact', head: true });
-      const added = (afterCount ?? before) - before;
       const origine = fromBank ? 'ton relevé bancaire' : 'tes factures';
-      const reserve = (approximate > 0
-        ? ` ${approximate} sont datés du jour du paiement, faute de date d'achat dans le libellé : vérifie-les.`
-        : '') + (skippedClosed > 0
-        ? ` ${skippedClosed} déplacement(s) laissé(s) de côté : mois clôturé(s).`
-        : '');
+      const ignored = candidates.length - selected.length;
+      const reserve =
+        (approximate > 0
+          ? ` ${approximate} sont datés du jour du paiement, faute de date d'achat dans le libellé ou de facture correspondante : vérifie-les.`
+          : '')
+        + (skippedClosed > 0 ? ` ${skippedClosed} laissé(s) de côté : mois clôturé(s).` : '')
+        + (ignored > 0
+          ? ` ${ignored} déplacement(s) ne sont attestés que par l'autre source : vois le contrôle de couverture ci-dessous.`
+          : '');
+
       setMessage({
-        type: approximate > 0 || skippedClosed > 0 ? 'warning' : 'success',
+        type: approximate > 0 || skippedClosed > 0 || ignored > 0 ? 'warning' : 'success',
         text: added > 0
           ? `${added} trajet${added > 1 ? 's' : ''} ajouté${added > 1 ? 's' : ''} depuis ${origine} ${year}.${reserve}`
-          : `Aucun nouveau trajet : les ${candidates.size} déplacements de ${year} sont déjà enregistrés.`,
+          : `Aucun nouveau trajet : les ${selected.length} déplacements de ${year} sont déjà enregistrés.${reserve}`,
       });
     } catch (e: any) {
       console.error('Détection trajets:', e);
       setMessage({ type: 'warning', text: detectionErrorMessage(e) });
     } finally {
       setDetecting(false);
+    }
+  };
+
+  /**
+   * Rattrape les déplacements attestés par une pièce mais sans trajet — quelle
+   * que soit la source qui les a vus.
+   */
+  const addMissingTrips = async () => {
+    if (coverage.missing.length === 0) return;
+    setFixing(true);
+    setMessage(null);
+    try {
+      const { added, skippedClosed } = await insertCandidates(coverage.missing);
+      setMessage({
+        type: skippedClosed > 0 ? 'warning' : 'success',
+        text: `${added} trajet${added > 1 ? 's' : ''} ajouté${added > 1 ? 's' : ''} au nom de ${driverLabel(driver)}.`
+          + (skippedClosed > 0 ? ` ${skippedClosed} laissé(s) de côté : mois clôturé(s), à rouvrir depuis le P&L.` : ''),
+      });
+    } catch (e: any) {
+      console.error('Rattrapage trajets:', e);
+      setMessage({ type: 'warning', text: detectionErrorMessage(e) });
+    } finally {
+      setFixing(false);
     }
   };
 
@@ -364,7 +431,22 @@ export default function TrajetsPage() {
   const recordToCca = async () => {
     if (remaining <= 0) return;
     const unrecorded = yearTrips.filter(t => !t.cca_movement_id);
-    if (unrecorded.length === 0 && remaining <= 0) return;
+
+    // Tous les trajets sont déjà rattachés à un mouvement : l'écart ne vient
+    // pas d'un déplacement nouveau, mais d'un réglage modifié après coup
+    // (barème, distance, péage). Un mouvement créé ici ne pourrait se rattacher
+    // à aucun trajet : « déjà porté » ne bougerait pas, l'écart resterait
+    // affiché, et chaque clic recréditerait l'associé — le compte courant
+    // gonflerait sans limite et sans justificatif.
+    if (unrecorded.length === 0) {
+      setMessage({
+        type: 'warning',
+        text: `Tous les trajets ${year} sont déjà portés au compte courant. L'écart de `
+          + `${formatCurrency(remaining)} vient d'un réglage modifié depuis (barème, distance ou péage) : `
+          + `saisis-le à la main comme apport « frais perso » depuis Comptes Associés, pour qu'il reste traçable.`,
+      });
+      return;
+    }
 
     setRecording(true);
     setMessage(null);
@@ -400,14 +482,13 @@ export default function TrajetsPage() {
 
       if (error || !movement) throw error ?? new Error('Insertion impossible');
 
-      // On rattache les trajets non encore portés à ce mouvement.
-      if (unrecorded.length > 0) {
-        const { error: linkError } = await supabase
-          .from('mileage_trips')
-          .update({ cca_movement_id: movement.id })
-          .in('id', unrecorded.map(t => t.id));
-        if (linkError) throw linkError;
-      }
+      // On rattache les trajets non encore portés à ce mouvement : c'est ce lien
+      // qui empêche de créditer deux fois la même indemnité.
+      const { error: linkError } = await supabase
+        .from('mileage_trips')
+        .update({ cca_movement_id: movement.id })
+        .in('id', unrecorded.map(t => t.id));
+      if (linkError) throw linkError;
 
       await loadData();
       setMessage({
@@ -436,6 +517,10 @@ export default function TrajetsPage() {
   }, [trips]);
 
   const driverName = driverLabel(driver);
+  const otherDriver = driver === 'justine' ? 'yohan' : 'justine';
+  const otherDriverTrips = trips.filter(
+    t => t.date?.startsWith(String(year)) && t.driver === otherDriver
+  ).length;
   const ownerName = driverLabel(config.vehicle.owner);
   /** Le conducteur n'est pas le titulaire de la carte grise. */
   const ownerMismatch = config.vehicle.owner !== driver;
@@ -571,6 +656,149 @@ export default function TrajetsPage() {
             </button>
           </div>
         )}
+
+        {/* ── Contrôle de couverture ─────────────────────────────────────── */}
+        <div className="card no-print" style={{ marginBottom: 24 }}>
+          <SectionHeader
+            title="Contrôle de couverture"
+            subtitle="Croise factures scannées et relevé bancaire : tout déplacement attesté par une pièce doit avoir son trajet"
+            icon={<Receipt size={18} />}
+          />
+
+          {loadingSources ? (
+            <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Lecture des factures et du relevé…</div>
+          ) : sourcesError ? (
+            <div className="alert alert-warning"><AlertTriangle size={16} /><span>{sourcesError}</span></div>
+          ) : candidates.length === 0 ? (
+            <EmptyState
+              icon={<Receipt size={36} />}
+              text={`Aucune facture ni opération ${destinationNames} sur ${year}. Scanne tes factures ou importe ton relevé bancaire.`}
+            />
+          ) : (
+            <>
+              <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', fontSize: 13, marginBottom: 14 }}>
+                <span><strong>{coverage.counts.covered}</strong> / {candidates.length} déplacements couverts</span>
+                <span style={{ color: 'var(--text-muted)' }}>
+                  Facture + banque : <strong>{coverage.counts.both}</strong> ·
+                  {' '}Facture seule : <strong>{coverage.counts.invoiceOnly}</strong> ·
+                  {' '}Banque seule : <strong>{coverage.counts.bankOnly}</strong>
+                </span>
+              </div>
+
+              {/* Une facture réglée en espèces ou sur la carte perso n'a aucune
+                  ligne bancaire : la détection « banque » ne la verra jamais. */}
+              {config.detectionSource === 'banque' && coverage.counts.invoiceOnly > 0 && (
+                <div className="alert alert-warning" style={{ marginBottom: 12 }}>
+                  <AlertTriangle size={16} />
+                  <span>
+                    <strong>{coverage.counts.invoiceOnly}</strong> facture(s) {destinationNames} n&apos;ont aucune
+                    ligne bancaire (réglées en espèces ou sur une carte perso, ou relevé incomplet) :
+                    la détection « banque » ne peut pas les voir. Le bouton ci-dessous les ajoute quand même.
+                  </span>
+                </div>
+              )}
+              {config.detectionSource === 'factures' && coverage.counts.bankOnly > 0 && (
+                <div className="alert alert-warning" style={{ marginBottom: 12 }}>
+                  <AlertTriangle size={16} />
+                  <span>
+                    <strong>{coverage.counts.bankOnly}</strong> opération(s) bancaire(s) {destinationNames} n&apos;ont
+                    pas de facture scannée : la détection « factures » ne peut pas les voir.
+                  </span>
+                </div>
+              )}
+
+              {coverage.missing.length === 0 ? (
+                <div className="alert alert-success">
+                  <Check size={16} />
+                  <span>
+                    Les {candidates.length} déplacements {year} attestés par une facture ou par le relevé
+                    ont tous leur trajet enregistré.
+                  </span>
+                </div>
+              ) : (
+                <>
+                  <div className="alert alert-warning" style={{ marginBottom: 12 }}>
+                    <AlertTriangle size={16} />
+                    <span>
+                      <strong>{coverage.missing.length}</strong> déplacement(s) attesté(s) par une pièce
+                      n&apos;ont pas de trajet enregistré : l&apos;indemnité correspondante n&apos;est pas réclamée.
+                    </span>
+                    <button
+                      className="btn btn-primary btn-sm"
+                      style={{ marginLeft: 'auto', flexShrink: 0 }}
+                      onClick={addMissingTrips}
+                      disabled={fixing}
+                    >
+                      <Plus size={15} />
+                      {fixing ? 'Ajout…' : `Ajouter (${driverName})`}
+                    </button>
+                  </div>
+                  <div className="table-container">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Date</th>
+                          <th>Destination</th>
+                          <th>Attesté par</th>
+                          <th>Justificatif</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {coverage.missing.slice(0, 15).map(c => (
+                          <tr key={c.key}>
+                            <td style={{ whiteSpace: 'nowrap' }}>{formatDate(c.date)}{c.approximate && ' ≈'}</td>
+                            <td style={{ fontWeight: 600 }}>{c.dest.label}</td>
+                            <td style={{ fontSize: 12 }}>{candidateOrigin(c)}</td>
+                            <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>{candidateNote(c) || '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {coverage.missing.length > 15 && (
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 6 }}>
+                      … et {coverage.missing.length - 15} autre(s). Une date suivie de « ≈ » est celle du
+                      paiement : aucune facture ni date d&apos;achat ne permet de la confirmer.
+                    </div>
+                  )}
+                </>
+              )}
+
+              {/* L'inverse : un trajet qu'aucune pièce ne justifie. */}
+              {coverage.unsupported.length > 0 && (
+                <div className="alert alert-warning" style={{ marginTop: 12 }}>
+                  <AlertTriangle size={16} />
+                  <span>
+                    <strong>{coverage.unsupported.length}</strong> trajet(s) détecté(s) automatiquement ne
+                    correspondent plus à aucune facture ni ligne bancaire
+                    ({coverage.unsupported.slice(0, 4).map(t => formatDate(t.date)).join(', ')}
+                    {coverage.unsupported.length > 4 ? '…' : ''}) : pièce supprimée, date corrigée depuis,
+                    ou fournisseur reconnu à tort. Sans justificatif, ils sont à retirer de la note de frais.
+                  </span>
+                </div>
+              )}
+
+              {/* La clé d'unicité en base ne connaît pas le conducteur : un trajet
+                  saisi au nom de l'autre associé couvre la pièce, mais ne figure
+                  pas sur la note de frais affichée. Autant le dire. */}
+              {otherDriverTrips > 0 && (
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 12 }}>
+                  {otherDriverTrips} trajet(s) {year} sont enregistrés au nom de {driverLabel(otherDriver)} :
+                  ils comptent comme couverts ici, mais figurent sur SA note de frais, pas sur celle
+                  de {driverName}.
+                </div>
+              )}
+
+              {coverage.unidentifiedInvoices > 0 && (
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 12 }}>
+                  {coverage.unidentifiedInvoices} facture(s) {year} sans fournisseur identifié : elles ne
+                  peuvent être rattachées à aucune destination. Corrige-les depuis la page Factures si
+                  l&apos;une d&apos;elles vient de {destinationNames}.
+                </div>
+              )}
+            </>
+          )}
+        </div>
 
         {/* ── Note de frais (écran + impression) ─────────────────────────── */}
         <div className="expense-report">
