@@ -29,7 +29,10 @@ import { checkInvoice, assertInvoiceAccepted } from '../src/lib/invoice-checks.t
 import {
   repairMojibake, normalizeName, findSupplierMatch, matchIngredient, unmatchedDesignations,
 } from '../src/lib/referentiel.ts';
-import { checkCcaOperation, firstDebitDay } from '../src/lib/cca.ts';
+import {
+  checkCcaOperation, firstDebitDay,
+  matchAssociate, looksLikeTransfer, mergeTransferTerms, analyseCcaReconciliation,
+} from '../src/lib/cca.ts';
 import { inventorySessions, sessionAtBoundary, computeCogs } from '../src/lib/cogs.ts';
 import { monthBounds, recentMonths, isMonthOver } from '../src/lib/months.ts';
 import { buildEntries, unbalancedEntries, toFec } from '../src/lib/fec.ts';
@@ -261,6 +264,8 @@ const faits = (o = {}) => ({
   ccaBalances: [{ associe: 'yohan', balance: 1200 }],
   tripsNotInCca: { count: 0 },
   tripsInPeriod: 0,
+  ccaUnlinkedTransfers: { count: 0, amount: 0 },
+  ccaDoubleLinked: { count: 0 },
   fuelDebits: { count: 0, amount: 0 },
   unmatchedDesignations: { count: 0, sample: [] },
   legacyMaskedItems: 0,
@@ -437,6 +442,11 @@ silence('compte courant créditeur', { ccaBalances: [{ associe: 'yohan', balance
 declenche('facture au 1er janvier', { suspectDateInvoices: { count: 3, sample: ['2024-01-01'] } }, 'factures-date-suspecte');
 declenche('fournisseur mal encodé', { mojibakeSuppliers: ['MÃ©tro'] }, 'fournisseurs-mojibake');
 declenche('trajets hors compte courant', { tripsNotInCca: { count: 7 } }, 'trajets-hors-cca');
+declenche('virements associés non rapprochés',
+  { ccaUnlinkedTransfers: { count: 2, amount: 800 } }, 'cca-virements-non-rapproches');
+silence('aucun virement en attente : silence',
+  { ccaUnlinkedTransfers: { count: 0, amount: 0 } }, 'cca-virements-non-rapproches');
+declenche('virement porté deux fois', { ccaDoubleLinked: { count: 1 } }, 'cca-virements-en-double');
 
 // Ordre de traitement : le CA d'abord, il rend faux tout ce qui le suit.
 const ordre = detectInterventions(faits({ caSquareTtc: 8000, foodCostPercent: 62, tripsNotInCca: { count: 7 } }));
@@ -890,6 +900,75 @@ verifie('creux ancien détecté', firstDebitDay(CREUX, 'yohan', '2026-01-01')?.d
 verifie('remboursement postérieur au creux : accepté quand même',
   checkCcaOperation(CREUX, { type: 'insert', movement: { date: '2026-04-01', associe: 'yohan', sens: 'remboursement', montant: 500 } }), null);
 
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Compte courant d'associé : rapprochement des virements sortants
+//
+//  Un apport s'enregistre tout seul ; un remboursement n'existe que si le
+//  virement sortant est rattaché. Ces contrôles figent ce qui doit être vu —
+//  et ce qui ne doit surtout pas être attribué au hasard.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── CCA : rapprochement bancaire ──');
+
+const TERMES = mergeTransferTerms({ justine: ['justine'], yohan: ['yohan', 'de faria'] });
+
+verifie('prénom reconnu', matchAssociate('VIR SEPA JUSTINE', TERMES), 'justine');
+verifie('nom de famille configuré reconnu', matchAssociate('VIR SEPA M DE FARIA', TERMES), 'yohan');
+verifie('libellé collé par la banque', matchAssociate('VIRDEFARIAYOHAN', TERMES), 'yohan');
+verifie('accents et casse ignorés', matchAssociate('virement justine dupré', TERMES), 'justine');
+verifie('fournisseur : aucun associé', matchAssociate('VIR SEPA METRO FRANCE', TERMES), null);
+verifie('terme partagé : personne, plutôt que le mauvais compte',
+  matchAssociate('VIR SEPA JUSTINE DE FARIA', TERMES), null);
+verifie('termes vides → prénoms par défaut', mergeTransferTerms({ yohan: [] }).yohan[0], 'yohan');
+verifie('un virement se reconnaît', looksLikeTransfer('VIR SEPA EMIS 12345'), true);
+verifie('un prélèvement n\'en est pas un', looksLikeTransfer('PRLV SEPA EDF'), false);
+
+const MVTS = [
+  { id: 'm1', date: '2026-03-01', associe: 'yohan', sens: 'apport', montant: 2000 },
+  { id: 'm2', date: '2026-04-02', associe: 'yohan', sens: 'remboursement', montant: 500,
+    bank_transaction_id: 'b1', rapproche_banque: true },
+  { id: 'm3', date: '2026-04-20', associe: 'yohan', sens: 'remboursement', montant: 100,
+    bank_transaction_id: null, rapproche_banque: true },
+];
+const LIGNES_CCA = [
+  { id: 'b1', date: '2026-04-02', description: 'VIR SEPA YOHAN', amount: -500 },
+  { id: 'b2', date: '2026-05-04', description: 'VIR SEPA M DE FARIA', amount: -300 },
+  { id: 'b3', date: '2026-05-06', description: 'VIR SEPA METRO FRANCE', amount: -420 },
+  { id: 'b4', date: '2026-05-07', description: 'VIR SEPA URSSAF', amount: -900 },
+  { id: 'b5', date: '2026-05-09', description: 'VIR SEPA SCI BEL AIR', amount: -1332 },
+  { id: 'b6', date: '2026-05-10', description: 'VIR RECU JUSTINE', amount: 800 },
+];
+const RAP = analyseCcaReconciliation(MVTS, LIGNES_CCA, TERMES, ['Metro France']);
+
+verifie('virement non rapproché détecté', RAP.unlinked.length, 1);
+verifie('… le bon', RAP.unlinked[0]?.line.id, 'b2');
+verifie('… au bon associé', RAP.unlinked[0]?.associe, 'yohan');
+verifie('… pour le bon montant', RAP.unlinkedTotal.yohan, 300);
+verifie('virement déjà rattaché : ignoré', RAP.unlinked.some(u => u.line.id === 'b1'), false);
+verifie('encaissement : jamais un remboursement', RAP.unlinked.some(u => u.line.id === 'b6'), false);
+verifie('virement fournisseur connu : écarté du bruit', RAP.unidentified.some(l => l.id === 'b3'), false);
+verifie('URSSAF : écarté du bruit', RAP.unidentified.some(l => l.id === 'b4'), false);
+verifie('virement inconnu : à trancher à la main', RAP.unidentified.map(l => l.id).join(), 'b5');
+verifie('drapeau « rapproché » sans lien : signalé', RAP.flaggedWithoutLink.map(m => m.id).join(), 'm3');
+verifie('remboursement sans ligne bancaire : signalé', RAP.refundsWithoutBank.map(m => m.id).join(), 'm3');
+verifie('aucun doublon ici', RAP.doubleLinked.length, 0);
+
+// Le cas qui rendait un associé débiteur sans qu'il ait rien reçu : deux
+// mouvements sur le MÊME virement.
+const DOUBLON = analyseCcaReconciliation(
+  [...MVTS, { id: 'm4', date: '2026-04-02', associe: 'yohan', sens: 'remboursement', montant: 500, bank_transaction_id: 'b1' }],
+  LIGNES_CCA, TERMES, []);
+verifie('virement compté deux fois : détecté', DOUBLON.doubleLinked.length, 1);
+verifie('… avec les deux mouvements en cause', DOUBLON.doubleLinked[0].movements.length, 2);
+
+// Un lien vers une ligne absente du relevé lu ne doit pas crier au loup quand
+// on n'a rien lu du tout.
+verifie('lien orphelin détecté',
+  analyseCcaReconciliation(MVTS, [{ id: 'zz', date: '2026-01-01', description: 'X', amount: -1 }], TERMES, [])
+    .danglingLinks.map(m => m.id).join(), 'm2');
+verifie('relevé vide : aucun orphelin annoncé',
+  analyseCcaReconciliation(MVTS, [], TERMES, []).danglingLinks.length, 0);
 
 console.log('\n── P&L : écritures ex-masquées ──');
 declenche('écritures autrefois masquées → à relire', { legacyMaskedItems: 3 }, 'ecritures-ex-masquees');

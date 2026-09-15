@@ -114,6 +114,8 @@ savoir qu'une clé est bonne sans l'apprendre au milieu d'un scan de facture.
 6. Correspondances désignation → ingrédient : exécuter `db/migration_referentiel.sql`.
 7. Verrou du compte courant d'associé : exécuter `db/migration_cca_verrou.sql`.
 8. Clôture mensuelle : exécuter `db/migration_clotures.sql`.
+9. Rapprochement des virements associés : exécuter `db/migration_cca_rapprochement.sql`
+   (un virement bancaire ne peut plus être porté deux fois au compte courant).
 
 > ⚠️ La migration consolidée est à **ré-exécuter** après une mise à jour qui
 > ajoute une catégorie bancaire : la contrainte `CHECK` de `bank_transactions`

@@ -304,6 +304,62 @@ barème après coup. Le mouvement ne se rattachant à rien, le « déjà porté 
 restait affiché, et **chaque clic recréditait l'associé**. Le bouton refuse désormais ce cas et
 renvoie vers une saisie manuelle tracée.
 
+## 6 quater. Comptes courants d'associés : le lien avec les virements LCL
+
+Le compte courant n'est juste que si **les deux sens** sont enregistrés :
+
+| Sens | D'où il vient | Automatique ? |
+|---|---|---|
+| **Apport** (la société doit) | Facture payée perso, frais kilométriques, avance | Oui — scanner, page Trajets |
+| **Remboursement** (la dette s'éteint) | Virement sortant du compte LCL vers l'associé | **Non** |
+
+Le second était le maillon faible, et il cassait de quatre façons.
+
+**1. Un virement sans prénom n'existait pas.** La reconnaissance cherchait
+`justine` ou `yohan` dans le libellé, en dur dans le code. Un « VIR SEPA M. DE FARIA »
+ou un « VIREMENT COMPTE PERSO » n'était jamais proposé — et comme la page Comptes
+Associés ne savait enregistrer que des **apports**, il n'existait aucun moyen de le
+saisir. Le compte courant restait crédité d'une somme déjà versée : la société
+s'affichait débitrice de ce qu'elle avait déjà payé.
+
+**2. Le même virement pouvait être porté deux fois.** Rien n'interdisait deux
+mouvements sur une même ligne bancaire : un double clic suffisait. L'associé se
+retrouvait à devoir de l'argent qu'il n'a jamais reçu, et le verrou « jamais
+débiteur » finissait par refuser des opérations légitimes. `db/migration_cca_rapprochement.sql`
+pose l'index unique qui rend le doublon impossible, et l'application vérifie avant
+d'envoyer pour montrer un message lisible plutôt qu'une erreur SQL.
+
+**3. Le grand livre était lu sans pagination.** Supabase tronque à 1 000 lignes sans
+le signaler : au-delà, le solde affiché était faux — donc la dette de la société était
+fausse. La lecture est désormais paginée, comme partout ailleurs.
+
+**4. Le drapeau « Banque rapprochée » pouvait mentir.** Il est stocké à part du lien
+réel : un mouvement pouvait l'afficher sans aucune ligne bancaire en face.
+
+**Ce qui change.** Un bloc **« Rapprochement bancaire »** sur la page Comptes Associés
+confronte le relevé aux mouvements et donne, en un écran :
+
+- les virements sortants vers un associé **non portés** au compte courant, avec le
+  montant que le solde surévalue, et un bouton qui crée le mouvement rattaché à la
+  ligne bancaire (compte 455, statut de la ligne passé à « rapprochée ») ;
+- les virements sortants **au bénéficiaire non identifié** — ni associé reconnu, ni
+  fournisseur connu — à trancher à la main, parce que créditer le mauvais compte
+  courant ne se voit pas passer. Un terme qui désigne les **deux** associés (un nom
+  de famille commun) n'est jamais attribué automatiquement, par construction ;
+- les anomalies : virement porté deux fois, lien vers une ligne disparue, drapeau
+  « rapproché » sans lien, remboursement sans virement en face.
+
+Les libellés reconnus sont **paramétrables** (bouton « Libellés reconnus ») : nom de
+famille, fragment de libellé de virement permanent. La page sait aussi enregistrer un
+**remboursement** manuel, avec le même contrôle « jamais débiteur » que partout.
+
+Le module « À faire » reprend les deux cas qui coûtent de l'argent : virements non
+rapprochés (important) et virement porté deux fois (critique).
+
+⚠️ **À faire une fois :** exécuter `db/migration_cca_rapprochement.sql`. S'il refuse
+de créer l'index, c'est qu'un virement est déjà porté en double : la première requête
+du fichier les liste, à corriger depuis la page Comptes Associés avant de relancer.
+
 ## 7. ⚠️ ACTION REQUISE DE TA PART
 
 1. **Exécute `db/migration_consolidee.sql`** dans Supabase → SQL Editor (une seule fois).

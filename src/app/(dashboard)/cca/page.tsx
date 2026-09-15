@@ -9,7 +9,12 @@ import {
   toISODate,
   downloadCSV
 } from '@/lib/utils';
-import { checkCcaOperation, describeCcaViolation } from '@/lib/cca';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
+import {
+  checkCcaOperation, describeCcaViolation, analyseCcaReconciliation,
+  mergeTransferTerms,
+  type CcaBankLine, type CcaMovementRow,
+} from '@/lib/cca';
 import { Modal } from '@/components/ui';
 import {
   Coins,
@@ -22,9 +27,12 @@ import {
   AlertCircle,
   CheckCircle,
   Download,
-  ExternalLink
+  ExternalLink,
+  Landmark,
+  Link2,
+  Settings
 } from 'lucide-react';
-import type { CcaAssocie, CcaSousType, MouvementCca, PeriodFilter } from '@/lib/types';
+import type { CcaAssocie, CcaSens, CcaSousType, MouvementCca, PeriodFilter } from '@/lib/types';
 
 
 function renderCcaAttachmentLinks(pieceJustif: string | null) {
@@ -72,29 +80,67 @@ export default function CcaPage() {
 
   // Form State
   const [formDate, setFormDate] = useState(toISODate(new Date()));
+  const [formSens, setFormSens] = useState<CcaSens>('apport');
   const [formAssocie, setFormAssocie] = useState<CcaAssocie>('justine');
   const [formSousType, setFormSousType] = useState<CcaSousType>('facture_payee_perso');
   const [formMontant, setFormMontant] = useState('');
   const [formNote, setFormNote] = useState('');
   const [formFile, setFormFile] = useState<File | null>(null);
 
+  // Rapprochement bancaire : le relevé, les fournisseurs connus (pour ne pas
+  // prendre un virement fournisseur pour un remboursement d'associé) et les
+  // termes qui désignent un associé dans un libellé.
+  const [bankLines, setBankLines] = useState<CcaBankLine[]>([]);
+  const [payees, setPayees] = useState<string[]>([]);
+  const [transferTerms, setTransferTerms] = useState(() => mergeTransferTerms(null));
+  const [showTerms, setShowTerms] = useState(false);
+  const [termsDraft, setTermsDraft] = useState({ justine: '', yohan: '' });
+  const [linking, setLinking] = useState<string | null>(null);
+
   const supabase = createClient();
 
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const { data, error } = await supabase
-        .from('mouvements_cca')
-        .select('*')
-        .order('date', { ascending: true })
-        .order('created_at', { ascending: true })
-        .order('id', { ascending: true });
+      // Lecture PAGINÉE : Supabase tronque toute réponse à 1 000 lignes sans
+      // le signaler. Un grand livre qui dépasse ce seuil affichait un solde
+      // faux — et un solde de compte courant faux, c'est une dette de société
+      // fausse. Le relevé est lu entier pour le même motif.
+      const [movementRows, bankRows, supplierRows, termsRes] = await Promise.all([
+        fetchAllRows<MouvementCca>((f0, f1) => supabase
+          .from('mouvements_cca')
+          .select('*')
+          .order('date', { ascending: true })
+          .order('created_at', { ascending: true })
+          .order('id', { ascending: true })
+          .range(f0, f1)),
+        fetchAllRows<CcaBankLine>((f0, f1) => supabase
+          .from('bank_transactions')
+          .select('id, date, description, amount')
+          .order('date', { ascending: false })
+          .range(f0, f1)),
+        fetchAllRows<{ name: string }>((f0, f1) => supabase
+          .from('suppliers')
+          .select('name')
+          .range(f0, f1)),
+        supabase.from('app_settings').select('value').eq('key', 'cca_transfer_terms').maybeSingle(),
+      ]);
 
-      if (error) throw error;
-      setMovements(data || []);
+      setMovements(movementRows);
+      setBankLines(bankRows.map(l => ({ ...l, description: l.description || '' })));
+      setPayees(supplierRows.map(r => r.name).filter(Boolean));
+
+      let terms = mergeTransferTerms(null);
+      try {
+        if (termsRes.data?.value) terms = mergeTransferTerms(JSON.parse(termsRes.data.value));
+      } catch {
+        // réglage illisible → prénoms par défaut
+      }
+      setTransferTerms(terms);
+      setTermsDraft({ justine: terms.justine.join(', '), yohan: terms.yohan.join(', ') });
     } catch (e) {
       console.error("Error loading CCA movements:", e);
-      alert("Impossible de charger les mouvements CCA.");
+      alert((e as { message?: string })?.message || "Impossible de charger les mouvements CCA.");
     } finally {
       setLoading(false);
     }
@@ -172,10 +218,112 @@ export default function CcaPage() {
   // Display array: Newest first
   const displayMovements = [...filtered].reverse();
 
-  // Handle manual apport submission
+  // ── Rapprochement bancaire ────────────────────────────────────────────────
+  //
+  // Le compte courant n'est juste que si les DEUX sens sont enregistrés. Les
+  // apports le sont automatiquement (facture payée perso, frais kilométriques) ;
+  // les remboursements, eux, n'existent que si quelqu'un rattache le virement
+  // sortant. Ce bloc dit ce qui manque, et ce qui a été rattaché deux fois.
+  const reconciliation = useMemo(
+    () => analyseCcaReconciliation(
+      movements as unknown as CcaMovementRow[], bankLines, transferTerms, payees
+    ),
+    [movements, bankLines, transferTerms, payees]
+  );
+
+  /** Enregistre un virement sortant comme remboursement de compte courant. */
+  const recordRefundFromBank = async (line: CcaBankLine, associe: CcaAssocie) => {
+    const montant = Math.round(Math.abs(Number(line.amount) || 0) * 100) / 100;
+    if (montant <= 0) return;
+
+    // 1. Le compte tient-il ? Le trigger refusera de toute façon : on le dit
+    //    avant, avec la date et le montant, et sans « enregistrer quand même ».
+    const violation = checkCcaOperation(movements, {
+      type: 'insert',
+      movement: { date: line.date, associe, sens: 'remboursement', montant },
+    });
+    if (violation) { alert(describeCcaViolation(violation)); return; }
+
+    setLinking(line.id);
+    try {
+      // 2. Ce virement est-il déjà porté au compte courant ? L'index unique sur
+      //    bank_transaction_id l'interdit ; on montre ici un message lisible.
+      const { data: already, error: dupErr } = await supabase
+        .from('mouvements_cca')
+        .select('id, associe, montant, date')
+        .eq('bank_transaction_id', line.id)
+        .maybeSingle();
+      if (dupErr && dupErr.code !== 'PGRST116') throw dupErr;
+      if (already) {
+        alert(
+          `Ce virement est déjà porté au compte courant de ${already.associe === 'justine' ? 'Justine' : 'Yohan'} `
+          + `(${formatCurrency(Number(already.montant))} au ${formatDate(already.date)}).`
+        );
+        await loadData();
+        return;
+      }
+
+      const { error: insertErr } = await supabase.from('mouvements_cca').insert({
+        date: line.date,
+        associe,
+        sens: 'remboursement',
+        sous_type: 'avance_tresorerie',
+        montant,
+        rapproche_banque: true,
+        date_virement_banque: line.date,
+        note: `Virement bancaire : ${line.description}`,
+        bank_transaction_id: line.id,
+      });
+      if (insertErr) {
+        if (insertErr.code === '23505') {
+          alert("Ce virement vient d'être rapproché ailleurs : rien n'a été enregistré en double.");
+          await loadData();
+          return;
+        }
+        throw insertErr;
+      }
+
+      // 3. La ligne bancaire n'attend plus de facture : c'est un mouvement de
+      //    compte courant d'associé (compte 455).
+      const { error: updateErr } = await supabase
+        .from('bank_transactions')
+        .update({ status: 'reconciled', accounting_class: '455' })
+        .eq('id', line.id);
+      if (updateErr) throw updateErr;
+
+      await loadData();
+    } catch (e) {
+      console.error('Rapprochement CCA:', e);
+      alert((e as { message?: string })?.message || 'Rapprochement impossible.');
+    } finally {
+      setLinking(null);
+    }
+  };
+
+  /** Enregistre les termes qui désignent un associé dans un libellé bancaire. */
+  const saveTransferTerms = async () => {
+    const parse = (v: string) => v.split(',').map(t => t.trim()).filter(Boolean);
+    const next = mergeTransferTerms({ justine: parse(termsDraft.justine), yohan: parse(termsDraft.yohan) });
+    const { error } = await supabase.from('app_settings').upsert({
+      key: 'cca_transfer_terms',
+      value: JSON.stringify(next),
+      updated_at: new Date().toISOString(),
+    });
+    if (error) { alert(`Enregistrement impossible : ${error.message}`); return; }
+    setTransferTerms(next);
+    setShowTerms(false);
+  };
+
+  // Handle manual movement submission (apport ou remboursement)
   const handleAddApport = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formFile) {
+    const isApport = formSens === 'apport';
+
+    // La pièce justificative reste obligatoire pour un apport : c'est elle qui
+    // prouve que l'associé a bien avancé l'argent. Un remboursement, lui, est
+    // prouvé par le relevé — et le rattacher au virement vaut mieux qu'un
+    // fichier joint : le bloc « Rapprochement bancaire » le fait en un clic.
+    if (isApport && !formFile) {
       alert("La pièce justificative est obligatoire pour un apport manuel.");
       return;
     }
@@ -185,22 +333,35 @@ export default function CcaPage() {
       return;
     }
 
+    // Un remboursement peut rendre le compte débiteur : interdit au dirigeant.
+    // La base refusera (trigger) ; on le dit avant, date et montant à l'appui.
+    if (!isApport) {
+      const violation = checkCcaOperation(movements, {
+        type: 'insert',
+        movement: { date: formDate, associe: formAssocie, sens: 'remboursement', montant: amountNum },
+      });
+      if (violation) { alert(describeCcaViolation(violation)); return; }
+    }
+
     setSaving(true);
     try {
       // 1. Upload file to Supabase storage
-      const fileExt = formFile.name.split('.').pop();
+      const fileExt = formFile?.name.split('.').pop();
       const fileName = `cca/${Date.now()}_${Math.random().toString(36).substring(2, 15)}.${fileExt}`;
-      const { error: uploadErr } = await supabase.storage
-        .from('invoice-files')
-        .upload(fileName, formFile);
+      let pieceJustifUrl: string | null = null;
+      if (formFile) {
+        const { error: uploadErr } = await supabase.storage
+          .from('invoice-files')
+          .upload(fileName, formFile);
 
-      if (uploadErr) throw uploadErr;
+        if (uploadErr) throw uploadErr;
 
-      const { data: publicUrlData } = supabase.storage
-        .from('invoice-files')
-        .getPublicUrl(fileName);
+        const { data: publicUrlData } = supabase.storage
+          .from('invoice-files')
+          .getPublicUrl(fileName);
 
-      const pieceJustifUrl = publicUrlData.publicUrl;
+        pieceJustifUrl = publicUrlData.publicUrl;
+      }
 
       // 2. Insert movement
       const { error: insertErr } = await supabase
@@ -208,7 +369,7 @@ export default function CcaPage() {
         .insert({
           date: formDate,
           associe: formAssocie,
-          sens: 'apport',
+          sens: formSens,
           sous_type: formSousType,
           montant: amountNum,
           piece_justif: pieceJustifUrl,
@@ -218,19 +379,24 @@ export default function CcaPage() {
 
       if (insertErr) {
         // L'insert a échoué : on supprime le fichier uploadé pour ne pas laisser d'orphelin
-        try {
-          await supabase.storage.from('invoice-files').remove([fileName]);
-        } catch (cleanupErr) {
-          console.error('Impossible de supprimer le fichier orphelin:', cleanupErr);
+        if (formFile) {
+          try {
+            await supabase.storage.from('invoice-files').remove([fileName]);
+          } catch (cleanupErr) {
+            console.error('Impossible de supprimer le fichier orphelin:', cleanupErr);
+          }
         }
         throw insertErr;
       }
 
-      alert("Apport manuel enregistré avec succès.");
+      alert(isApport
+        ? "Apport manuel enregistré avec succès."
+        : "Remboursement enregistré. S'il correspond à un virement du relevé, rattache-le depuis « Rapprochement bancaire » pour qu'il soit tracé.");
       setShowModal(false);
       
       // Reset form
       setFormDate(toISODate(new Date()));
+      setFormSens('apport');
       setFormAssocie('justine');
       setFormSousType('facture_payee_perso');
       setFormMontant('');
@@ -240,7 +406,7 @@ export default function CcaPage() {
       loadData();
     } catch (e) {
       console.error(e);
-      alert((e as { message?: string })?.message || "Erreur lors de l'enregistrement de l'apport.");
+      alert((e as { message?: string })?.message || "Erreur lors de l'enregistrement du mouvement.");
     } finally {
       setSaving(false);
     }
@@ -543,6 +709,187 @@ export default function CcaPage() {
           </div>
         </div>
 
+        {/* ── Rapprochement bancaire ──────────────────────────────────────
+            Un apport s'enregistre tout seul (facture payée perso, frais
+            kilométriques) ; un remboursement, non. Sans ce bloc, un virement
+            sortant que personne ne rattache laisse le compte courant crédité
+            d'une somme déjà versée — la société s'affiche débitrice de ce
+            qu'elle a déjà payé. */}
+        <div className="card" style={{ marginBottom: 24 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
+            <Landmark size={18} style={{ color: 'var(--teal)' }} />
+            <div style={{ flex: 1, minWidth: 220 }}>
+              <div style={{ fontWeight: 800, fontSize: 15 }}>Rapprochement bancaire</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+                Les virements sortants du compte LCL, confrontés aux remboursements enregistrés
+              </div>
+            </div>
+            <button className="btn btn-secondary btn-sm" onClick={() => setShowTerms(true)}
+              style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5 }}>
+              <Settings size={14} /> Libellés reconnus
+            </button>
+          </div>
+
+          {loading ? (
+            <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Lecture du relevé…</div>
+          ) : (
+            <>
+              {/* 1. Virements identifiés, pas encore portés au compte courant */}
+              {reconciliation.unlinked.length > 0 ? (
+                <div className="table-container" style={{ marginBottom: 14 }}>
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px',
+                    background: 'rgba(217, 119, 6, 0.08)', borderRadius: 8, marginBottom: 8,
+                    fontSize: 12.5, fontWeight: 700, color: '#B45309',
+                  }}>
+                    <AlertCircle size={15} />
+                    <span>
+                      {reconciliation.unlinked.length} virement(s) vers un associé ne sont pas portés au
+                      compte courant — le solde affiché est donc surévalué d&apos;autant
+                      {reconciliation.unlinkedTotal.justine > 0 && ` · Justine : ${formatCurrency(reconciliation.unlinkedTotal.justine)}`}
+                      {reconciliation.unlinkedTotal.yohan > 0 && ` · Yohan : ${formatCurrency(reconciliation.unlinkedTotal.yohan)}`}
+                    </span>
+                  </div>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Date</th>
+                        <th>Libellé bancaire</th>
+                        <th style={{ textAlign: 'right' }}>Montant</th>
+                        <th>Associé</th>
+                        <th style={{ textAlign: 'right' }}>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {reconciliation.unlinked.slice(0, 12).map(({ line, associe }) => (
+                        <tr key={line.id}>
+                          <td style={{ whiteSpace: 'nowrap' }}>{formatDate(line.date)}</td>
+                          <td style={{ fontSize: 12 }}>{line.description}</td>
+                          <td style={{ textAlign: 'right', fontWeight: 700 }}>{formatCurrency(Math.abs(line.amount))}</td>
+                          <td style={{ textTransform: 'capitalize', fontWeight: 600 }}>{associe}</td>
+                          <td style={{ textAlign: 'right' }}>
+                            <button
+                              className="btn btn-primary btn-sm"
+                              disabled={linking === line.id}
+                              onClick={() => recordRefundFromBank(line, associe)}
+                              style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12 }}
+                            >
+                              <Link2 size={13} />
+                              {linking === line.id ? 'Enregistrement…' : 'Porter au compte courant'}
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {reconciliation.unlinked.length > 12 && (
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 6 }}>
+                      … et {reconciliation.unlinked.length - 12} autre(s).
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 8, fontSize: 13,
+                  color: 'var(--green)', fontWeight: 650, marginBottom: 12,
+                }}>
+                  <CheckCircle size={15} />
+                  Tous les virements identifiés comme allant à un associé sont portés au compte courant.
+                </div>
+              )}
+
+              {/* 2. Virements sortants dont le bénéficiaire reste à trancher */}
+              {reconciliation.unidentified.length > 0 && (
+                <div style={{ marginBottom: 14 }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 6 }}>
+                    {reconciliation.unidentified.length} virement(s) sortant(s) au bénéficiaire non identifié
+                  </div>
+                  <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginBottom: 8 }}>
+                    Ni un associé reconnu, ni un fournisseur connu. Si l&apos;un d&apos;eux est un
+                    remboursement, désigne l&apos;associé — sinon, ajoute son libellé dans
+                    « Libellés reconnus » pour qu&apos;il soit rattaché automatiquement à l&apos;avenir.
+                  </div>
+                  <div className="table-container">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Date</th>
+                          <th>Libellé bancaire</th>
+                          <th style={{ textAlign: 'right' }}>Montant</th>
+                          <th style={{ textAlign: 'right' }}>C&apos;est un remboursement pour…</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {reconciliation.unidentified.slice(0, 8).map(line => (
+                          <tr key={line.id}>
+                            <td style={{ whiteSpace: 'nowrap' }}>{formatDate(line.date)}</td>
+                            <td style={{ fontSize: 12 }}>{line.description}</td>
+                            <td style={{ textAlign: 'right', fontWeight: 700 }}>{formatCurrency(Math.abs(line.amount))}</td>
+                            <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                              {(['justine', 'yohan'] as const).map(a => (
+                                <button
+                                  key={a}
+                                  className="btn btn-secondary btn-sm"
+                                  disabled={linking === line.id}
+                                  onClick={() => {
+                                    if (confirm(`Enregistrer ${formatCurrency(Math.abs(line.amount))} comme remboursement du compte courant de ${a === 'justine' ? 'Justine' : 'Yohan'} ?`)) {
+                                      recordRefundFromBank(line, a);
+                                    }
+                                  }}
+                                  style={{ marginLeft: 6, fontSize: 12, textTransform: 'capitalize' }}
+                                >
+                                  {a}
+                                </button>
+                              ))}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {reconciliation.unidentified.length > 8 && (
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 6 }}>
+                      … et {reconciliation.unidentified.length - 8} autre(s).
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* 3. Anomalies de rattachement */}
+              {reconciliation.doubleLinked.length > 0 && (
+                <div style={{
+                  padding: '10px 12px', borderRadius: 8, marginBottom: 8,
+                  background: 'rgba(239, 68, 68, 0.08)', color: 'var(--red)',
+                  fontSize: 12.5, fontWeight: 700,
+                }}>
+                  <AlertCircle size={15} style={{ verticalAlign: -3, marginRight: 6 }} />
+                  {reconciliation.doubleLinked.length} virement(s) portés DEUX fois au compte courant :
+                  le même versement est débité en double. Supprime le mouvement en trop ci-dessous, puis
+                  exécute db/migration_cca_rapprochement.sql pour que le cas ne puisse plus se reproduire.
+                </div>
+              )}
+              {reconciliation.danglingLinks.length > 0 && (
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>
+                  {reconciliation.danglingLinks.length} mouvement(s) pointent une ligne bancaire absente du
+                  relevé (relevé réimporté ou ligne supprimée) : le rapprochement n&apos;est plus vérifiable.
+                </div>
+              )}
+              {reconciliation.flaggedWithoutLink.length > 0 && (
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>
+                  {reconciliation.flaggedWithoutLink.length} mouvement(s) marqués « Banque rapprochée » sans
+                  ligne bancaire rattachée : le drapeau ne prouve rien, la trace est à refaire.
+                </div>
+              )}
+              {reconciliation.refundsWithoutBank.length > 0 && (
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                  {reconciliation.refundsWithoutBank.length} remboursement(s) enregistrés sans virement en
+                  face : normal s&apos;ils ont été réglés en espèces, à vérifier sinon.
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
         {/* Filters */}
         <div className="cca-filter-section">
           <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
@@ -745,10 +1092,49 @@ export default function CcaPage() {
         )}
       </div>
 
+      {/* Libellés reconnus */}
+      {showTerms && (
+        <Modal
+          title="Libellés reconnus comme virement à un associé"
+          onClose={() => setShowTerms(false)}
+          footer={
+            <>
+              <button type="button" className="btn btn-secondary" onClick={() => setShowTerms(false)}>Annuler</button>
+              <button type="button" className="btn btn-primary" onClick={saveTransferTerms}>Enregistrer</button>
+            </>
+          }
+        >
+          <div style={{ fontSize: 12.5, color: 'var(--text-secondary)', marginBottom: 14, lineHeight: 1.55 }}>
+            Termes cherchés dans le libellé bancaire, séparés par des virgules. Insensible à la casse et
+            aux accents. Un terme qui désignerait les <strong>deux</strong> associés (un nom de famille
+            commun, par exemple) n&apos;est jamais attribué automatiquement : le virement part dans la
+            liste « bénéficiaire non identifié », à trancher à la main. C&apos;est voulu — créditer le
+            mauvais compte courant ne se voit pas passer.
+          </div>
+          {(['justine', 'yohan'] as const).map(a => (
+            <div key={a} style={{ marginBottom: 14 }}>
+              <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13, textTransform: 'capitalize' }}>
+                {a}
+              </label>
+              <input
+                type="text"
+                className="form-input"
+                value={termsDraft[a]}
+                placeholder="justine, nom de famille, libellé de virement permanent…"
+                onChange={e => setTermsDraft(d => ({ ...d, [a]: e.target.value }))}
+              />
+            </div>
+          ))}
+          <div style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+            Laisser vide remet le prénom par défaut.
+          </div>
+        </Modal>
+      )}
+
       {/* Manual Apport Modal */}
       {showModal && (
         <Modal
-          title="Ajouter un apport manuel"
+          title={formSens === 'apport' ? 'Ajouter un apport manuel' : 'Enregistrer un remboursement'}
           onClose={() => setShowModal(false)}
           footer={
             <>
@@ -773,13 +1159,41 @@ export default function CcaPage() {
                     <div className="spinner" style={{ width: 14, height: 14 }} /> Enregistrement...
                   </>
                 ) : (
-                  <>Enregistrer l&apos;apport</>
+                  <>{formSens === 'apport' ? "Enregistrer l'apport" : 'Enregistrer le remboursement'}</>
                 )}
               </button>
             </>
           }
         >
           <form id="cca-apport-form" onSubmit={handleAddApport} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* Sens — le remboursement manquait : un virement sortant qui ne
+                porte aucun prénom dans son libellé ne pouvait se saisir nulle
+                part, et le compte courant restait crédité d'une somme versée. */}
+            <div>
+              <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
+                Sens de l&apos;opération
+              </label>
+              <select
+                className="form-select"
+                value={formSens}
+                onChange={e => {
+                  const sens = e.target.value as CcaSens;
+                  setFormSens(sens);
+                  if (sens === 'remboursement') setFormSousType('avance_tresorerie');
+                }}
+              >
+                <option value="apport">Apport — l&apos;associé avance de l&apos;argent à la société</option>
+                <option value="remboursement">Remboursement — la société rend l&apos;argent à l&apos;associé</option>
+              </select>
+              {formSens === 'remboursement' && (
+                <span style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 6, display: 'block' }}>
+                  Si ce remboursement correspond à un virement du relevé, préfère le bloc
+                  « Rapprochement bancaire » : il rattache le mouvement à la ligne bancaire,
+                  ce qu&apos;une saisie manuelle ne fait pas.
+                </span>
+              )}
+            </div>
+
             {/* Date */}
             <div>
               <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
@@ -812,7 +1226,7 @@ export default function CcaPage() {
             {/* Sub-type */}
             <div>
               <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
-                Nature de l&apos;apport
+                {formSens === 'apport' ? "Nature de l'apport" : 'Nature du remboursement'}
               </label>
               <select
                 className="form-select"
@@ -828,7 +1242,7 @@ export default function CcaPage() {
             {/* Montant */}
             <div>
               <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
-                Montant de l&apos;apport (€)
+                Montant {formSens === 'apport' ? "de l'apport" : 'du remboursement'} (€)
               </label>
               <div style={{ position: 'relative' }}>
                 <input
@@ -851,7 +1265,7 @@ export default function CcaPage() {
                 la soumission avec une erreur « not focusable ») */}
             <div>
               <label className="form-label" style={{ display: 'block', marginBottom: 6, fontWeight: 700, fontSize: 13 }}>
-                Pièce justificative (Requis)
+                Pièce justificative {formSens === 'apport' ? '(Requis)' : '(Facultatif)'}
               </label>
               <div
                 className="file-upload-zone"
