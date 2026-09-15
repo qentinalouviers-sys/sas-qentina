@@ -15,7 +15,13 @@ import { NextResponse, type NextRequest } from 'next/server';
 // de s'exécuter si la variable est absente). Sans cette exemption, l'appel de
 // Vercel Cron — qui n'a évidemment pas de session — serait redirigé vers la
 // page de connexion et la synchronisation nocturne ne tournerait jamais.
-const PUBLIC_PATHS = ['/login', '/api/square/webhook', '/api/cron/'];
+// « /api/agent/ » : porte des agents IA. Elle n'est pas ouverte pour autant —
+// chaque route y exige une clé « Authorization: Bearer qk_live_… » vérifiée
+// contre son empreinte en base, et la portée de la clé décide de ce qu'elle
+// peut faire. L'exemption est nécessaire parce qu'un agent n'a pas de cookie
+// de session : sans elle, le proxy répondrait 401 avant que la clé ne soit lue.
+// Les clés elles-mêmes se gèrent sous /api/settings, qui reste protégé.
+const PUBLIC_PATHS = ['/login', '/api/square/webhook', '/api/cron/', '/api/agent/'];
 
 // Préfixes autorisés pour le rôle "comptable" (pages + API correspondantes)
 const COMPTABLE_PATHS = [

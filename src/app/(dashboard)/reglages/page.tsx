@@ -2,8 +2,9 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import { Plus, Trash2, Save, Settings, Flame, RefreshCw, Stethoscope, KeyRound, Merge, Link2 } from 'lucide-react';
+import { Plus, Trash2, Save, Settings, Flame, RefreshCw, Stethoscope, KeyRound, Merge, Link2, Bot } from 'lucide-react';
 import AiSettingsPanel from '@/components/AiSettingsPanel';
+import AgentKeysPanel from '@/components/AgentKeysPanel';
 import { formatCurrency } from '@/lib/utils';
 import { UNITS } from '@/lib/recipes';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
@@ -23,9 +24,9 @@ export default function ReglagesPage() {
   const [loading, setLoading] = useState(true);
   const [newSupplier, setNewSupplier] = useState('');
   const [newIngredient, setNewIngredient] = useState({ name: '', unit: 'kg', last_unit_price: 0 });
-  type Tab = 'suppliers' | 'ingredients' | 'ia' | 'services' | 'moteurs';
+  type Tab = 'suppliers' | 'ingredients' | 'ia' | 'services' | 'moteurs' | 'agents';
   const isTab = (v: string | null): v is Tab =>
-    v !== null && ['suppliers', 'ingredients', 'ia', 'services', 'moteurs'].includes(v);
+    v !== null && ['suppliers', 'ingredients', 'ia', 'services', 'moteurs', 'agents'].includes(v);
   // Onglet demandé par l'URL : les interventions de l'accueil y renvoient.
   // Lu à l'initialisation plutôt que dans un effet : le premier rendu
   // affiche un spinner des deux côtés, il n'y a donc rien à réconcilier.
@@ -325,9 +326,12 @@ export default function ReglagesPage() {
           <button className={`period-btn ${tab === 'services' ? 'active' : ''}`} onClick={() => setTab('services')}>Horaires & Services</button>
           <button className={`period-btn ${tab === 'ia' ? 'active' : ''}`} onClick={() => setTab('ia')}><Flame size={14} style={{ display: 'inline', marginRight: 4, verticalAlign: 'text-bottom' }} /> Fuego IA</button>
           <button className={`period-btn ${tab === 'moteurs' ? 'active' : ''}`} onClick={() => setTab('moteurs')}><KeyRound size={14} style={{ display: 'inline', marginRight: 4, verticalAlign: 'text-bottom' }} /> Moteurs IA</button>
+          <button className={`period-btn ${tab === 'agents' ? 'active' : ''}`} onClick={() => setTab('agents')}><Bot size={14} style={{ display: 'inline', marginRight: 4, verticalAlign: 'text-bottom' }} /> Agents IA</button>
         </div>
 
         {tab === 'moteurs' && <AiSettingsPanel />}
+
+        {tab === 'agents' && <AgentKeysPanel />}
 
         {tab === 'services' && (
           <div className="card">

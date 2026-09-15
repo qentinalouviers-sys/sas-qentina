@@ -304,6 +304,114 @@ barème après coup. Le mouvement ne se rattachant à rien, le « déjà porté 
 restait affiché, et **chaque clic recréditait l'associé**. Le bouton refuse désormais ce cas et
 renvoie vers une saisie manuelle tracée.
 
+## 6 quater. Comptes courants d'associés : le lien avec les virements LCL
+
+Le compte courant n'est juste que si **les deux sens** sont enregistrés :
+
+| Sens | D'où il vient | Automatique ? |
+|---|---|---|
+| **Apport** (la société doit) | Facture payée perso, frais kilométriques, avance | Oui — scanner, page Trajets |
+| **Remboursement** (la dette s'éteint) | Virement sortant du compte LCL vers l'associé | **Non** |
+
+Le second était le maillon faible, et il cassait de quatre façons.
+
+**1. Un virement sans prénom n'existait pas.** La reconnaissance cherchait
+`justine` ou `yohan` dans le libellé, en dur dans le code. Un « VIR SEPA M. DE FARIA »
+ou un « VIREMENT COMPTE PERSO » n'était jamais proposé — et comme la page Comptes
+Associés ne savait enregistrer que des **apports**, il n'existait aucun moyen de le
+saisir. Le compte courant restait crédité d'une somme déjà versée : la société
+s'affichait débitrice de ce qu'elle avait déjà payé.
+
+**2. Le même virement pouvait être porté deux fois.** Rien n'interdisait deux
+mouvements sur une même ligne bancaire : un double clic suffisait. L'associé se
+retrouvait à devoir de l'argent qu'il n'a jamais reçu, et le verrou « jamais
+débiteur » finissait par refuser des opérations légitimes. `db/migration_cca_rapprochement.sql`
+pose l'index unique qui rend le doublon impossible, et l'application vérifie avant
+d'envoyer pour montrer un message lisible plutôt qu'une erreur SQL.
+
+**3. Le grand livre était lu sans pagination.** Supabase tronque à 1 000 lignes sans
+le signaler : au-delà, le solde affiché était faux — donc la dette de la société était
+fausse. La lecture est désormais paginée, comme partout ailleurs.
+
+**4. Le drapeau « Banque rapprochée » pouvait mentir.** Il est stocké à part du lien
+réel : un mouvement pouvait l'afficher sans aucune ligne bancaire en face.
+
+**Ce qui change.** Un bloc **« Rapprochement bancaire »** sur la page Comptes Associés
+confronte le relevé aux mouvements et donne, en un écran :
+
+- les virements sortants vers un associé **non portés** au compte courant, avec le
+  montant que le solde surévalue, et un bouton qui crée le mouvement rattaché à la
+  ligne bancaire (compte 455, statut de la ligne passé à « rapprochée ») ;
+- les virements sortants **au bénéficiaire non identifié** — ni associé reconnu, ni
+  fournisseur connu — à trancher à la main, parce que créditer le mauvais compte
+  courant ne se voit pas passer. Un terme qui désigne les **deux** associés (un nom
+  de famille commun) n'est jamais attribué automatiquement, par construction ;
+- les anomalies : virement porté deux fois, lien vers une ligne disparue, drapeau
+  « rapproché » sans lien, remboursement sans virement en face.
+
+Les libellés reconnus sont **paramétrables** (bouton « Libellés reconnus ») : nom de
+famille, fragment de libellé de virement permanent. La page sait aussi enregistrer un
+**remboursement** manuel, avec le même contrôle « jamais débiteur » que partout.
+
+Le module « À faire » reprend les deux cas qui coûtent de l'argent : virements non
+rapprochés (important) et virement porté deux fois (critique).
+
+⚠️ **À faire une fois :** exécuter `db/migration_cca_rapprochement.sql`. S'il refuse
+de créer l'index, c'est qu'un virement est déjà porté en double : la première requête
+du fichier les liste, à corriger depuis la page Comptes Associés avant de relancer.
+
+## 6 quinquies. Rendre le SaaS utilisable par un agent IA
+
+**Le point de départ : rien n'était appelable.** Toute l'application repose sur un
+cookie de session Supabase. Un agent n'a pas de cookie — il recevait donc un 401
+avant même d'avoir formulé sa demande. Il n'existait ni clé d'accès, ni description
+machine des données, ni contrat d'appel.
+
+**Le protocole retenu : MCP.** Hermes Agent (Nous Research) est un client MCP natif,
+comme Claude Desktop, Cursor et VS Code. Exposer un serveur MCP, c'est donc être
+utilisable par tous d'un coup, plutôt que d'écrire un connecteur par outil. Le
+serveur est écrit à la main (`/api/agent/mcp`) : le protocole tient en quatre
+méthodes, et une dépendance de plus à suivre coûterait plus cher que 120 lignes de
+JSON-RPC.
+
+**Ce qu'un agent attend d'une API, et qu'un écran ne donne pas.** Quatre règles,
+appliquées par chaque outil :
+
+| Règle | Pourquoi |
+|---|---|
+| Une **phrase de synthèse en français** dans chaque réponse | Un modèle qui reçoit `{ca_ht: 18234.55}` invente le commentaire ; celui qui reçoit la phrase la recopie |
+| Toute liste **bornée**, et qui annonce `truncated` | 4 000 lignes ne font pas déborder le contexte, elles le remplissent de bruit |
+| Les erreurs sont des **consignes** | « Mois clôturé : rouvre-le depuis le P&L ou date l'écriture du mois courant » se corrige au tour suivant ; « 500 Internal Error » fait inventer une réponse |
+| Les écritures sont **idempotentes et simulables** | Un agent réessaie. La clé d'idempotence (trajets) et l'unicité (virements) garantissent qu'un second appel ne duplique rien ; `dry_run` montre avant d'écrire |
+
+**Douze outils, dont deux seulement écrivent.** Lecture : santé du restaurant, chiffres
+du mois, TVA, factures et leurs lignes, relevé bancaire, comptes d'associés (avec le
+rapprochement), frais kilométriques (avec la couverture des justificatifs), état de
+clôture, fournisseurs. Écriture : enregistrer les trajets détectés, rattacher un
+virement au compte courant. La clôture d'un mois n'est **pas** exposée : elle fige un
+chiffre transmis au cabinet, c'est un geste humain.
+
+**La sécurité ne repose pas sur la docilité du modèle.**
+
+- La clé n'est pas stockée : seule son empreinte SHA-256 l'est. Une base qui fuite ne
+  livre aucune clé utilisable — et l'application ne peut donc pas la réafficher.
+- La **portée est portée par la clé**. Une clé de lecture ne se voit même pas proposer
+  les outils d'écriture : un modèle qui ne les voit pas ne perd pas un tour à les
+  essayer.
+- Les verrous restent en base. Un agent emprunte les mêmes chemins qu'un humain :
+  compte courant jamais débiteur, mois clôturé en lecture seule, un virement porté une
+  seule fois. Les tests le vérifient en exécutant les outils pour de vrai.
+- Chaque appel est journalisé (outil, arguments, résultat, durée) et lisible dans
+  Réglages → Agents IA. « L'agent a fait quelque chose » devient vérifiable.
+
+**Un skill livré avec.** `agent/skills/qentina-gestion/SKILL.md` (format agentskills.io)
+apprend à l'agent les règles métier et la méthode de travail. Sans lui, un modèle
+présente un coût matières estimé comme s'il était mesuré, ou insiste après un refus
+réglementaire.
+
+⚠️ **À faire une fois :** exécuter `db/migration_agent_api.sql`, puis créer une clé
+dans Réglages → Agents IA.
+
 ## 7. ⚠️ ACTION REQUISE DE TA PART
 
 1. **Exécute `db/migration_consolidee.sql`** dans Supabase → SQL Editor (une seule fois).

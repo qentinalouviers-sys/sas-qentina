@@ -29,7 +29,10 @@ import { checkInvoice, assertInvoiceAccepted } from '../src/lib/invoice-checks.t
 import {
   repairMojibake, normalizeName, findSupplierMatch, matchIngredient, unmatchedDesignations,
 } from '../src/lib/referentiel.ts';
-import { checkCcaOperation, firstDebitDay } from '../src/lib/cca.ts';
+import {
+  checkCcaOperation, firstDebitDay,
+  matchAssociate, looksLikeTransfer, mergeTransferTerms, analyseCcaReconciliation,
+} from '../src/lib/cca.ts';
 import { inventorySessions, sessionAtBoundary, computeCogs } from '../src/lib/cogs.ts';
 import { monthBounds, recentMonths, isMonthOver } from '../src/lib/months.ts';
 import { buildEntries, unbalancedEntries, toFec } from '../src/lib/fec.ts';
@@ -37,6 +40,9 @@ import {
   computeAllowance, allocateShares, tripDateFromLabel, matchDestination, isFuelPurchase,
   DEFAULT_CONFIG,
 } from '../src/lib/mileage.ts';
+import { validateArgs, describeErrors, toJsonSchema } from '../src/lib/agent/schema.ts';
+import { AGENT_TOOLS, findTool, suggestTools } from '../src/lib/agent/tools.ts';
+import { visibleTools, toMcpTool, toFunctionSpec, renderResultText } from '../src/lib/agent/manifest.ts';
 
 /**
  * Faux client Supabase, qui applique réellement les filtres utilisés.
@@ -74,7 +80,21 @@ function fakeSupabase(tables) {
         gte(col, v) { rows = rows.filter(r => String(r[col]) >= v); return q; },
         lte(col, v) { rows = rows.filter(r => String(r[col]) <= v); return q; },
         in(col, vs) { rows = rows.filter(r => vs.includes(r[col])); return q; },
+        is(col, v) { rows = rows.filter(r => (r[col] ?? null) === v); return q; },
+        ilike(col, pattern) {
+          const needle = String(pattern).replace(/%/g, '').toLowerCase();
+          rows = rows.filter(r => String(r[col] ?? '').toLowerCase().includes(needle));
+          return q;
+        },
         limit(n) { rows = rows.slice(0, n); return q; },
+        // Les outils d'agent lisent souvent UNE ligne : sans ces deux méthodes,
+        // le faux client ne permettrait pas de les exécuter du tout.
+        maybeSingle() { return Promise.resolve({ data: rows[0] ?? null, error: null }); },
+        single() {
+          return Promise.resolve(rows[0]
+            ? { data: rows[0], error: null }
+            : { data: null, error: { code: 'PGRST116', message: 'Aucune ligne' } });
+        },
         range(from, to) {
           start = from;
           // Le serveur ne rend jamais plus de MAX_ROWS, même si on en demande
@@ -261,6 +281,8 @@ const faits = (o = {}) => ({
   ccaBalances: [{ associe: 'yohan', balance: 1200 }],
   tripsNotInCca: { count: 0 },
   tripsInPeriod: 0,
+  ccaUnlinkedTransfers: { count: 0, amount: 0 },
+  ccaDoubleLinked: { count: 0 },
   fuelDebits: { count: 0, amount: 0 },
   unmatchedDesignations: { count: 0, sample: [] },
   legacyMaskedItems: 0,
@@ -437,6 +459,11 @@ silence('compte courant créditeur', { ccaBalances: [{ associe: 'yohan', balance
 declenche('facture au 1er janvier', { suspectDateInvoices: { count: 3, sample: ['2024-01-01'] } }, 'factures-date-suspecte');
 declenche('fournisseur mal encodé', { mojibakeSuppliers: ['MÃ©tro'] }, 'fournisseurs-mojibake');
 declenche('trajets hors compte courant', { tripsNotInCca: { count: 7 } }, 'trajets-hors-cca');
+declenche('virements associés non rapprochés',
+  { ccaUnlinkedTransfers: { count: 2, amount: 800 } }, 'cca-virements-non-rapproches');
+silence('aucun virement en attente : silence',
+  { ccaUnlinkedTransfers: { count: 0, amount: 0 } }, 'cca-virements-non-rapproches');
+declenche('virement porté deux fois', { ccaDoubleLinked: { count: 1 } }, 'cca-virements-en-double');
 
 // Ordre de traitement : le CA d'abord, il rend faux tout ce qui le suit.
 const ordre = detectInterventions(faits({ caSquareTtc: 8000, foodCostPercent: 62, tripsNotInCca: { count: 7 } }));
@@ -890,6 +917,247 @@ verifie('creux ancien détecté', firstDebitDay(CREUX, 'yohan', '2026-01-01')?.d
 verifie('remboursement postérieur au creux : accepté quand même',
   checkCcaOperation(CREUX, { type: 'insert', movement: { date: '2026-04-01', associe: 'yohan', sens: 'remboursement', montant: 500 } }), null);
 
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Compte courant d'associé : rapprochement des virements sortants
+//
+//  Un apport s'enregistre tout seul ; un remboursement n'existe que si le
+//  virement sortant est rattaché. Ces contrôles figent ce qui doit être vu —
+//  et ce qui ne doit surtout pas être attribué au hasard.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── CCA : rapprochement bancaire ──');
+
+const TERMES = mergeTransferTerms({ justine: ['justine'], yohan: ['yohan', 'de faria'] });
+
+verifie('prénom reconnu', matchAssociate('VIR SEPA JUSTINE', TERMES), 'justine');
+verifie('nom de famille configuré reconnu', matchAssociate('VIR SEPA M DE FARIA', TERMES), 'yohan');
+verifie('libellé collé par la banque', matchAssociate('VIRDEFARIAYOHAN', TERMES), 'yohan');
+verifie('accents et casse ignorés', matchAssociate('virement justine dupré', TERMES), 'justine');
+verifie('fournisseur : aucun associé', matchAssociate('VIR SEPA METRO FRANCE', TERMES), null);
+verifie('terme partagé : personne, plutôt que le mauvais compte',
+  matchAssociate('VIR SEPA JUSTINE DE FARIA', TERMES), null);
+verifie('termes vides → prénoms par défaut', mergeTransferTerms({ yohan: [] }).yohan[0], 'yohan');
+verifie('un virement se reconnaît', looksLikeTransfer('VIR SEPA EMIS 12345'), true);
+verifie('un prélèvement n\'en est pas un', looksLikeTransfer('PRLV SEPA EDF'), false);
+
+const MVTS = [
+  { id: 'm1', date: '2026-03-01', associe: 'yohan', sens: 'apport', montant: 2000 },
+  { id: 'm2', date: '2026-04-02', associe: 'yohan', sens: 'remboursement', montant: 500,
+    bank_transaction_id: 'b1', rapproche_banque: true },
+  { id: 'm3', date: '2026-04-20', associe: 'yohan', sens: 'remboursement', montant: 100,
+    bank_transaction_id: null, rapproche_banque: true },
+];
+const LIGNES_CCA = [
+  { id: 'b1', date: '2026-04-02', description: 'VIR SEPA YOHAN', amount: -500 },
+  { id: 'b2', date: '2026-05-04', description: 'VIR SEPA M DE FARIA', amount: -300 },
+  { id: 'b3', date: '2026-05-06', description: 'VIR SEPA METRO FRANCE', amount: -420 },
+  { id: 'b4', date: '2026-05-07', description: 'VIR SEPA URSSAF', amount: -900 },
+  { id: 'b5', date: '2026-05-09', description: 'VIR SEPA SCI BEL AIR', amount: -1332 },
+  { id: 'b6', date: '2026-05-10', description: 'VIR RECU JUSTINE', amount: 800 },
+];
+const RAP = analyseCcaReconciliation(MVTS, LIGNES_CCA, TERMES, ['Metro France']);
+
+verifie('virement non rapproché détecté', RAP.unlinked.length, 1);
+verifie('… le bon', RAP.unlinked[0]?.line.id, 'b2');
+verifie('… au bon associé', RAP.unlinked[0]?.associe, 'yohan');
+verifie('… pour le bon montant', RAP.unlinkedTotal.yohan, 300);
+verifie('virement déjà rattaché : ignoré', RAP.unlinked.some(u => u.line.id === 'b1'), false);
+verifie('encaissement : jamais un remboursement', RAP.unlinked.some(u => u.line.id === 'b6'), false);
+verifie('virement fournisseur connu : écarté du bruit', RAP.unidentified.some(l => l.id === 'b3'), false);
+verifie('URSSAF : écarté du bruit', RAP.unidentified.some(l => l.id === 'b4'), false);
+verifie('virement inconnu : à trancher à la main', RAP.unidentified.map(l => l.id).join(), 'b5');
+verifie('drapeau « rapproché » sans lien : signalé', RAP.flaggedWithoutLink.map(m => m.id).join(), 'm3');
+verifie('remboursement sans ligne bancaire : signalé', RAP.refundsWithoutBank.map(m => m.id).join(), 'm3');
+verifie('aucun doublon ici', RAP.doubleLinked.length, 0);
+
+// Le cas qui rendait un associé débiteur sans qu'il ait rien reçu : deux
+// mouvements sur le MÊME virement.
+const DOUBLON = analyseCcaReconciliation(
+  [...MVTS, { id: 'm4', date: '2026-04-02', associe: 'yohan', sens: 'remboursement', montant: 500, bank_transaction_id: 'b1' }],
+  LIGNES_CCA, TERMES, []);
+verifie('virement compté deux fois : détecté', DOUBLON.doubleLinked.length, 1);
+verifie('… avec les deux mouvements en cause', DOUBLON.doubleLinked[0].movements.length, 2);
+
+// Un lien vers une ligne absente du relevé lu ne doit pas crier au loup quand
+// on n'a rien lu du tout.
+verifie('lien orphelin détecté',
+  analyseCcaReconciliation(MVTS, [{ id: 'zz', date: '2026-01-01', description: 'X', amount: -1 }], TERMES, [])
+    .danglingLinks.map(m => m.id).join(), 'm2');
+verifie('relevé vide : aucun orphelin annoncé',
+  analyseCcaReconciliation(MVTS, [], TERMES, []).danglingLinks.length, 0);
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  API agents IA : le contrat que voit un modèle
+//
+//  Un agent choisit son outil d'après sa description et son schéma. Un schéma
+//  faux ne plante pas : il fait choisir le mauvais outil, ou passer un argument
+//  ignoré en silence. C'est exactement le genre de défaut qui doit tomber ici.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Agents IA : catalogue d\'outils ──');
+
+verifie('des outils sont exposés', AGENT_TOOLS.length > 0, true);
+verifie('aucun doublon de nom',
+  new Set(AGENT_TOOLS.map(t => t.name)).size, AGENT_TOOLS.length);
+verifie('noms utilisables comme identifiants',
+  AGENT_TOOLS.every(t => /^[a-z][a-z0-9_]{2,63}$/.test(t.name)), true);
+verifie('chaque outil se décrit assez pour être choisi',
+  AGENT_TOOLS.every(t => t.description.length >= 60), true);
+verifie('chaque paramètre est décrit',
+  AGENT_TOOLS.every(t => Object.values(t.schema.properties).every(p => (p.description || '').length >= 10)), true);
+verifie('chaque obligatoire existe dans le schéma',
+  AGENT_TOOLS.every(t => (t.schema.required ?? []).every(r => r in t.schema.properties)), true);
+verifie('toute portée est read ou write',
+  AGENT_TOOLS.every(t => t.scope === 'read' || t.scope === 'write'), true);
+verifie('les écritures se simulent (dry_run)',
+  AGENT_TOOLS.filter(t => t.scope === 'write').every(t => 'dry_run' in t.schema.properties), true);
+verifie('les listes sont bornées (limit plafonné)',
+  AGENT_TOOLS.filter(t => 'limit' in t.schema.properties)
+    .every(t => typeof t.schema.properties.limit.maximum === 'number'), true);
+verifie('outil retrouvé par son nom', findTool('get_vat_report')?.scope, 'read');
+verifie('outil inconnu : suggestions renvoyées', suggestTools('get_vat').length > 0, true);
+
+// Une clé en lecture seule ne doit même pas VOIR les outils d'écriture : un
+// modèle qui les voit les essaie, et perd un tour sur un refus prévisible.
+const LECTURE = { scopes: ['read'] };
+const ECRITURE = { scopes: ['read', 'write'] };
+verifie('clé lecture : aucun outil d\'écriture visible',
+  visibleTools(LECTURE).some(t => t.scope === 'write'), false);
+verifie('clé write : tout est visible', visibleTools(ECRITURE).length, AGENT_TOOLS.length);
+
+// Format MCP / function-calling
+const MCP = toMcpTool(findTool('get_monthly_summary'));
+verifie('MCP : inputSchema présent', MCP.inputSchema.type, 'object');
+verifie('MCP : lecture annoncée non destructive', MCP.annotations.readOnlyHint, true);
+verifie('MCP : écriture annoncée comme telle',
+  toMcpTool(findTool('link_bank_transfer_to_partner_account')).annotations.readOnlyHint, false);
+verifie('function-calling : enveloppe attendue', toFunctionSpec(MCP && findTool('get_invoice')).type, 'function');
+verifie('schéma fermé aux paramètres inventés',
+  toJsonSchema(findTool('get_invoice').schema).additionalProperties, false);
+
+// La synthèse passe AVANT le JSON : un modèle qui s'arrête à la première ligne
+// a déjà la réponse.
+const RENDU = renderResultText({ summary: 'CA de juin : 18 000 €.', data: { ca: 18000 }, next: ['get_vat_report'] });
+verifie('synthèse en tête du rendu', RENDU.startsWith('CA de juin'), true);
+verifie('données jointes en JSON', RENDU.includes('"ca": 18000'), true);
+
+console.log('\n── Agents IA : validation des arguments ──');
+
+const SCHEMA_MOIS = findTool('get_monthly_summary').schema;
+verifie('mois bien formé : accepté',
+  validateArgs(SCHEMA_MOIS, { month: '2026-06' }).value?.month, '2026-06');
+verifie('mois en toutes lettres : refusé',
+  validateArgs(SCHEMA_MOIS, { month: 'juin 2026' }).ok, false);
+verifie('mois 13 : refusé', validateArgs(SCHEMA_MOIS, { month: '2026-13' }).ok, false);
+verifie('mois absent : accepté (défaut appliqué par l\'outil)',
+  validateArgs(SCHEMA_MOIS, {}).ok, true);
+verifie('espaces rognés', validateArgs(SCHEMA_MOIS, { month: ' 2026-06 ' }).value?.month, '2026-06');
+verifie('paramètre inventé : refusé, avec la liste des admis',
+  describeErrors('x', validateArgs(SCHEMA_MOIS, { mois: '2026-06' }).errors ?? []).includes('month'), true);
+
+const SCHEMA_FACTURE = findTool('get_invoice').schema;
+verifie('obligatoire manquant : refusé', validateArgs(SCHEMA_FACTURE, {}).ok, false);
+verifie('identifiant qui n\'est pas un UUID : refusé',
+  validateArgs(SCHEMA_FACTURE, { invoice_id: 'facture-metro-12' }).ok, false);
+verifie('UUID valide : accepté',
+  validateArgs(SCHEMA_FACTURE, { invoice_id: '3f2504e0-4f89-41d3-9a0c-0305e82c3301' }).ok, true);
+
+const SCHEMA_BANQUE = findTool('list_bank_transactions').schema;
+verifie('valeur hors énumération : refusée',
+  validateArgs(SCHEMA_BANQUE, { status: 'en attente' }).ok, false);
+verifie('limite par défaut appliquée', validateArgs(SCHEMA_BANQUE, {}).value?.limit, 50);
+verifie('limite délirante : ramenée au plafond, pas refusée',
+  validateArgs(SCHEMA_BANQUE, { limit: 100000 }).value?.limit, 200);
+verifie('limite en chaîne : convertie',
+  validateArgs(SCHEMA_BANQUE, { limit: '10' }).value?.limit, 10);
+
+const SCHEMA_TRAJETS = findTool('record_missing_mileage_trips').schema;
+verifie('booléen en chaîne : accepté',
+  validateArgs(SCHEMA_TRAJETS, { dry_run: 'true' }).value?.dry_run, true);
+verifie('dry_run par défaut à false', validateArgs(SCHEMA_TRAJETS, {}).value?.dry_run, false);
+verifie('année aberrante : refusée', validateArgs(SCHEMA_TRAJETS, { year: 26 }).ok, false);
+verifie('conducteur inconnu : refusé',
+  validateArgs(SCHEMA_TRAJETS, { driver: 'marc' }).ok, false);
+verifie('arguments non-objet : refusés', validateArgs(SCHEMA_TRAJETS, 'tout').ok, false);
+
+
+console.log('\n── Agents IA : les outils rendent les mêmes chiffres que l\'écran ──');
+
+// Un outil d'agent qui calculerait autrement que l'application serait pire
+// qu'inutile : deux vérités pour un même chiffre. On exécute donc les
+// gestionnaires pour de vrai, sur des données connues.
+const BASE_AGENT = {
+  mouvements_cca: [
+    { id: 'm1', date: '2026-03-01', associe: 'yohan', sens: 'apport', montant: 2000,
+      bank_transaction_id: null, rapproche_banque: false },
+    { id: 'm2', date: '2026-04-02', associe: 'yohan', sens: 'remboursement', montant: 500,
+      bank_transaction_id: 'b1', rapproche_banque: true },
+    { id: 'm3', date: '2026-03-05', associe: 'justine', sens: 'apport', montant: 300,
+      bank_transaction_id: null, rapproche_banque: false },
+  ],
+  bank_transactions: [
+    { id: 'b1', date: '2026-04-02', description: 'VIR SEPA YOHAN', amount: -500 },
+    { id: 'b2', date: '2026-05-04', description: 'VIR SEPA YOHAN', amount: -300 },
+    { id: 'b3', date: '2026-05-06', description: 'VIR SEPA METRO FRANCE', amount: -420 },
+  ],
+  suppliers: [{ name: 'Metro France' }],
+  app_settings: [],
+};
+const ctxAgent = (tables = BASE_AGENT) => ({ supabase: fakeSupabase(tables), today: '2026-06-15' });
+const appelle = (nom, args, tables) => findTool(nom).handler(args, ctxAgent(tables));
+
+const comptes = await appelle('get_partner_accounts', {});
+verifie('solde yohan = apports − remboursements',
+  comptes.data.balances.find(b => b.associe === 'yohan').solde, 1500);
+verifie('solde justine indépendant',
+  comptes.data.balances.find(b => b.associe === 'justine').solde, 300);
+verifie('virement non rapproché remonté',
+  comptes.data.reconciliation.unlinked_transfers.length, 1);
+verifie('… et chiffré', comptes.data.reconciliation.unlinked_total.yohan, 300);
+verifie('la synthèse prévient que le solde est surévalué',
+  comptes.summary.includes('surévalués'), true);
+verifie('un outil de lecture propose la suite', comptes.next.includes('link_bank_transfer_to_partner_account'), true);
+
+// Les verrous métier doivent s'appliquer par la porte des agents comme par
+// l'écran — sinon l'API agent devient le trou dans la coque.
+const rembourseTrop = {
+  ...BASE_AGENT,
+  bank_transactions: [{ id: 'b9', date: '2026-05-04', description: 'VIR SEPA JUSTINE', amount: -5000 }],
+};
+let refus = null;
+try {
+  await appelle('link_bank_transfer_to_partner_account',
+    { bank_transaction_id: 'b9', associe: 'justine', dry_run: true }, rembourseTrop);
+} catch (e) { refus = e; }
+verifie('compte courant débiteur : refusé même côté agent', refus?.code, 'cca_debtor');
+verifie('… avec le texte de loi, pas une erreur technique',
+  refus?.message.includes('L.225-43'), true);
+
+let refusEncaissement = null;
+try {
+  await appelle('link_bank_transfer_to_partner_account',
+    { bank_transaction_id: 'b9', associe: 'justine', dry_run: true },
+    { ...BASE_AGENT, bank_transactions: [{ id: 'b9', date: '2026-05-04', description: 'VIR RECU', amount: 500 }] });
+} catch (e) { refusEncaissement = e; }
+verifie('un encaissement ne rembourse pas un compte courant',
+  refusEncaissement?.code, 'invalid_request');
+
+let refusDoublon = null;
+try {
+  await appelle('link_bank_transfer_to_partner_account',
+    { bank_transaction_id: 'b1', associe: 'yohan', dry_run: true });
+} catch (e) { refusDoublon = e; }
+verifie('virement déjà porté : refusé', refusDoublon?.code, 'already_linked');
+
+const simulation = await appelle('link_bank_transfer_to_partner_account',
+  { bank_transaction_id: 'b2', associe: 'yohan', dry_run: true });
+verifie('dry_run : rien n\'est écrit, tout est annoncé', simulation.data.dry_run, true);
+verifie('… avec le montant du virement', simulation.data.montant, 300);
+
+let moisFutur = null;
+try { await appelle('get_monthly_summary', { month: '2027-01' }); } catch (e) { moisFutur = e; }
+verifie('mois futur : refusé avec une consigne', moisFutur?.code, 'out_of_range');
 
 console.log('\n── P&L : écritures ex-masquées ──');
 declenche('écritures autrefois masquées → à relire', { legacyMaskedItems: 3 }, 'ecritures-ex-masquees');

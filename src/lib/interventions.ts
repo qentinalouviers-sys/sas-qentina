@@ -27,6 +27,7 @@ import { unmatchedDesignations } from '@/lib/referentiel';
 import { inventorySessions, sessionAtBoundary } from '@/lib/cogs';
 import { isFuelPurchase } from '@/lib/mileage';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
+import { analyseCcaReconciliation, mergeTransferTerms } from '@/lib/cca';
 import { foldLabel, isFinancialFlow, round2 } from './accounting';
 import { computeTva, TvaResult } from './tva';
 
@@ -145,6 +146,13 @@ export interface InterventionFacts {
   tripsNotInCca: { count: number };
   /** Trajets (barème kilométrique) enregistrés dans la période. */
   tripsInPeriod: number;
+  /**
+   * Virements sortants vers un associé que rien ne rattache à un mouvement de
+   * compte courant : le solde affiché doit alors plus que ce qui reste dû.
+   */
+  ccaUnlinkedTransfers: { count: number; amount: number };
+  /** Lignes bancaires portées DEUX fois au compte courant. */
+  ccaDoubleLinked: { count: number };
   /** Pleins de carburant payés par la société dans la période. */
   fuelDebits: { count: number; amount: number };
   /**
@@ -564,6 +572,45 @@ export function detectInterventions(f: InterventionFacts): Intervention[] {
     }
   }
 
+  // ── 11 bis. Virements sortants non portés au compte courant ──────────────
+  // Un apport s'enregistre tout seul ; un remboursement n'existe que si le
+  // virement sortant est rattaché. Tant qu'il ne l'est pas, le compte courant
+  // reste crédité d'une somme déjà versée : la société s'affiche débitrice de
+  // ce qu'elle a déjà payé, et le jour du rattrapage le solde chute d'un coup.
+  if (f.ccaUnlinkedTransfers.count > 0) {
+    out.push({
+      id: 'cca-virements-non-rapproches',
+      severity: 'important',
+      title: `${f.ccaUnlinkedTransfers.count} virement(s) vers un associé non porté(s) au compte courant`,
+      impact:
+        `${eur(f.ccaUnlinkedTransfers.amount)} sont sortis du compte de la société vers ` +
+        `un associé sans mouvement de compte courant en face. Le solde affiché est ` +
+        `surévalué d'autant : la société paraît devoir ce qu'elle a déjà versé.`,
+      action: 'Ouvre le bloc « Rapprochement bancaire » et porte ces virements au compte courant.',
+      href: '/cca',
+      hrefLabel: 'Comptes Associés',
+      amount: f.ccaUnlinkedTransfers.amount,
+    });
+  }
+
+  // ── 11 ter. Un même virement porté deux fois ─────────────────────────────
+  if (f.ccaDoubleLinked.count > 0) {
+    out.push({
+      id: 'cca-virements-en-double',
+      severity: 'critique',
+      title: `${f.ccaDoubleLinked.count} virement(s) porté(s) deux fois au compte courant`,
+      impact:
+        `Le même versement est débité en double : l'associé se retrouve à devoir ` +
+        `de l'argent qu'il n'a jamais reçu, et le verrou « jamais débiteur » finit ` +
+        `par refuser des opérations légitimes.`,
+      action:
+        'Supprime le mouvement en trop depuis Comptes Associés, puis exécute '
+        + 'db/migration_cca_rapprochement.sql pour que le cas ne puisse plus se reproduire.',
+      href: '/cca',
+      hrefLabel: 'Comptes Associés',
+    });
+  }
+
   // ── 12. Factures à date de repli (01/01) ──────────────────────────────────
   if (f.suspectDateInvoices.count > 0) {
     out.push({
@@ -740,7 +787,7 @@ export async function collectInterventionFacts(
   // tronque à 1 000 lignes sans le dire. Sur un exercice de 1 788 commandes, ce
   // module comparait les versements bancaires à un CA amputé de 44 % — et
   // annonçait « des ventes manquantes » en désignant la mauvaise cause.
-  const [orders, lastRes, firstRes, bank, invoices, suppliers, cca, trips, tva, foodLines, ingredients, aliases, maskedRes, counts] =
+  const [orders, lastRes, firstRes, bank, invoices, suppliers, cca, trips, tva, foodLines, ingredients, aliases, maskedRes, termsRes, counts] =
     await Promise.all([
       fetchAllRows<any>((f0, f1) => supabase.from('square_orders')
         .select('service, net_amount, raw_data')
@@ -756,7 +803,7 @@ export async function collectInterventionFacts(
         .order('service', { ascending: true })
         .limit(1),
       fetchAllRows<any>((f0, f1) => supabase.from('bank_transactions')
-        .select('date, description, amount, category, invoice_id')
+        .select('id, date, description, amount, category, invoice_id')
         .gte('date', start).lte('date', end)
         .range(f0, f1)),
       fetchAllRows<any>((f0, f1) => supabase.from('invoices')
@@ -764,7 +811,8 @@ export async function collectInterventionFacts(
       fetchAllRows<any>((f0, f1) => supabase.from('suppliers')
         .select('name').range(f0, f1)),
       fetchAllRows<any>((f0, f1) => supabase.from('mouvements_cca')
-        .select('associe, sens, montant').range(f0, f1)),
+        .select('id, date, associe, sens, montant, rapproche_banque, bank_transaction_id')
+        .range(f0, f1)),
       fetchAllRows<{ id: string; date: string | null; cca_movement_id: string | null }>((f0, f1) => supabase.from('mileage_trips')
         .select('id, date, cca_movement_id').range(f0, f1)),
       computeTva(supabase, start, end),
@@ -776,8 +824,9 @@ export async function collectInterventionFacts(
         .select('id, name').range(f0, f1)),
       fetchAllRows<{ alias: string; ingredient_id: string }>((f0, f1) => supabase.from('ingredient_aliases')
         .select('alias, ingredient_id').range(f0, f1)),
-      // Bornée par construction : une clé de réglage.
+      // Bornées par construction : deux clés de réglage.
       supabase.from('app_settings').select('value').eq('key', 'masked_items').limit(1),
+      supabase.from('app_settings').select('value').eq('key', 'cca_transfer_terms').limit(1),
       fetchAllRows<{ ingredient_id: string; quantity: number | null; unit_price: number | null; counted_at: string }>(
         (f0, f1) => supabase.from('inventory_counts')
           .select('ingredient_id, quantity, unit_price, counted_at').range(f0, f1)),
@@ -843,6 +892,27 @@ export async function collectInterventionFacts(
     const signed = m.sens === 'apport' ? (m.montant || 0) : -(m.montant || 0);
     balances.set(m.associe, round2((balances.get(m.associe) || 0) + signed));
   }
+
+  // Virements sortants vers un associé que rien ne rattache. Le rapprochement
+  // ne porte que sur la période examinée : les liens vers des lignes hors
+  // fenêtre ne sont donc pas interprétés comme des orphelins ici.
+  let transferTerms = mergeTransferTerms(null);
+  try {
+    const raw = termsRes.data?.[0]?.value;
+    if (raw) transferTerms = mergeTransferTerms(JSON.parse(raw));
+  } catch {
+    // réglage illisible → prénoms par défaut
+  }
+  const rapprochement = analyseCcaReconciliation(
+    cca,
+    bank.map(t => ({ id: t.id, date: t.date, description: t.description || '', amount: t.amount || 0 })),
+    transferTerms,
+    suppliers.map(s => String(s.name || '')),
+  );
+  const ccaUnlinkedTransfers = {
+    count: rapprochement.unlinked.length,
+    amount: round2(rapprochement.unlinked.reduce((s, u) => s + Math.abs(u.line.amount || 0), 0)),
+  };
 
   // Trajets à porter au compte courant : ceux d'au moins 45 jours. Une note
   // de frais se fait au mois ou au trimestre, pas le lendemain de la course.
@@ -913,6 +983,8 @@ export async function collectInterventionFacts(
     mojibakeSuppliers: mojibake,
     ccaBalances: [...balances].map(([associe, balance]) => ({ associe, balance })),
     tripsNotInCca: { count: tripsNotInCca },
+    ccaUnlinkedTransfers,
+    ccaDoubleLinked: { count: rapprochement.doubleLinked.length },
     tripsInPeriod,
     fuelDebits: { count: fuelCount, amount: round2(fuelAmount) },
     unmatchedDesignations: {

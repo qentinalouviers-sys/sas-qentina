@@ -6,7 +6,7 @@ import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate } from '@/lib/utils';
 import { KpiCard } from '@/components/ui';
 import { suggestInvoicesForTransaction, sumDebits } from '@/lib/reconciliation';
-import { checkCcaOperation, describeCcaViolation } from '@/lib/cca';
+import { checkCcaOperation, describeCcaViolation, matchAssociate, mergeTransferTerms } from '@/lib/cca';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { Upload, Landmark, AlertCircle, CheckCircle, Filter, ScanLine, Scissors, Plus, Trash2 } from 'lucide-react';
 
@@ -60,6 +60,7 @@ export default function BanquePage() {
   const [filterStatus, setFilterStatus] = useState('pending_invoice');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [ccaMovements, setCcaMovements] = useState<any[]>([]);
+  const [transferTerms, setTransferTerms] = useState(() => mergeTransferTerms(null));
   const [recategorizing, setRecategorizing] = useState(false);
 
   /** Solde du compte courant d'un associé à une date donnée (incluse). */
@@ -79,7 +80,7 @@ export default function BanquePage() {
     // Requêtes indépendantes lancées en parallèle
     // Les deux premières lectures sont paginées : Supabase tronque à 1 000
     // lignes sans le signaler, et un historique bancaire les dépasse vite.
-    const [invoiceRows, txList, settingsRes, movementsRes] = await Promise.all([
+    const [invoiceRows, txList, settingsRes, movementsRes, termsRes] = await Promise.all([
       fetchAllRows<any>((f0, f1) => supabase
         .from('invoices')
         .select('*, supplier:suppliers(*)')
@@ -95,9 +96,15 @@ export default function BanquePage() {
         .select('value')
         .eq('key', 'transaction_classifications')
         .limit(1),
-      supabase
+      fetchAllRows<{ associe: string; sens: string; montant: number; date: string }>((f0, f1) => supabase
         .from('mouvements_cca')
-        .select('associe, sens, montant, date'),
+        .select('associe, sens, montant, date')
+        .range(f0, f1)),
+      supabase
+        .from('app_settings')
+        .select('value')
+        .eq('key', 'cca_transfer_terms')
+        .maybeSingle(),
     ]);
 
     setInvoices(invoiceRows);
@@ -122,7 +129,17 @@ export default function BanquePage() {
     // annoncer le solde À LA DATE du mouvement, pas le solde final — sinon il
     // affiche « solde suffisant » pour un remboursement d'avril couvert par un
     // apport de juin.
-    setCcaMovements(movementsRes.data || []);
+    setCcaMovements(movementsRes);
+
+    // Termes qui désignent un associé dans un libellé de virement. Se règlent
+    // depuis la page Comptes Associés ; à défaut, les prénoms.
+    try {
+      setTransferTerms(mergeTransferTerms(
+        termsRes.data?.value ? JSON.parse(termsRes.data.value) : null
+      ));
+    } catch {
+      setTransferTerms(mergeTransferTerms(null));
+    }
 
     setTransactions(txList);
     setLoading(false);
@@ -410,7 +427,31 @@ export default function BanquePage() {
         return;
       }
 
-      // 2. Insert movement
+      // 2. Cette ligne bancaire est-elle déjà portée au compte courant ?
+      //
+      // Un double clic, un retour arrière, une page rechargée : le même
+      // virement débitait le compte courant deux fois, et l'associé se
+      // retrouvait à devoir de l'argent qu'il n'a jamais reçu. L'index unique
+      // sur bank_transaction_id l'interdit désormais ; on le dit ici avant
+      // d'envoyer, pour montrer un message compréhensible plutôt qu'un
+      // « duplicate key value violates unique constraint ».
+      const { data: already, error: dupErr } = await supabase
+        .from('mouvements_cca')
+        .select('id, date, associe, montant')
+        .eq('bank_transaction_id', tx.id)
+        .maybeSingle();
+      if (dupErr && dupErr.code !== 'PGRST116') throw dupErr;
+      if (already) {
+        alert(
+          `Ce virement est déjà porté au compte courant de ${already.associe === 'justine' ? 'Justine' : 'Yohan'} `
+          + `(${formatCurrency(Number(already.montant))} au ${formatDate(already.date)}).\n\n`
+          + `L'enregistrer une seconde fois débiterait deux fois le même virement.`
+        );
+        setLoading(false);
+        return;
+      }
+
+      // 3. Insert movement
       const { error: insertErr } = await supabase
         .from('mouvements_cca')
         .insert({
@@ -425,9 +466,18 @@ export default function BanquePage() {
           bank_transaction_id: tx.id
         });
 
-      if (insertErr) throw insertErr;
+      if (insertErr) {
+        // 23505 : l'index unique a joué — une autre session a rapproché ce
+        // virement entre-temps. Ce n'est pas une panne, c'est le garde-fou.
+        if (insertErr.code === '23505') {
+          alert("Ce virement vient d'être rapproché ailleurs : rien n'a été enregistré en double.");
+          await loadData();
+          return;
+        }
+        throw insertErr;
+      }
 
-      // 3. Update bank transaction
+      // 4. Update bank transaction
       const { error: updateErr } = await supabase
         .from('bank_transactions')
         .update({
@@ -580,11 +630,13 @@ export default function BanquePage() {
 
   const renderCcaSuggestion = (t: any, mobile = false) => {
     if (t.status !== 'pending_invoice' || t.amount >= 0) return null;
-    const desc = t.description?.toLowerCase() || '';
-    const isJustine = desc.includes('justine');
-    const isYohan = desc.includes('yohan');
-    if (!isJustine && !isYohan) return null;
-    const partner: 'justine' | 'yohan' = isJustine ? 'justine' : 'yohan';
+    // Déjà porté au compte courant : plus rien à suggérer.
+    if (t.mouvements_cca && t.mouvements_cca.length > 0) return null;
+    // Les termes reconnus sont paramétrables depuis la page Comptes Associés :
+    // un virement libellé « VIR SEPA DE FARIA » n'a aucun prénom, et restait
+    // invisible tant que la reconnaissance était codée en dur.
+    const partner = matchAssociate(t.description || '', transferTerms);
+    if (!partner) return null;
     const partnerName = partner === 'justine' ? 'Justine' : 'Yohan';
     const balance = ccaBalanceAt(partner, t.date);
     const reimbursementAmount = Math.abs(t.amount);
