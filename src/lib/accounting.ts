@@ -116,13 +116,26 @@ export function estimatedVatRate(category: string | null | undefined): number {
   }
 }
 
-/** TVA d'une facture — 0 si elle est marquée non récupérable. */
+/**
+ * TVA d'une facture — 0 si elle est marquée non récupérable.
+ *
+ * La TVA LUE sur le document (`tva_amount`, pied de facture) prime sur
+ * TTC − HT : la différence entre les deux est ce que le document porte hors
+ * champ de TVA — consigne, frais, arrondis. Sur une facture Metro avec
+ * consigne de bouteilles, TTC − HT surestimait la TVA déductible du montant
+ * de la consigne. Une facture enregistrée avant cette colonne (tva_amount
+ * null) garde l'ancien calcul.
+ */
 export function invoiceVat(inv: {
   total_ht: number | null;
   total_ttc: number | null;
+  tva_amount?: number | null;
   tva_recoverable?: boolean | null;
 }): number {
   if (inv.tva_recoverable === false) return 0;
+  if (inv.tva_amount !== null && inv.tva_amount !== undefined && Number.isFinite(Number(inv.tva_amount))) {
+    return Math.max(0, Math.round(Number(inv.tva_amount) * 100) / 100);
+  }
   const ttc = inv.total_ttc || 0;
   const ht = inv.total_ht || 0;
   return Math.max(0, Math.round((ttc - ht) * 100) / 100);

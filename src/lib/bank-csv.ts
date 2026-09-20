@@ -23,10 +23,50 @@ export interface ParsedBankRow {
   categoryKey: string;
 }
 
+/**
+ * Contrôle de solde : la banque imprime le solde avant et après la période.
+ * Si solde d'ouverture + somme des opérations lues ≠ solde de clôture, des
+ * lignes ont été perdues (format non reconnu, fichier coupé) et l'import
+ * doit être refusé — pas signalé dans un journal que personne ne lit.
+ */
+export interface BalanceCheck {
+  opening: number;
+  closing: number;
+  /** Somme signée des opérations lues. */
+  sumRows: number;
+  /** clôture − (ouverture + somme). 0 = concordance au centime. */
+  gap: number;
+  ok: boolean;
+}
+
 export interface BankCsvResult {
   rows: ParsedBankRow[];
   /** Lignes écartées : soldes d'ouverture/clôture, en-têtes, lignes vides. */
   skipped: number;
+  /** Lignes non reconnues alors qu'elles ressemblent à une opération (date valide, montant illisible…). */
+  suspicious: string[];
+  /** Null si le fichier ne porte pas deux lignes de solde exploitables. */
+  balance: BalanceCheck | null;
+}
+
+const cents = (n: number) => Math.round(n * 100);
+
+/**
+ * Vérifie ouverture + Σ = clôture. Les deux soldes sont donnés dans l'ordre du
+ * fichier ; comme certaines banques exportent du plus récent au plus ancien,
+ * les deux sens sont essayés — un seul peut tomber juste, sauf si la somme
+ * des opérations est nulle, auquel cas les deux sont vrais et c'est correct.
+ */
+export function checkBalance(first: number, last: number, rows: readonly { amount: number }[]): BalanceCheck {
+  const sum = rows.reduce((s, r) => s + cents(r.amount), 0);
+  const forward = cents(last) - (cents(first) + sum);
+  const backward = cents(first) - (cents(last) + sum);
+  // Le sens inverse n'est retenu que s'il tombe juste : sinon on rend l'écart
+  // dans l'ordre du fichier, le plus lisible pour qui compare au relevé.
+  if (forward !== 0 && backward === 0) {
+    return { opening: last, closing: first, sumRows: sum / 100, gap: 0, ok: true };
+  }
+  return { opening: first, closing: last, sumRows: sum / 100, gap: forward / 100, ok: forward === 0 };
 }
 
 const DATE_RE = /^(\d{2})\/(\d{2})\/(\d{4})$/;
@@ -64,22 +104,36 @@ export function parseBankCsv(text: string): BankCsvResult {
   const lines = clean.split(/\r?\n/).filter(l => l.trim());
 
   const rows: ParsedBankRow[] = [];
+  const balances: number[] = [];
+  const suspicious: string[] = [];
   let skipped = 0;
 
   for (const line of lines) {
     const f = line.split(';');
+    const dateMatch = f[0]?.trim().match(DATE_RE);
+    const rawAmount = f[1]?.trim() ?? '';
+    const amountOk = AMOUNT_RE.test(rawAmount);
 
     // Les lignes de solde d'ouverture et de clôture portent une date et un
     // montant valides mais seulement quatre colonnes. Sans ce filtre, elles
-    // entreraient en base comme deux opérations fantômes.
-    if (f.length < 6) { skipped++; continue; }
+    // entreraient en base comme deux opérations fantômes. On les garde de
+    // côté : elles servent au contrôle de solde.
+    if (f.length < 6) {
+      skipped++;
+      if (dateMatch && amountOk) balances.push(parseFloat(rawAmount.replace(',', '.')));
+      continue;
+    }
 
-    const dateMatch = f[0]?.trim().match(DATE_RE);
-    const rawAmount = f[1]?.trim() ?? '';
-    if (!dateMatch || !AMOUNT_RE.test(rawAmount)) { skipped++; continue; }
+    if (!dateMatch || !amountOk) {
+      skipped++;
+      // Une date valide sans montant lisible (ou l'inverse) est une opération
+      // que le lecteur ne sait pas lire : à signaler, pas à taire.
+      if (dateMatch || amountOk) suspicious.push(line.slice(0, 80));
+      continue;
+    }
 
     const amount = parseFloat(rawAmount.replace(',', '.'));
-    if (!Number.isFinite(amount)) { skipped++; continue; }
+    if (!Number.isFinite(amount)) { skipped++; suspicious.push(line.slice(0, 80)); continue; }
 
     // Selon le type d'opération, la banque écrit le libellé en 5ᵉ colonne
     // (carte, prélèvement) ou en 6ᵉ (virement SEPA).
@@ -94,7 +148,11 @@ export function parseBankCsv(text: string): BankCsvResult {
     });
   }
 
-  return { rows, skipped };
+  const balance = balances.length === 2 && rows.length > 0
+    ? checkBalance(balances[0], balances[1], rows)
+    : null;
+
+  return { rows, skipped, suspicious, balance };
 }
 
 /**

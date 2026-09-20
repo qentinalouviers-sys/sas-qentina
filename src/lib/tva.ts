@@ -54,6 +54,12 @@ export interface TvaResult {
   /** Positif = à payer, négatif = crédit de TVA. */
   netTva: number;
   collectedTvaBreakdown: TvaBreakdown;
+  /**
+   * TVA déductible par taux, lue dans la ventilation des factures. Les
+   * factures sans ventilation (anciennes, tickets) vont dans `nonVentile`.
+   * Sert de contrôle : une TVA à 20 % chez un grossiste alimentaire se voit.
+   */
+  deductibleTvaBreakdown: TvaBreakdown;
 
   // ── Indicateurs de pilotage, NON déclarables ────────────────────────────
   /**
@@ -236,7 +242,7 @@ export async function computeTva(
       .lte('service', endStr)
       .range(from, to)),
     fetchAllRows<any>((from, to) => supabase.from('invoices')
-      .select('id, total_ht, total_ttc, tva_recoverable, supplier:suppliers(name)')
+      .select('id, total_ht, total_ttc, tva_amount, tva_breakdown, tva_recoverable, supplier:suppliers(name)')
       .gte('date', startStr)
       .lte('date', endStr)
       .range(from, to)),
@@ -277,13 +283,29 @@ export async function computeTva(
 
   let deductibleCents = 0;
   let invoiceCount = 0;
+  const dedCents: Record<keyof TvaBreakdown, number> = { '5.5%': 0, '10%': 0, '20%': 0, nonVentile: 0 };
 
   for (const inv of invoicesList) {
     const supName: string = (inv.supplier as any)?.name || 'Inconnu';
     if (maskedSuppliers.includes(supName)) continue;
     const tva = invoiceVat(inv);
     if (tva > 0) invoiceCount++;
-    deductibleCents += Math.round(tva * 100);
+    const tvaCents = Math.round(tva * 100);
+    deductibleCents += tvaCents;
+
+    // Ventilation lue sur le document. Le total reste celui de la facture :
+    // ce que la ventilation n'explique pas (écart, taux 2,1 %) va en résidu.
+    let ventile = 0;
+    if (tvaCents > 0 && Array.isArray(inv.tva_breakdown)) {
+      for (const v of inv.tva_breakdown as { taux?: number; montant_tva?: number }[]) {
+        const bucket = bucketForPercentage(Number(v?.taux));
+        const c = Math.round((Number(v?.montant_tva) || 0) * 100);
+        if (!bucket || c <= 0 || ventile + c > tvaCents) continue;
+        dedCents[bucket] += c;
+        ventile += c;
+      }
+    }
+    dedCents.nonVentile += tvaCents - ventile;
   }
 
   // ── 3. Indicateur : ce qui serait récupérable avec les factures ──────────
@@ -325,6 +347,12 @@ export async function computeTva(
       '10%': round2(cents['10%'] / 100),
       '20%': round2(cents['20%'] / 100),
       nonVentile: round2(cents.nonVentile / 100),
+    },
+    deductibleTvaBreakdown: {
+      '5.5%': round2(dedCents['5.5%'] / 100),
+      '10%': round2(dedCents['10%'] / 100),
+      '20%': round2(dedCents['20%'] / 100),
+      nonVentile: round2(dedCents.nonVentile / 100),
     },
     recoverableIfInvoiced: round2(recoverableCents / 100),
     unInvoicedCount,

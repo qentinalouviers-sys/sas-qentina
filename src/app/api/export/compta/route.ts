@@ -46,7 +46,7 @@ export async function GET(request: NextRequest) {
     fetchAllRows<OrderRow>((f0, f1) => supabase.from('square_orders')
       .select('id, service, net_amount, raw_data').gte('service', start).lte('service', end).range(f0, f1)),
     fetchAllRows<InvoiceFetched>((f0, f1) => supabase.from('invoices')
-      .select('id, date, invoice_number, accounting_ref, accounting_class, total_ht, total_ttc, tva_recoverable, supplier:suppliers(name)')
+      .select('id, date, invoice_number, accounting_ref, accounting_class, total_ht, total_ttc, tva_amount, tva_recoverable, supplier:suppliers(name)')
       .gte('date', start).lte('date', end).range(f0, f1)),
     fetchAllRows<BankRow>((f0, f1) => supabase.from('bank_transactions')
       .select('id, date, description, amount, category, invoice_id').gte('date', start).lte('date', end).range(f0, f1)),

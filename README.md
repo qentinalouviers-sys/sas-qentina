@@ -39,6 +39,7 @@ npm run dev
 | `OCR_PROVIDER` | `gemini` ou `anthropic`. Vide = Gemini si sa clé existe, sinon Claude |
 | `GEMINI_MODEL` | Modèle Gemini. Vide = `gemini-2.5-flash` |
 | `GEMINI_THINKING_BUDGET` | Budget de raisonnement Gemini. `0` par défaut (économie) |
+| `OCR_CONTROL` | `off` désactive la **lecture de contrôle** des totaux (second appel, moteur croisé). Activée par défaut : à ne couper qu'en cas de quota |
 | `SQUARE_ACCESS_TOKEN` | Jeton d'accès Square |
 | `SQUARE_LOCATION_ID` | Identifiant du point de vente Square |
 | `SQUARE_WEBHOOK_SECRET` | **Important** : secret de signature du webhook (Square Developer Dashboard) |
@@ -66,6 +67,34 @@ Trois choses à savoir :
 Le moteur réellement utilisé est visible à trois endroits : la pastille d'état en
 haut de l'application, le champ `ocr_engine` renvoyé par `/api/scanner`, et
 `config.ocr_provider` dans `/api/scanner/health`.
+
+### Ce que l'OCR fait, et ce qu'il ne fait plus
+
+**L'IA recopie, le code calcule.** Le modèle rend les totaux, la ventilation
+de TVA par taux, et pour chaque ligne la quantité et le conditionnement *tels
+qu'imprimés* (« 2 × 25 kg »). Il ne divise plus, ne convertit plus, ne
+« corrige » plus un total. Les prix au kilo et les unités standard sont
+dérivés par `lib/invoice-normalize.ts`, déterministe et testé. Un champ
+illisible vaut `null`, jamais 0 — un total absent n'est pas un total nul, et
+l'écran le dit.
+
+**Chaque facture est lue deux fois.** Les champs qui font la comptabilité
+(fournisseur, date, numéro, HT, TVA, TTC) sont relus par un second appel,
+court, avec une autre consigne et — quand les deux clés existent — par
+l'autre moteur. Deux lectures qui divergent sont affichées côte à côte ;
+l'humain tranche sur le document. Côté Gemini, un schéma JSON est imposé à la
+réponse : plus de champ manquant ni de montant rendu en chaîne.
+
+**La relecture permet de corriger.** Le Scanner affiche un formulaire complet
+(totaux, ventilation, lignes), surligne ce que l'OCR jugeait incertain et ce
+qu'une anomalie vise, et recalcule les anomalies à chaque frappe avec la même
+fonction que le serveur. Ce qui a été corrigé est tracé en base (`ocr_meta`) :
+on sait, fournisseur par fournisseur, ce que l'OCR rate.
+
+**La TVA déductible est celle du document.** `invoices.tva_amount` reçoit le
+montant imprimé en pied de facture, `tva_breakdown` la ventilation par taux.
+TTC − HT n'est plus qu'un repli pour les factures antérieures : une consigne
+de bouteilles n'est pas de la TVA.
 
 Gemini accepte en plus le **HEIC/HEIF** des iPhone, que Claude refusait : les
 photos prises sans changer les réglages de l'appareil passent désormais.
@@ -173,6 +202,9 @@ appel est journalisé (`agent_calls`) et visible dans Réglages → Agents IA.
 9. Rapprochement des virements associés : exécuter `db/migration_cca_rapprochement.sql`
    (un virement bancaire ne peut plus être porté deux fois au compte courant).
 10. Accès des agents IA : exécuter `db/migration_agent_api.sql` (clés d'accès + journal des appels).
+11. TVA lue sur la facture et trace OCR : exécuter `db/migration_fiabilite.sql`
+    (`tva_amount`, `tva_breakdown`, `ocr_meta`). **Obligatoire** : sans elle, l'enregistrement
+    d'une facture échoue.
 
 > ⚠️ La migration consolidée est à **ré-exécuter** après une mise à jour qui
 > ajoute une catégorie bancaire : la contrainte `CHECK` de `bank_transactions`
@@ -243,13 +275,14 @@ base et consomme l'API Square.
 npm run verify:compta
 ```
 
-317 contrôles de non-régression sur les calculs de TVA, la classification des
+487 contrôles de non-régression sur les calculs de TVA, la classification des
 écritures, le lettrage, la détection des anomalies, les verrous à
-l'enregistrement d'une facture, le référentiel, la règle du compte courant, le
-coût matières consommé et l'équilibre de chaque écriture exportée. **À lancer après toute
+l'enregistrement d'une facture, la normalisation de ce que l'OCR renvoie, le
+contrôle de solde d'un relevé bancaire, le référentiel, la règle du compte
+courant, le coût matières consommé et l'équilibre de chaque écriture exportée. **À lancer après toute
 modification touchant `src/lib/tva.ts`, `src/lib/accounting.ts`,
 `src/lib/bank-csv.ts`, `src/lib/interventions.ts`, `src/lib/reconciliation.ts`,
-`src/lib/invoice-checks.ts`, `src/lib/referentiel.ts`, `src/lib/cca.ts`,
+`src/lib/invoice-checks.ts`, `src/lib/invoice-normalize.ts`, `src/lib/referentiel.ts`, `src/lib/cca.ts`,
 `src/lib/cogs.ts`, `src/lib/fec.ts`, le P&L ou le tableau de bord.** Chaque contrôle correspond à une erreur qui a
 réellement été commise : TVA déduite sans facture, ventilation par taux ne
 réconciliant pas avec son total, taux à 7 % classé en 5,5 %, encaissement traité
@@ -285,7 +318,8 @@ avant la déclaration de TVA. Quatre verrous, du plus au moins strict :
 |---|---|---|
 | **Compte courant d'associé** | Trigger Postgres (`db/migration_cca_verrou.sql`), miroir `lib/cca.ts` | Tout mouvement qui rend un solde débiteur à partir de sa date, quel que soit le chemin (écran, API, SQL). Art. L.225-43 C. com. |
 | **Facture incohérente** | `lib/invoice-checks.ts`, appliqué par `saveInvoice` | Pas de date, date future, HT > TTC, montants nuls, fournisseur absent. Refus sec. |
-| **Facture inhabituelle** | idem | 1er janvier, plus de 18 mois, pas de numéro, HT + TVA ≠ TTC, lignes qui ne somment pas, HT = TTC, plus de 5 000 €. Chaque point exige une coche « j'ai vérifié » ; le serveur recompte et refuse ce qui n'est pas acquitté. |
+| **Facture inhabituelle** | idem | 1er janvier, plus de 18 mois, pas de numéro, HT + TVA ≠ TTC, taux implicite > 20 %, ventilation par taux qui ne tombe pas juste, lignes qui ne somment pas, HT = TTC, plus de 5 000 €, **deux lectures OCR qui divergent**, champs déclarés incertains ou non lus, **doublon probable** (même numéro chez le même fournisseur, ou même jour et même montant). Chaque point exige une coche « j'ai vérifié » ; le serveur recompte et refuse ce qui n'est pas acquitté. |
+| **Relevé bancaire** | `lib/bank-csv.ts`, `/api/bank/extract` | Solde d'ouverture + Σ opérations ≠ solde de clôture : import refusé (422) avec l'écart au centime, CSV comme PDF. Import forcé possible, mais en le sachant. |
 | **Référentiel** | `lib/referentiel.ts` | Un libellé de facture ne met à jour un prix que s'il correspond **exactement** à un ingrédient ou à un alias validé. Plus de création automatique ; les orphelins attendent dans Réglages. |
 
 Trois principes derrière ces verrous :

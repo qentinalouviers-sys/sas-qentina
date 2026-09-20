@@ -240,18 +240,25 @@ export default function BanquePage() {
 
     setUploading(true);
 
-    const sendToApi = async (body: { pdfBase64: string } | { csvText: string }) => {
+    const sendToApi = async (body: { pdfBase64: string } | { csvText: string }, force = false) => {
       try {
         const res = await fetch('/api/bank/extract', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
+          body: JSON.stringify({ ...body, force }),
         });
 
         const data = await res.json();
         if (data.success) {
-          alert(`Import réussi : ${data.count} nouvelles transactions ajoutées.`);
+          alert(`Import réussi : ${data.count} nouvelles transactions ajoutées.${data.message ? `\n\n${data.message}` : ''}`);
           loadData();
+        } else if (data.balance_mismatch && !force) {
+          // Le serveur a refusé : ouverture + opérations ≠ clôture. On peut
+          // forcer, mais en sachant que des lignes manquent probablement.
+          if (confirm(`${data.error}\n\nImporter quand même ? Les montants lus seront exacts, mais le relevé sera incomplet et le rapprochement bancaire faux jusqu'à correction.`)) {
+            setUploading(true);
+            await sendToApi(body, true);
+          }
         } else {
           alert('Erreur extraction : ' + (data.error || 'Inconnu'));
         }

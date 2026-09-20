@@ -35,6 +35,12 @@ interface GeminiOptions {
   maxOutputTokens?: number;
   /** Force une sortie JSON stricte côté serveur Google. */
   responseJson?: boolean;
+  /**
+   * Schéma (sous-ensemble OpenAPI) imposé à la réponse. Avec lui, Google
+   * refuse de produire un champ manquant ou d'un mauvais type : plus de
+   * « total_ttc » rendu en chaîne ni de clé oubliée sur une facture longue.
+   */
+  responseSchema?: Record<string, unknown>;
 }
 
 export interface GeminiResult {
@@ -113,6 +119,7 @@ export async function callGemini(options: GeminiOptions): Promise<GeminiResult> 
       temperature: 0,
       maxOutputTokens: options.maxOutputTokens ?? 32000,
       ...(options.responseJson ? { responseMimeType: 'application/json' } : {}),
+      ...(options.responseSchema ? { responseSchema: options.responseSchema } : {}),
       ...(Number.isFinite(thinkingBudget) ? { thinkingConfig: { thinkingBudget } } : {}),
     },
   };

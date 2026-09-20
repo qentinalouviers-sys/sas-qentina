@@ -1031,6 +1031,42 @@ l'être, et exige un contrôle humain là où une donnée fausse coûterait cher
 - **`verify:compta` passe de 171 à 317 contrôles.** Chaque verrou est testé dans les deux
   sens : il refuse ce qu'il faut, et il se tait sur une facture normale.
 
+## 7 ter. Révision du 20 septembre 2026 — des chiffres dont on est sûr
+
+*Objectif fixé : que l'entrée des chiffres — lecture des factures, des relevés, TVA —
+soit la plus fiable possible. Un chiffre faux qui entre contamine tout ce qui suit.*
+
+### Ce qui rendait les chiffres fragiles, et ce qui a été fait
+
+| Constat | Correction |
+|---|---|
+| **La relecture humaine ne permettait rien.** L'écran du Scanner affichait cinq pastilles (fournisseur, date, TTC, compte, numéro) et un bouton. Le HT et la TVA — les deux montants qui font la déclaration — n'étaient pas visibles, et rien n'était modifiable. Une anomalie « saisis le fournisseur » n'avait aucun champ où le saisir : la seule issue était de retirer la facture. | `components/InvoiceReviewForm.tsx` : formulaire complet (identité, HT/TVA/TTC, ventilation par taux, lignes), champs incertains surlignés, champs visés par une anomalie en rouge, marqueur « corrigé » avec retour à la lecture OCR. Les anomalies sont recalculées à chaque frappe par `checkInvoice`, la même fonction que le serveur. |
+| **L'IA faisait de l'arithmétique.** Le prompt demandait le prix ramené au kilo (« si le carton de 25 kg coûte 50 €, prix_unitaire_ht = 2 ») et un `0` pour toute valeur illisible — indiscernable d'un vrai zéro. | Prompt v2 : l'IA recopie ce qui est imprimé (quantité lue, conditionnement « 25 kg », montant de ligne, totaux, ventilation de TVA), `null` pour l'illisible, liste des champs incertains. `lib/invoice-normalize.ts` dérive unités standard et prix unitaires en code, testé sur « 6 x 1 L », « 12x33cl », « 500 g », le vrac au kg. Les valeurs lues sont conservées pour l'audit. |
+| **Une seule lecture, aucune vérification.** Un TTC lu 1 100 au lieu de 1 010 entrait si HT + TVA tombait juste par hasard, ou après une coche. | **Lecture de contrôle** : second appel, consigne différente, moteur croisé (Claude contrôle Gemini et inversement quand les deux clés existent). Les deux lectures sont comparées champ par champ ; une divergence est un point à confirmer, avec les deux valeurs. Ne fait jamais échouer le scan ; si elle manque, l'écran dit que la facture n'a été lue qu'une fois. `OCR_CONTROL=off` pour la couper. |
+| **Le JSON de Gemini était « réparé » plutôt que garanti.** | `responseSchema` imposé à l'API : types, énumérations et présence des clés sont garantis par Google. |
+| **TVA déductible = TTC − HT.** Faux dès que le TTC contient autre chose : consigne de bouteilles chez un grossiste en boissons, frais hors champ. | `invoices.tva_amount` (montant imprimé) et `tva_breakdown` (ventilation par taux), migration `db/migration_fiabilite.sql`. `invoiceVat` préfère le montant lu ; TTC − HT reste le repli des factures antérieures. L'export FEC met 20 € en 44566 et 5 € de consigne en charge, nommés — et reste équilibré. La page TVA montre la déductible par taux lu. |
+| **Contrôles arithmétiques incomplets.** Un HT lu sur un sous-total (taux implicite de 50 %) passait ; une ventilation par taux n'était pas lue du tout. | Nouveaux points à confirmer : taux implicite > 20 %, ventilation dont un montant ≠ base × taux, dont Σ bases ≠ HT ou Σ TVA ≠ TVA, taux inconnu (7 %). Tolérance : 5 centimes + 0,1 % de la base. |
+| **Doublon = cul-de-sac, et mal détecté.** Un numéro identique chez un *autre* fournisseur bloquait une vraie facture (TVA perdue) ; le même jour et le même montant chez un autre fournisseur aussi. Aucune issue à l'écran. | `findDuplicateInvoice` : même numéro (casse, espaces, tirets ignorés) chez le même fournisseur, ou même jour et montant chez le même fournisseur. Résultat : un point à confirmer avec la facture existante affichée. Le serveur refait la recherche à l'enregistrement. |
+| **Le seuil des tickets était en TTC**, et un reçu CB ou un bon de livraison ouvrait droit à déduction. | Seuil à 150 € HT (art. 242 nonies A). Reçu CB et bon de livraison : TVA non déduite, avec une information à l'écran (niveau `info`, sans coche). |
+| **Le serveur reprenait les conclusions de l'écran.** `tva_recoverable` arrivait du client ; les montants n'étaient pas coercés. | `saveInvoice` re-normalise tout, recalcule la TVA récupérable, refait la recherche de doublon, puis recompte les anomalies. `ocr_meta` conserve moteur, lecture de contrôle, champs incertains, champs corrigés et coches. |
+| **Relevé bancaire : aucun contrôle de complétude.** L'audit d'août avait vérifié à la main que solde d'ouverture + 177 opérations = solde de clôture. Rien ne le refaisait à chaque import ; une ligne au format inattendu disparaissait sans bruit. | `parseBankCsv` lit les lignes de solde et vérifie ouverture + Σ = clôture (les deux sens du fichier sont acceptés). Écart → **import refusé** (422) avec l'écart au centime et les lignes suspectes ; import forcé possible depuis la page Banque, en le sachant. Même contrôle sur un PDF avec les soldes lus par l'IA — le seul filet qui existe sur cette voie. Les règles locales passent avant l'IA sur les deux voies. |
+
+### Ce qu'il faut savoir
+
+- **Une migration à jouer : `db/migration_fiabilite.sql`.** Sans elle, l'enregistrement
+  d'une facture échoue (colonnes `tva_amount`, `tva_breakdown`, `ocr_meta`). Les factures
+  antérieures gardent TTC − HT comme TVA : elles apparaissent « sans ventilation » sur la
+  page TVA, ce qui est exact.
+- **Chaque scan fait deux appels IA.** Le second est court (une image relue, une vingtaine
+  de tokens en sortie). C'est le prix d'une double saisie ; `OCR_CONTROL=off` le supprime
+  si un quota l'exige.
+- **Ce qui reste hors de portée de l'outil** : une facture lue juste deux fois mais
+  fausse sur le papier ; un PDF bancaire sans soldes imprimés (le contrôle dit alors qu'il
+  est impossible, il ne fait pas semblant).
+- **`verify:compta` passe de 317 à 487 contrôles.** Normalisation OCR (nombres français,
+  conditionnements, idempotence), double lecture, ventilation, doublon, TVA lue, FEC avec
+  consigne, contrôle de solde dans les deux sens et avec une ligne manquante.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 **Chantiers de fond :**

@@ -49,6 +49,8 @@ export interface OrderRow { id: string; service: string; net_amount: number | nu
 export interface InvoiceRow {
   id: string; date: string; invoice_number: string | null; accounting_ref: string | null;
   accounting_class: string | null; total_ht: number | null; total_ttc: number | null;
+  /** TVA lue en pied de facture ; null sur les factures enregistrées avant cette colonne. */
+  tva_amount?: number | null;
   tva_recoverable: boolean | null; supplier: { name: string | null } | null;
   lines: { category: string | null; total_ht: number | null }[];
 }
@@ -178,13 +180,19 @@ export function buildPurchaseEntries(invoices: readonly InvoiceRow[], month: str
       e.add(CHARGES_PAR_CATEGORIE_LIGNE[cat], `${lib} — ${cat}`, amount / 100, 0, undefined);
       allocated += amount;
     }
-    const tva = ttc - ht;
+    // TVA lue sur le document quand elle existe ; sinon TTC − HT. Ce que le
+    // TTC contient au-delà de HT + TVA (consigne, frais hors champ) n'est
+    // ni charge HT ni TVA : il part sur la classe de la facture, nommé.
+    const tvaLue = inv.tva_amount !== null && inv.tva_amount !== undefined ? Math.max(0, cents(inv.tva_amount)) : null;
+    const tva = Math.min(Math.max(0, ttc - ht), tvaLue ?? Math.max(0, ttc - ht));
+    const horsTva = ttc - ht - tva;
     const deductible = inv.tva_recoverable !== false && tva > 0;
     // Une TVA non récupérable (ticket sans nom de société) est un coût :
     // elle rejoint la charge plutôt que le compte de TVA.
     const chargeResidual = (ht - allocated) + (deductible ? 0 : tva);
     if (chargeResidual !== 0) e.add(classe, `${lib} — ${allocated ? 'écart lignes/total' : 'total HT'}${deductible ? '' : ' (TVA non récupérable incluse)'}`, chargeResidual / 100, 0);
     if (deductible) e.add(COMPTES.tvaDeductible, `${lib} — TVA déductible`, tva / 100, 0);
+    if (horsTva !== 0) e.add(classe, `${lib} — hors champ TVA (consigne, frais)`, horsTva / 100, 0);
     e.add(COMPTES.fournisseurs, lib, 0, ttc / 100, aux);
 
     out.push(...e.lines);

@@ -11,21 +11,15 @@ import {
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, formatDate } from '@/lib/utils';
 import ClaudeStatusIndicator from '@/components/ClaudeStatusIndicator';
-import type { InvoiceAnomaly } from '@/lib/invoice-checks';
+import InvoiceReviewForm from '@/components/InvoiceReviewForm';
+import { checkInvoice, type InvoiceAnomaly } from '@/lib/invoice-checks';
+import { computeTvaRecoverable, type ExtractedInvoiceData, type DuplicateHint } from '@/lib/invoice-normalize';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-interface ExtractedData {
-  fournisseur: string;
-  date: string;
-  numero_facture: string | null;
-  total_ht: number;
-  total_ttc: number;
-  tva?: number;
-  compte_comptable: string;
-  type_document: string;
-  lignes: any[];
-}
+type ExtractedData = ExtractedInvoiceData;
+
+interface OcrEngine { provider: string; model: string; control: string | null }
 
 interface BankCandidate {
   id: string;
@@ -39,19 +33,21 @@ interface BankCandidate {
 }
 
 interface ScanResult {
+  /** Lecture OCR initiale, jamais modifiée : sert de référence aux corrections. */
   extracted: ExtractedData;
   file_url: string | null;
   is_duplicate: boolean;
-  duplicate_invoice: any | null;
+  duplicate_invoice: DuplicateHint | null;
   bank_candidates: BankCandidate[];
   match_confidence: 'high' | 'medium' | 'low' | 'none';
   /** Points à vérifier avant d'enregistrer (voir lib/invoice-checks.ts). */
   anomalies?: InvoiceAnomaly[];
+  ocr_engine?: OcrEngine;
 }
 
 type QueueStatus =
   | 'pending' | 'reading' | 'uploading' | 'analyzing'
-  | 'matching' | 'complete' | 'error' | 'duplicate';
+  | 'matching' | 'complete' | 'error';
 
 interface QueueItem {
   id: string;
@@ -61,6 +57,8 @@ interface QueueItem {
   progress: number;
   step: string;
   result: ScanResult | null;
+  /** La facture telle que l'humain la corrige ; null tant qu'il n'a rien touché. */
+  edited: ExtractedData | null;
   error: string | null;
   // User action state
   actionTaken: boolean;
@@ -83,7 +81,7 @@ interface MultiPageFile {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MAX_QUEUE = 5;
-const TERMINAL: QueueStatus[] = ['complete', 'error', 'duplicate'];
+const TERMINAL: QueueStatus[] = ['complete', 'error'];
 
 const STATUS_LABEL: Record<QueueStatus, string> = {
   pending:   'En attente',
@@ -93,23 +91,16 @@ const STATUS_LABEL: Record<QueueStatus, string> = {
   matching:  'Rapprochement',
   complete:  'Terminé',
   error:     'Erreur',
-  duplicate: 'Doublon',
 };
 
 // Étapes de progression affichées en points — libellés partagés via STATUS_LABEL.
 const PROGRESS_STEPS: QueueStatus[] = ['reading', 'uploading', 'analyzing', 'matching'];
 const STEP_ORDER: QueueStatus[] = ['pending', ...PROGRESS_STEPS, 'complete'];
 
-const ACCOUNTING_LABELS: Record<string, string> = {
-  '601': '601 — Matières Premières',
-  '607': '607 — Marchandises (Boissons)',
-  '606': '606 — Fournitures & Emballages',
-  '6061':'6061 — Énergie',
-  '61':  '61 — Services extérieurs',
-  '62':  '62 — Autres services',
-  '63':  '63 — Impôts & Taxes',
-  '64':  '64 — Personnel',
-  'autre':'Autre',
+/** Date du jour en ISO, dans le fuseau du navigateur : celle que le serveur utilisera aussi. */
+const todayIso = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -132,7 +123,6 @@ const readBase64 = (file: File): Promise<{ base64: string; preview: string | nul
 
 function accentFor(item: QueueItem): string {
   if (item.status === 'error')     return 'var(--red)';
-  if (item.status === 'duplicate') return '#D97706';
   if (item.status === 'complete') {
     if (item.actionTaken)                          return 'var(--green)';
     if (item.result?.match_confidence === 'high')  return 'var(--green)';
@@ -154,12 +144,13 @@ interface CardProps {
     id: string, bankId: string | null, pm: 'bank'|'cash'|'card_perso',
     associe: 'justine' | 'yohan' | undefined, confirmations: string[],
   ) => Promise<void>;
+  onEdit: (id: string, next: ExtractedData) => void;
   onToggleCandidates: () => void;
   onToggleManual: () => Promise<void>;
   bankTxList: any[];
 }
 
-function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, onToggleManual, bankTxList }: CardProps) {
+function QueueCard({ item, isActive, onRemove, onConfirm, onEdit, onToggleCandidates, onToggleManual, bankTxList }: CardProps) {
   const [txSearch, setTxSearch] = useState('');
   const [confirming, setConfirming] = useState(false);
   const [showCcaSelector, setShowCcaSelector] = useState(false);
@@ -169,10 +160,22 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
   // le contrôle humain est exigé, pas suggéré.
   const [acked, setAcked] = useState<Set<string>>(() => new Set());
 
-  const anomalies  = item.result?.anomalies ?? [];
+  // La facture en cours de relecture : la lecture OCR tant qu'on n'a rien
+  // corrigé, la version corrigée ensuite. Les anomalies sont recalculées à
+  // chaque modification par la même fonction que le serveur.
+  const current    = item.edited ?? item.result?.extracted ?? null;
+  const anomalies  = current ? checkInvoice(current, todayIso()) : [];
   const blocking   = anomalies.filter(a => a.level === 'bloquant');
   const toConfirm  = anomalies.filter(a => a.level === 'a_confirmer');
   const canAct     = blocking.length === 0 && toConfirm.every(a => acked.has(a.code));
+  const flagged    = new Set<string>(
+    anomalies.filter(a => a.level === 'bloquant' || (a.level === 'a_confirmer' && !acked.has(a.code))).flatMap(a => a.fields ?? [])
+  );
+  // Les candidats bancaires ont été cherchés sur le TTC lu par l'OCR : s'il a
+  // été corrigé, ils ne valent plus rien.
+  const ttcCorrected = !!current && !!item.result
+    && Math.abs((Number(current.total_ttc) || 0) - (Number(item.result.extracted.total_ttc) || 0)) > 0.05;
+  const matchConfidence = ttcCorrected ? 'none' : item.result?.match_confidence ?? 'none';
 
   const isTerminal = TERMINAL.includes(item.status);
   const canRemove  = (item.status === 'pending' || isTerminal) && !item.actionTaken;
@@ -233,11 +236,15 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
           </div>
           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
             {fmtSize(item.file.size)}
-            {item.result?.extracted?.fournisseur && (
-              <> · <strong style={{ color: 'var(--text-secondary)' }}>{item.result.extracted.fournisseur}</strong></>
+            {current?.fournisseur && (
+              <> · <strong style={{ color: 'var(--text-secondary)' }}>{current.fournisseur}</strong></>
             )}
-            {item.result?.extracted?.total_ttc != null && (
-              <> · <strong style={{ color: 'var(--red)' }}>{formatCurrency(item.result.extracted.total_ttc)}</strong></>
+            {current?.total_ttc != null && (
+              <> · <strong style={{ color: 'var(--red)' }}>{formatCurrency(current.total_ttc)}</strong></>
+            )}
+            {item.result?.ocr_engine && (
+              <> · <span title={item.result.ocr_engine.model}>{item.result.ocr_engine.provider === 'gemini' ? 'Gemini' : 'Claude'}
+                {item.result.ocr_engine.control ? ` + contrôle ${item.result.ocr_engine.control === 'gemini' ? 'Gemini' : 'Claude'}` : ' (lecture unique)'}</span></>
             )}
           </div>
         </div>
@@ -252,7 +259,6 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
           {isActive && <Loader2 size={11} style={{ animation: 'spin 1s linear infinite' }} />}
           {item.status === 'complete' && item.actionTaken && <CheckCircle size={11} />}
           {item.status === 'error'     && <XCircle size={11} />}
-          {item.status === 'duplicate' && <Info size={11} />}
           {item.status === 'pending'   && <Clock size={11} />}
           {STATUS_LABEL[item.status]}
         </div>
@@ -281,7 +287,6 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
             transition: 'width 0.35s ease',
             background:
               item.status === 'error'     ? 'var(--red)'
-              : item.status === 'duplicate' ? '#D97706'
               : item.status === 'complete' && item.actionTaken ? 'var(--green)'
               : 'linear-gradient(90deg, var(--teal-light), var(--teal))',
           }} />
@@ -327,27 +332,6 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
             </div>
           )}
 
-          {/* DUPLICATE */}
-          {item.status === 'duplicate' && item.result && (
-            <div style={{ background: 'rgba(217,119,6,0.07)', borderRadius: 10, padding: 12, border: '1px solid rgba(217,119,6,0.2)' }}>
-              <div style={{ fontSize: 13, fontWeight: 800, color: '#92400E', marginBottom: 6 }}>⚠️ Doublon détecté</div>
-              <div style={{ fontSize: 12, color: '#B45309', lineHeight: 1.5 }}>
-                Cette facture est déjà enregistrée dans le système.
-                {item.result.duplicate_invoice?.accounting_ref && (
-                  <> Référence existante : <strong style={{ fontFamily: 'monospace' }}>{item.result.duplicate_invoice.accounting_ref}</strong></>
-                )}
-              </div>
-              <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                <Link href="/factures" className="btn btn-ghost btn-sm" style={{ fontSize: 12, gap: 5, display: 'flex', alignItems: 'center' }}>
-                  <FileText size={12} /> Voir les factures
-                </Link>
-                <button className="btn btn-ghost btn-sm" onClick={onRemove} style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                  Ignorer
-                </button>
-              </div>
-            </div>
-          )}
-
           {/* COMPLETE — action taken → success */}
           {item.status === 'complete' && item.actionTaken && (
             <div style={{ background: 'rgba(45,143,94,0.07)', borderRadius: 10, padding: 14, border: '1px solid rgba(45,143,94,0.2)' }}>
@@ -357,6 +341,9 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
               </div>
               <div style={{ fontSize: 12, color: '#1A5C38', lineHeight: 1.6 }}>
                 Référence : <strong style={{ fontFamily: 'monospace' }}>{item.confirmedRef}</strong>
+                {current && (
+                  <> · {current.fournisseur} · {current.date ? formatDate(current.date) : ''} · HT {formatCurrency(current.total_ht)} · TVA {formatCurrency(current.tva ?? 0)} · TTC <strong>{formatCurrency(current.total_ttc)}</strong></>
+                )}
                 <br />
                 {item.selectedBankTxId
                   ? '✅ Rapprochée à une transaction bancaire'
@@ -385,25 +372,16 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
           )}
 
           {/* COMPLETE — needs action */}
-          {item.status === 'complete' && !item.actionTaken && item.result && (
+          {item.status === 'complete' && !item.actionTaken && item.result && current && (
             <div>
-              {/* Extracted data summary */}
-              <div style={{
-                display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))',
-                gap: 8, padding: 12, background: 'var(--cream-light)', borderRadius: 10, marginBottom: 14,
-              }}>
-                <DataPill label="Fournisseur" value={item.result.extracted.fournisseur || '—'} />
-                <DataPill label="Date" value={item.result.extracted.date ? formatDate(item.result.extracted.date) : '—'} />
-                <DataPill label="Montant TTC" value={formatCurrency(item.result.extracted.total_ttc)} valueColor="var(--red)" />
-                <DataPill
-                  label="Compte"
-                  value={ACCOUNTING_LABELS[item.result.extracted.compte_comptable] || item.result.extracted.compte_comptable || '—'}
-                  valueColor="var(--teal)"
-                />
-                {item.result.extracted.numero_facture && (
-                  <DataPill label="N° Facture" value={item.result.extracted.numero_facture} mono />
-                )}
-              </div>
+              {/* ── Relecture : chaque champ se corrige ── */}
+              <InvoiceReviewForm
+                value={current}
+                original={item.result.extracted}
+                onChange={next => onEdit(item.id, next)}
+                flaggedFields={flagged}
+                disabled={confirming}
+              />
 
               {/* ── Points à vérifier avant d'enregistrer ── */}
               {anomalies.length > 0 && (
@@ -420,8 +398,17 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
               )}
 
               {canAct && (<>
+              {ttcCorrected && (
+                <div style={{
+                  background: 'var(--cream-light)', border: '1px solid var(--border)',
+                  borderRadius: 10, padding: '10px 14px', marginBottom: 12,
+                  fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 8,
+                }}>
+                  <Info size={14} /> Montant TTC corrigé : les correspondances bancaires proposées ne valent plus. Sélectionne la transaction manuellement.
+                </div>
+              )}
               {/* ── HIGH confidence match ── */}
-              {item.result.match_confidence === 'high' && item.result.bank_candidates.length > 0 && (
+              {matchConfidence === 'high' && item.result.bank_candidates.length > 0 && (
                 <div style={{
                   background: 'rgba(45,143,94,0.06)', border: '1.5px solid rgba(45,143,94,0.25)',
                   borderRadius: 12, padding: 14, marginBottom: 12,
@@ -443,7 +430,7 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
               )}
 
               {/* ── MEDIUM / LOW confidence ── */}
-              {(item.result.match_confidence === 'medium' || item.result.match_confidence === 'low') && item.result.bank_candidates.length > 0 && (
+              {(matchConfidence === 'medium' || matchConfidence === 'low') && item.result.bank_candidates.length > 0 && (
                 <div style={{
                   background: 'rgba(232,155,62,0.06)', border: '1.5px solid rgba(232,155,62,0.25)',
                   borderRadius: 12, padding: 14, marginBottom: 12,
@@ -483,7 +470,7 @@ function QueueCard({ item, isActive, onRemove, onConfirm, onToggleCandidates, on
               )}
 
               {/* ── No match info ── */}
-              {item.result.match_confidence === 'none' && (
+              {matchConfidence === 'none' && !ttcCorrected && (
                 <div style={{
                   background: 'var(--cream-light)', border: '1px solid var(--border)',
                   borderRadius: 10, padding: '10px 14px', marginBottom: 12,
@@ -719,22 +706,24 @@ function AnomalyPanel({ anomalies, acked, onToggle, onRemove }: {
 }) {
   const blocking  = anomalies.filter(a => a.level === 'bloquant');
   const toConfirm = anomalies.filter(a => a.level === 'a_confirmer');
+  const infos     = anomalies.filter(a => a.level === 'info');
   const remaining = toConfirm.filter(a => !acked.has(a.code)).length;
+  const calm      = blocking.length === 0 && toConfirm.length === 0;
 
   return (
     <div style={{
-      border: `1px solid ${blocking.length ? 'rgba(217,79,79,0.35)' : 'rgba(232,155,62,0.4)'}`,
-      background: blocking.length ? 'rgba(217,79,79,0.05)' : 'rgba(232,155,62,0.07)',
+      border: `1px solid ${blocking.length ? 'rgba(217,79,79,0.35)' : calm ? 'var(--border)' : 'rgba(232,155,62,0.4)'}`,
+      background: blocking.length ? 'rgba(217,79,79,0.05)' : calm ? 'var(--cream-light)' : 'rgba(232,155,62,0.07)',
       borderRadius: 10, padding: 12, marginBottom: 14,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-        <AlertCircle size={15} style={{ color: blocking.length ? 'var(--red)' : '#B45309', flexShrink: 0 }} />
-        <span style={{ fontSize: 12, fontWeight: 800, color: blocking.length ? 'var(--red)' : '#92400E' }}>
+        <AlertCircle size={15} style={{ color: blocking.length ? 'var(--red)' : calm ? 'var(--text-muted)' : '#B45309', flexShrink: 0 }} />
+        <span style={{ fontSize: 12, fontWeight: 800, color: blocking.length ? 'var(--red)' : calm ? 'var(--text-secondary)' : '#92400E' }}>
           {blocking.length
-            ? 'Facture refusée en l\'état'
+            ? 'Facture refusée en l\'état — corrige les champs en rouge'
             : remaining > 0
               ? `${remaining} point${remaining > 1 ? 's' : ''} à vérifier avant d'enregistrer`
-              : 'Points vérifiés — tu peux enregistrer'}
+              : calm ? 'À savoir' : 'Points vérifiés — tu peux enregistrer'}
         </span>
       </div>
 
@@ -765,6 +754,13 @@ function AnomalyPanel({ anomalies, acked, onToggle, onRemove }: {
         </label>
       ))}
 
+      {infos.map(a => (
+        <div key={a.code} style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5, padding: '6px 0', borderTop: '1px solid var(--border-light)' }}>
+          <strong>{a.message}</strong>
+          <div style={{ color: 'var(--text-muted)', marginTop: 2 }}>{a.verification}</div>
+        </div>
+      ))}
+
       {blocking.length > 0 && (
         <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
           <button className="btn btn-ghost btn-sm" onClick={onRemove} style={{ fontSize: 12, color: 'var(--text-muted)' }}>
@@ -772,17 +768,6 @@ function AnomalyPanel({ anomalies, acked, onToggle, onRemove }: {
           </button>
         </div>
       )}
-    </div>
-  );
-}
-
-function DataPill({ label, value, valueColor, mono }: { label: string; value: string; valueColor?: string; mono?: boolean }) {
-  return (
-    <div>
-      <div style={{ fontSize: 9, fontWeight: 800, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{label}</div>
-      <div style={{ fontSize: 12, fontWeight: 700, color: valueColor || 'var(--text-primary)', marginTop: 2, fontFamily: mono ? 'monospace' : undefined, wordBreak: 'break-all' }}>
-        {value}
-      </div>
     </div>
   );
 }
@@ -903,7 +888,7 @@ export default function ScannerPage() {
           id: Math.random().toString(36).slice(2, 10),
           file, preview: null,
           status: 'pending', progress: 0, step: 'En attente...',
-          result: null, error: null,
+          result: null, edited: null, error: null,
           actionTaken: false, selectedBankTxId: null,
           associe: null,
           confirmedRef: null, showCandidates: false, showManualSelector: false,
@@ -999,16 +984,14 @@ export default function ScannerPage() {
         data.match_confidence = 'high';
       }
 
-      // Step 5 — result
-      if (data.is_duplicate) {
-        upd({ status: 'duplicate', progress: 100, step: '⚠️ Doublon détecté', result: data });
-      } else {
-        const lbl =
-          data.match_confidence === 'high'          ? '✅ Transaction trouvée' :
-          (data.bank_candidates?.length ?? 0) > 0  ? '🔍 Correspondances possibles' :
-          '📋 Aucune transaction bancaire';
-        upd({ status: 'complete', progress: 100, step: lbl, result: data });
-      }
+      // Step 5 — result. Un doublon probable n'est plus un cul-de-sac : c'est
+      // un point à confirmer, avec la facture existante affichée.
+      const lbl =
+        data.is_duplicate                         ? '⚠️ Doublon probable — à vérifier' :
+        data.match_confidence === 'high'          ? '✅ Transaction trouvée' :
+        (data.bank_candidates?.length ?? 0) > 0  ? '🔍 Correspondances possibles' :
+        '📋 Aucune transaction bancaire';
+      upd({ status: 'complete', progress: 100, step: lbl, result: data, edited: null });
     } catch (e: any) {
       if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; }
       upd({ status: 'error', progress: 100, step: 'Erreur', error: e?.message || 'Erreur analyse IA' });
@@ -1041,7 +1024,9 @@ export default function ScannerPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          extracted:      item.result.extracted,
+          extracted:      item.edited ?? item.result.extracted,
+          ocr_original:   item.result.extracted,
+          ocr_engine:     item.result.ocr_engine ?? null,
           file_url:       item.result.file_url,
           bank_tx_id:     bankId,
           payment_method: pm,
@@ -1061,8 +1046,10 @@ export default function ScannerPage() {
         // pour ne plus la proposer aux éléments suivants de la file.
         if (bankId) setBankTxList(prev => prev.filter(tx => tx.id !== bankId));
       } else {
+        // 422 : le serveur a recompté et refuse — un doublon apparu entre la
+        // lecture et la confirmation, ou un point non acquitté.
         alert('Erreur : ' + (data.error || 'Inconnu'));
-        setItem(itemId, { step: 'Erreur enregistrement', progress: 100 });
+        setItem(itemId, { step: 'Enregistrement refusé', progress: 100 });
       }
     } catch {
       alert('Erreur réseau lors de l\'enregistrement.');
@@ -1171,9 +1158,6 @@ export default function ScannerPage() {
             <KpiCard label="Rapprochés"  value={String(matched)}   sub="transactions liées"  accent="var(--green)" />
             {needsAction > 0 && (
               <KpiCard label="Décision requise" value={String(needsAction)} sub="en attente" accent="var(--orange)" />
-            )}
-            {queue.filter(i => i.status === 'duplicate').length > 0 && (
-              <KpiCard label="Doublons" value={String(queue.filter(i => i.status === 'duplicate').length)} sub="ignorés" accent="#D97706" />
             )}
           </div>
         )}
@@ -1324,6 +1308,7 @@ export default function ScannerPage() {
                         progress: 0,
                         step: 'En attente...',
                         result: null,
+                        edited: null,
                         error: null,
                         actionTaken: false,
                         selectedBankTxId: null,
@@ -1447,6 +1432,7 @@ export default function ScannerPage() {
                   isActive={item.id === processingId}
                   onRemove={() => removeItem(item.id)}
                   onConfirm={confirmAction}
+                  onEdit={(id, next) => setItem(id, { edited: { ...next, tva_recoverable: computeTvaRecoverable(next) } })}
                   onToggleCandidates={() => setItem(item.id, { showCandidates: !item.showCandidates })}
                   onToggleManual={async () => {
                     await loadBankTx();

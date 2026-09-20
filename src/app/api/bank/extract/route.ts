@@ -7,7 +7,8 @@ import { createClaudeMessage } from '@/lib/anthropic';
 import { createAnthropicClient } from '@/lib/ai/settings';
 import { extractJson } from '@/lib/ai/json';
 import {
-  parseBankCsv, distinctCategoryKeys, categoryFromRules, type ParsedBankRow,
+  parseBankCsv, distinctCategoryKeys, categoryFromRules, categoryKeyOf, checkBalance,
+  type ParsedBankRow, type BalanceCheck,
 } from '@/lib/bank-csv';
 
 const CATEGORIES = [
@@ -92,6 +93,8 @@ Retourne UNIQUEMENT un JSON valide, sans texte avant ni après, sans markdown.
 
 Format attendu :
 {
+  "solde_ouverture": number ou null,  // « ancien solde » / solde au début du relevé, tel qu'imprimé
+  "solde_cloture": number ou null,    // « nouveau solde » / solde à la fin du relevé, tel qu'imprimé
   "transactions": [
     {
       "date": "YYYY-MM-DD",
@@ -101,6 +104,8 @@ Format attendu :
     }
   ]
 }
+
+Les soldes servent à vérifier que tu n'as oublié aucune ligne : solde_ouverture + somme des montants doit égaler solde_cloture. Recopie-les tels qu'imprimés ; null s'ils ne figurent pas. Ne mets JAMAIS les lignes de solde dans "transactions".
 
 Règles de catégorisation :
 - fixe_loyer : loyers, charges locatives
@@ -185,10 +190,26 @@ export async function POST(request: NextRequest) {
   if (auth.error) return auth.error;
 
   try {
-    const { pdfBase64, csvText } = await request.json();
+    const { pdfBase64, csvText, force } = await request.json();
     if (!pdfBase64 && !csvText) {
       return NextResponse.json({ error: 'PDF ou CSV requis' }, { status: 400 });
     }
+
+    // Contrôle de solde : ouverture + Σ opérations = clôture. Un écart signifie
+    // que des lignes manquent ou qu'un montant est faux ; l'import est refusé
+    // (422) sauf demande explicite (`force`), et l'écart est renvoyé au centime.
+    let balance: BalanceCheck | null = null;
+    let balanceSource: 'csv' | 'ia' | null = null;
+    const refuseOnGap = (rowsRead: number, extra: string) => NextResponse.json(
+      {
+        error: `Contrôle de solde en échec : ${balance!.opening.toFixed(2)} € d'ouverture + ${balance!.sumRows.toFixed(2)} € `
+          + `de ${rowsRead} opérations lues = ${(balance!.opening + balance!.sumRows).toFixed(2)} €, mais le relevé annonce `
+          + `${balance!.closing.toFixed(2)} € de clôture — écart de ${balance!.gap.toFixed(2)} €. ${extra}`,
+        balance_mismatch: true,
+        balance,
+      },
+      { status: 422 },
+    );
 
     const anthropic = await createAnthropicClient();
 
@@ -203,8 +224,19 @@ export async function POST(request: NextRequest) {
     let csvExtracted: { transactions: any[] } | null = null;
     let csvDegraded = false;
     if (csvText) {
-      const { rows, skipped } = parseBankCsv(csvText);
+      const { rows, skipped, suspicious, balance: csvBalance } = parseBankCsv(csvText);
       if (rows.length > 0) {
+        balance = csvBalance;
+        balanceSource = 'csv';
+        if (balance && !balance.ok && !force) {
+          return refuseOnGap(rows.length,
+            (suspicious.length > 0
+              ? `${suspicious.length} ligne(s) ressemblent à des opérations mais n'ont pas pu être lues : ${suspicious.slice(0, 3).join(' | ')}. `
+              : '')
+            + 'Vérifie que le fichier est complet (export sur toute la période, non modifié). '
+            + 'Mieux vaut refuser un relevé incomplet que l\'importer sans le dire.');
+        }
+
         // Les règles locales couvrent la majorité des libellés sans rien
         // coûter ; on ne soumet à l'IA que ceux qu'elles ne reconnaissent pas.
         // Un libellé n'est « inconnu » que si AUCUNE de ses lignes n'est
@@ -297,6 +329,33 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Format invalide, "transactions" manquant' }, { status: 400 });
     }
 
+    // Voie IA : même contrôle de solde, avec les soldes lus par le modèle. Une
+    // IA qui invente un montant ou saute une ligne ne tombe pas juste ; c'est
+    // le seul filet qui existe sur un PDF.
+    if (!csvExtracted) {
+      const opening = Number(extracted.solde_ouverture);
+      const closing = Number(extracted.solde_cloture);
+      const txRows = (extracted.transactions as { amount?: unknown }[])
+        .map(t => ({ amount: Number(t.amount) }))
+        .filter(t => Number.isFinite(t.amount));
+      if (Number.isFinite(opening) && Number.isFinite(closing) && txRows.length > 0) {
+        balance = checkBalance(opening, closing, txRows);
+        balanceSource = 'ia';
+        if (!balance.ok && !force) {
+          return refuseOnGap(txRows.length,
+            'Sur un PDF, c\'est l\'IA qui lit les montants : un écart veut dire qu\'elle a sauté ou déformé une ligne. '
+            + 'Préfère l\'export CSV de la banque, exact par construction.');
+        }
+      }
+      // Les règles locales passent devant l'IA aussi sur cette voie : elles
+      // sont sûres, et un même libellé doit recevoir la même catégorie quel
+      // que soit le format du relevé.
+      for (const t of extracted.transactions as { description?: string; amount?: number; category?: string }[]) {
+        const byRule = categoryFromRules(categoryKeyOf(t.description ?? ''), t.amount);
+        if (byRule) t.category = byRule;
+      }
+    }
+
     // ── STEP 1 : Normalize the full batch from the AI ──────────────────────
     // Build a multi-set: key → { normalized transaction, count in this batch }
     const batchMap = new Map<string, { tx: any; count: number }>();
@@ -324,8 +383,14 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    const balanceNote = balance
+      ? (balance.ok
+          ? `Contrôle de solde : concordance au centime (${balance.opening.toFixed(2)} € → ${balance.closing.toFixed(2)} €${balanceSource === 'ia' ? ', soldes lus par l\'IA' : ''}).`
+          : `⚠️ Importé malgré un écart de solde de ${balance.gap.toFixed(2)} € : des opérations manquent probablement.`)
+      : 'Contrôle de solde impossible : le fichier ne porte pas de soldes d\'ouverture et de clôture exploitables.';
+
     if (batchMap.size === 0) {
-      return NextResponse.json({ success: true, count: 0 });
+      return NextResponse.json({ success: true, count: 0, balance, message: balanceNote });
     }
 
     // ── STEP 2 : Query existing counts from DB in a single request ─────────
@@ -373,7 +438,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         success: true,
         count: 0,
-        message: 'Aucune nouvelle transaction (relevé déjà importé ou doublons éliminés)',
+        balance,
+        message: `Aucune nouvelle transaction (relevé déjà importé ou doublons éliminés). ${balanceNote}`,
       });
     }
 
@@ -431,7 +497,10 @@ export async function POST(request: NextRequest) {
         + `${manquantes} ont été refusées. Relance l'import pour les rattraper.`
       : degradedNote;
 
-    return NextResponse.json({ success: true, count: insertedCount, message: note });
+    return NextResponse.json({
+      success: true, count: insertedCount, balance,
+      message: [balanceNote, note].filter(Boolean).join(' '),
+    });
 
   } catch (error: any) {
     console.error('Bank extract error:', error);

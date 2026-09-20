@@ -1,7 +1,10 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { ExtractedInvoiceData } from '@/lib/ai/invoice-ocr';
-import { assertInvoiceAccepted } from '@/lib/invoice-checks';
-import { cleanName, findSupplierMatch, matchIngredient } from '@/lib/referentiel';
+import {
+  normalizeExtracted, computeTvaRecoverable, correctedFields,
+  type ExtractedInvoiceData, type DuplicateHint,
+} from '@/lib/invoice-normalize';
+import { assertInvoiceAccepted, normalizeInvoiceNumber } from '@/lib/invoice-checks';
+import { cleanName, findSupplierMatch, matchIngredient, normalizeName } from '@/lib/referentiel';
 
 /**
  * invoices.ts — Enregistrement d'une facture extraite par l'IA.
@@ -49,10 +52,92 @@ export async function findOrCreateSupplier(
   return created?.id ?? null;
 }
 
+const rnd2 = (v: number) => Math.round(Number(v) * 100) / 100;
+
+interface DuplicateRow {
+  id: string; invoice_number: string | null; date: string; total_ttc: number | null;
+  accounting_ref: string | null; suppliers: { name: string } | { name: string }[] | null;
+}
+
+function supplierNameOf(row: DuplicateRow): string | null {
+  const s = Array.isArray(row.suppliers) ? row.suppliers[0] : row.suppliers;
+  return s?.name ?? null;
+}
+
+/**
+ * Cherche une facture déjà enregistrée qui ressemble à celle-ci.
+ *
+ * Deux critères, dans cet ordre :
+ *  1. même numéro chez le MÊME fournisseur. Le numéro seul ne suffit pas :
+ *     « 1234 » existe chez tous les fournisseurs, et l'ancienne détection
+ *     bloquait une vraie facture parce qu'une autre enseigne avait le même
+ *     numéro — la TVA de la facture refusée était perdue ;
+ *  2. même jour et même montant TTC (à 50 centimes), même fournisseur si on
+ *     le connaît. Deux tickets Metro identiques le même jour existent ; c'est
+ *     pour ça que le résultat est un point à confirmer, pas un refus.
+ *
+ * Renvoie une description de la facture existante, ou null. C'est
+ * `checkInvoice` qui en fait une anomalie — la même dans l'écran et sur le
+ * serveur, qui refait cette recherche à l'enregistrement.
+ */
+export async function findDuplicateInvoice(
+  supabase: SupabaseClient,
+  extracted: Pick<ExtractedInvoiceData, 'fournisseur' | 'numero_facture' | 'date' | 'total_ttc'>,
+): Promise<DuplicateHint | null> {
+  const SELECT = 'id, invoice_number, date, total_ttc, accounting_ref, suppliers(name)';
+  const supplierKey = normalizeName(extracted.fournisseur ?? '');
+  const sameSupplier = (row: DuplicateRow) => {
+    const name = supplierNameOf(row);
+    // Fournisseur inconnu d'un côté ou de l'autre : on ne peut pas exclure.
+    if (!supplierKey || !name) return true;
+    return normalizeName(name) === supplierKey;
+  };
+  const toHint = (row: DuplicateRow, raison: DuplicateHint['raison']): DuplicateHint => ({
+    id: row.id, accounting_ref: row.accounting_ref, invoice_number: row.invoice_number,
+    date: row.date, total_ttc: row.total_ttc, supplier: supplierNameOf(row), raison,
+  });
+
+  const wanted = normalizeInvoiceNumber(extracted.numero_facture);
+  if (wanted) {
+    // La comparaison ignore casse, espaces et tirets : « F-2026 4471 » et
+    // « f20264471 » sont le même numéro. SQL ne sait pas le faire : on lit les
+    // candidats proches (même fournisseur ou même jour) et on compare ici.
+    const { data } = await supabase.from('invoices').select(SELECT)
+      .not('invoice_number', 'is', null)
+      .ilike('invoice_number', `%${(extracted.numero_facture ?? '').replace(/[\s\-_./]/g, '').slice(-4)}%`)
+      .limit(200);
+    const hit = ((data ?? []) as unknown as DuplicateRow[])
+      .find(r => normalizeInvoiceNumber(r.invoice_number) === wanted && sameSupplier(r));
+    if (hit) return toHint(hit, 'numero');
+  }
+
+  if (extracted.date && extracted.total_ttc) {
+    const ttc = rnd2(extracted.total_ttc);
+    const { data } = await supabase.from('invoices').select(SELECT)
+      .eq('date', extracted.date)
+      .gte('total_ttc', ttc - 0.5)
+      .lte('total_ttc', ttc + 0.5)
+      .limit(20);
+    const hit = ((data ?? []) as unknown as DuplicateRow[]).find(sameSupplier);
+    if (hit) return toHint(hit, 'date-montant');
+  }
+
+  return null;
+}
+
 export interface SaveInvoiceOptions {
   fileUrl?: string | null;
   paymentMethod?: string;
   paymentNotes?: string | null;
+  /**
+   * Lecture brute de l'OCR, avant correction humaine, et moteur utilisé :
+   * conservés en `ocr_meta` pour savoir ce que l'OCR rate.
+   */
+  ocr?: {
+    original?: ExtractedInvoiceData | null;
+    engine?: { provider: string; model: string } | null;
+    controlEngine?: string | null;
+  };
   /**
    * Codes d'anomalies que l'humain a explicitement acquittés à l'écran.
    * Sans eux, toute facture inhabituelle est refusée : le serveur ne fait pas
@@ -77,14 +162,32 @@ export interface SavedInvoice {
  */
 export async function saveInvoice(
   supabase: SupabaseClient,
-  extracted: ExtractedInvoiceData,
+  input: ExtractedInvoiceData,
   options: SaveInvoiceOptions = {}
 ): Promise<SavedInvoice> {
   const today = options.today ?? new Date().toISOString().slice(0, 10);
+
+  // Ce qui arrive de l'écran est re-normalisé ici : nombres coercés, unités
+  // recalculées, TVA récupérable recomputée depuis le type de document et la
+  // mention du client — le serveur ne reprend aucune conclusion du client.
+  const extracted = normalizeExtracted({ ...input, doublon: input.doublon ?? null });
+  extracted.tva_recoverable = computeTvaRecoverable(extracted);
   assertInvoiceAccepted(extracted, today, options.confirmations ?? []);
 
   const supplierId = await findOrCreateSupplier(supabase, extracted.fournisseur);
   const accountingRef = generateAccountingRef(extracted.date);
+
+  const original = options.ocr?.original ? normalizeExtracted(options.ocr.original) : null;
+  const ocrMeta = {
+    engine: options.ocr?.engine ?? null,
+    control_engine: options.ocr?.controlEngine ?? null,
+    control_reading: extracted.controle_lecture ?? null,
+    uncertain_fields: extracted.champs_incertains ?? [],
+    unread_fields: extracted.champs_non_lus ?? [],
+    corrected_fields: original ? correctedFields(original, extracted) : [],
+    confirmations: options.confirmations ?? [],
+    original_totals: original ? { total_ht: original.total_ht, total_tva: original.tva, total_ttc: original.total_ttc } : null,
+  };
 
   const { data: invoice, error } = await supabase
     .from('invoices')
@@ -94,6 +197,9 @@ export async function saveInvoice(
       date: extracted.date,
       total_ht: extracted.total_ht,
       total_ttc: extracted.total_ttc,
+      tva_amount: extracted.tva ?? null,
+      tva_breakdown: extracted.tva_ventilation ?? [],
+      ocr_meta: ocrMeta,
       pdf_url: options.fileUrl ?? null,
       accounting_ref: accountingRef,
       accounting_class: extracted.compte_comptable || '601',
@@ -101,7 +207,7 @@ export async function saveInvoice(
       payment_notes: options.paymentNotes || null,
       type_document: extracted.type_document || 'facture',
       company_name_present: extracted.nom_entreprise_present ?? true,
-      tva_recoverable: extracted.tva_recoverable ?? true,
+      tva_recoverable: extracted.tva_recoverable,
     })
     .select('id')
     .single();

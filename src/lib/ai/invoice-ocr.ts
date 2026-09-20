@@ -3,11 +3,18 @@ import { createClaudeMessage, PRIMARY_MODEL } from '@/lib/anthropic';
 import { createAnthropicClient, getSetting } from '@/lib/ai/settings';
 import { callGemini, getGeminiModel, type GeminiPart } from '@/lib/ai/gemini';
 import { extractJson } from '@/lib/ai/json';
+import {
+  normalizeExtracted, computeTvaRecoverable, toNumber, toText,
+  type ExtractedInvoiceData, type OcrControlReading,
+} from '@/lib/invoice-normalize';
+
+export type { ExtractedInvoiceData } from '@/lib/invoice-normalize';
+export { computeTvaRecoverable } from '@/lib/invoice-normalize';
 
 /**
- * invoice-ocr.ts — OCR de factures (prompt + appel + règles TVA).
- * Un seul point d'entrée, /api/scanner : le résultat est toujours relu par
- * un humain avant d'être enregistré (/api/scanner/confirm).
+ * invoice-ocr.ts — OCR de factures (prompt + appel + lecture de contrôle).
+ * Un seul point d'entrée, /api/scanner : le résultat est toujours relu — et
+ * corrigeable — par un humain avant d'être enregistré (/api/scanner/confirm).
  *
  * Deux moteurs possibles, choisis dans Réglages → Moteurs IA (ou, à défaut,
  * par la variable d'environnement OCR_PROVIDER) :
@@ -16,78 +23,172 @@ import { extractJson } from '@/lib/ai/json';
  *    de code, si Gemini se révèle moins fiable sur les tickets.
  * Le prompt est rigoureusement le même dans les deux cas : les résultats
  * restent comparables, et seul le moteur change.
+ *
+ * ── Ce que l'IA fait, et ce qu'elle ne fait plus ──
+ *
+ * Elle RECOPIE ce qui est imprimé : totaux, ventilation de TVA par taux,
+ * quantité et conditionnement de chaque ligne. Elle ne calcule plus rien :
+ * les prix au kilo, les unités standard, la TVA déduite du TTC sont dérivés
+ * par `lib/invoice-normalize.ts`, en code, de façon rejouable. Un modèle de
+ * langage qui divise 50 € par 25 kg se trompe une fois sur vingt ; un code
+ * qui le fait ne se trompe jamais.
+ *
+ * Elle DIT ce qu'elle n'a pas lu : `null` pour un champ illisible (jamais 0,
+ * qui est une valeur), et une liste de champs incertains. L'écran surligne
+ * ces champs et exige qu'on les vérifie.
+ *
+ * ── La lecture de contrôle ──
+ *
+ * Les cinq champs qui font la comptabilité (fournisseur, date, numéro, HT,
+ * TVA, TTC) sont relus par un second appel, court, avec une consigne
+ * différente et, quand une clé existe pour l'autre moteur, par l'AUTRE
+ * moteur. Deux lectures indépendantes qui s'accordent valent une
+ * vérification ; deux lectures qui divergent sont signalées à l'humain avec
+ * les deux valeurs. C'est le même principe que la double saisie en compta.
+ * Coût : une image relue, une vingtaine de tokens en sortie.
  */
 
-export const INVOICE_OCR_PROMPT = `Tu es un assistant OCR expert pour un restaurant.
+export const INVOICE_OCR_PROMPT = `Tu es un assistant OCR expert pour un restaurant (pizzeria napolitaine, société TEKOTEK / enseigne QENTINA).
 Analyse ce document (facture fournisseur, ticket de caisse, bon de livraison, reçu CB).
 Retourne UNIQUEMENT un JSON valide, sans markdown, sans texte autour.
 
+RÈGLE ABSOLUE : tu RECOPIES ce qui est imprimé, tu ne CALCULES rien. Pas de division, pas de conversion d'unité, pas de « correction » d'un total qui te semble faux. Si une valeur est illisible ou absente, mets null — jamais 0 (0 est une valeur, null est une absence).
+
 {
-  "fournisseur": "string",
-  "date": "YYYY-MM-DD",
+  "fournisseur": "string ou null",
+  "date": "YYYY-MM-DD ou null",
   "numero_facture": "string ou null",
-  "total_ht": number,
-  "total_ttc": number,
-  "tva": number,
-  "compte_comptable": "601|607|606|6061|61|62|63|64|autre",
   "type_document": "facture|ticket_caisse|bon_livraison|recu",
   "nom_entreprise_present": boolean,
+  "total_ht": number ou null,
+  "total_tva": number ou null,
+  "total_ttc": number ou null,
+  "tva_ventilation": [
+    { "taux": number, "base_ht": number ou null, "montant_tva": number ou null }
+  ],
+  "compte_comptable": "601|607|606|6061|61|62|63|64|autre",
   "lignes": [
     {
       "designation": "string",
-      "quantite": number,
-      "unite": "kg|L|unité|g|mL",
-      "prix_unitaire_ht": number,
-      "prix_total_ht": number,
+      "quantite_lue": number ou null,
+      "conditionnement": "string ou null",
+      "prix_unitaire_lu": number ou null,
+      "prix_total_ht": number ou null,
       "categorie": "alimentaire|materiel|emballage|boisson|autre"
     }
-  ]
+  ],
+  "champs_incertains": ["fournisseur"|"date"|"numero_facture"|"total_ht"|"total_tva"|"total_ttc"|"tva_ventilation"|"lignes"]
 }
 
-Classification comptable :
-- 601 : Matières premières alimentaires (farine, viande, fromage, légumes, sauce)
-- 607 : Boissons, café, alcool revendus en l'état
-- 606 : Fournitures, emballages, nettoyage, petit matériel
-- 6061 : Énergie (électricité, gaz, eau)
-- 61 : Loyer, assurances, crédit bail
-- 62 : Téléphone, internet, SaaS, commissions plateforme
-- 63 : Impôts, URSSAF, taxes
-- 64 : Salaires, acomptes personnel
+Totaux :
+- total_ht, total_tva, total_ttc : les montants DÉFINITIFS imprimés en pied de document (après remises), pas un sous-total de page.
+- tva_ventilation : le tableau de TVA par taux tel qu'imprimé (« Base HT / Taux / Montant TVA »). Taux en pourcentage : 5.5, 10, 20, 2.1 ou 0. Tableau vide [] si le document n'en imprime pas.
+- Un ticket ou reçu sans TVA détaillée : total_tva null, tva_ventilation [].
 
-Règles impératives :
-- L'unité DOIT être standardisée (kg, L, unité, g, mL). Pour un carton de 25kg de farine : quantite 25, unite "kg".
-- Le prix unitaire HT correspond à cette unité standard. Si le carton de 25kg coûte 50€, prix_unitaire_ht = 2.
-- Si "METRO" dans le nom → retourner "Métro"
-- Si "EUROCIBUS" ou "MOZZALAT" → retourner "Mozzalat"
-- Si pas de numéro de facture (ticket simple) → retourner null pour numero_facture
-- Si une valeur est illisible → 0 pour les nombres, null pour les textes
-- Toujours retourner total_ht et total_ttc même si c'est le même montant (pas de TVA)
-- Pour nom_entreprise_present, vérifie si l'une des mentions client "TEKOTEK", "QENTINA" ou "TEKO TEK" apparaît explicitement sur le document (comme client ou dans l'en-tête client).`;
+Lignes (une par article, dans l'ordre du document) :
+- quantite_lue : le nombre imprimé dans la colonne quantité (colis, pièces, kg…), tel quel.
+- conditionnement : ce que contient UNE unité de la colonne quantité, tel qu'imprimé : « 25 kg », « 6 x 1 L », « 12x33cl », « 500 g », « 1 kg ». Si la quantité est déjà en kg ou en litres (vrac), écris « kg » ou « L ». Null si rien n'est indiqué.
+- prix_unitaire_lu : le prix unitaire imprimé (par colis, par pièce, par kg… selon la colonne), sans le retraiter.
+- prix_total_ht : le montant HT de la ligne, tel qu'imprimé.
+- Sur une facture longue, lis TOUTES les lignes : une facture Metro peut en compter plus de cent.
+
+Classification comptable (compte_comptable) :
+- 601 : matières premières alimentaires (farine, viande, fromage, légumes, sauce)
+- 607 : boissons, café, alcool revendus en l'état
+- 606 : fournitures, emballages, nettoyage, petit matériel
+- 6061 : énergie (électricité, gaz, eau)
+- 61 : loyer, assurances, crédit-bail
+- 62 : téléphone, internet, logiciels, commissions de plateforme
+- 63 : impôts, URSSAF, taxes
+- 64 : salaires, acomptes du personnel
+
+Autres règles :
+- Si « METRO » dans le nom → "Métro". Si « EUROCIBUS » ou « MOZZALAT » → "Mozzalat".
+- Pas de numéro (ticket simple) → numero_facture null.
+- nom_entreprise_present : vrai seulement si « TEKOTEK », « TEKO TEK » ou « QENTINA » figure explicitement comme client (adresse de facturation ou en-tête client).
+- champs_incertains : liste chaque champ que tu as lu avec doute (flou, rayé, coupé, plusieurs candidats). Liste vide si tout est net.`;
+
+/**
+ * Schéma imposé à Gemini. C'est la traduction stricte du prompt : Google
+ * garantit alors le type de chaque champ, la présence des clés et les
+ * valeurs des énumérations — on ne « répare » plus un JSON approximatif.
+ */
+const INVOICE_RESPONSE_SCHEMA = {
+  type: 'object',
+  properties: {
+    fournisseur: { type: 'string', nullable: true },
+    date: { type: 'string', nullable: true },
+    numero_facture: { type: 'string', nullable: true },
+    type_document: { type: 'string', enum: ['facture', 'ticket_caisse', 'bon_livraison', 'recu'] },
+    nom_entreprise_present: { type: 'boolean' },
+    total_ht: { type: 'number', nullable: true },
+    total_tva: { type: 'number', nullable: true },
+    total_ttc: { type: 'number', nullable: true },
+    tva_ventilation: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          taux: { type: 'number' },
+          base_ht: { type: 'number', nullable: true },
+          montant_tva: { type: 'number', nullable: true },
+        },
+        required: ['taux'],
+      },
+    },
+    compte_comptable: { type: 'string', enum: ['601', '607', '606', '6061', '61', '62', '63', '64', 'autre'] },
+    lignes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          designation: { type: 'string' },
+          quantite_lue: { type: 'number', nullable: true },
+          conditionnement: { type: 'string', nullable: true },
+          prix_unitaire_lu: { type: 'number', nullable: true },
+          prix_total_ht: { type: 'number', nullable: true },
+          categorie: { type: 'string', enum: ['alimentaire', 'materiel', 'emballage', 'boisson', 'autre'] },
+        },
+        required: ['designation', 'categorie'],
+      },
+    },
+    champs_incertains: { type: 'array', items: { type: 'string' } },
+  },
+  required: [
+    'fournisseur', 'date', 'numero_facture', 'type_document', 'nom_entreprise_present',
+    'total_ht', 'total_tva', 'total_ttc', 'tva_ventilation', 'compte_comptable', 'lignes', 'champs_incertains',
+  ],
+} as const;
+
+/**
+ * Consigne de la lecture de contrôle. Volontairement différente de la
+ * consigne principale (autre angle, autre ordre) : deux prompts identiques
+ * sur le même modèle reproduisent la même erreur.
+ */
+const CONTROL_PROMPT = `Tu vérifies la saisie d'une facture. Ne lis QUE l'en-tête et le pied du document.
+Retourne UNIQUEMENT ce JSON, sans autre texte :
+{ "fournisseur": "string ou null", "date": "YYYY-MM-DD ou null", "numero_facture": "string ou null",
+  "total_ht": number ou null, "total_tva": number ou null, "total_ttc": number ou null }
+- Recopie les montants DÉFINITIFS (après remises), exactement comme imprimés, sans calcul.
+- Une valeur illisible ou absente → null, jamais 0.
+- Pour Metro écris "Métro" ; pour Eurocibus ou Mozzalat écris "Mozzalat".`;
+
+const CONTROL_RESPONSE_SCHEMA = {
+  type: 'object',
+  properties: {
+    fournisseur: { type: 'string', nullable: true },
+    date: { type: 'string', nullable: true },
+    numero_facture: { type: 'string', nullable: true },
+    total_ht: { type: 'number', nullable: true },
+    total_tva: { type: 'number', nullable: true },
+    total_ttc: { type: 'number', nullable: true },
+  },
+  required: ['fournisseur', 'date', 'numero_facture', 'total_ht', 'total_tva', 'total_ttc'],
+} as const;
 
 export interface OcrFile {
   fileBase64: string;
   mimeType: string;
-}
-
-export interface ExtractedInvoiceData {
-  fournisseur: string | null;
-  date: string | null;
-  numero_facture: string | null;
-  total_ht: number;
-  total_ttc: number;
-  tva?: number;
-  compte_comptable?: string;
-  type_document?: string;
-  nom_entreprise_present?: boolean;
-  tva_recoverable?: boolean;
-  lignes?: {
-    designation: string;
-    quantite: number;
-    unite: string;
-    prix_unitaire_ht: number;
-    prix_total_ht: number;
-    categorie: string;
-  }[];
 }
 
 /** Formats d'image acceptés par l'API Claude. */
@@ -144,23 +245,9 @@ function toGeminiPart(f: OcrFile): GeminiPart {
   return { inlineData: { mimeType: mime, data: f.fileBase64 } };
 }
 
-/**
- * Règle fiscale française : la TVA n'est récupérable que si le nom de
- * l'entreprise figure sur le document (obligatoire sur facture ;
- * toléré sur ticket de caisse < 150 € TTC).
- */
-export function computeTvaRecoverable(extracted: ExtractedInvoiceData): boolean {
-  const typeDoc = extracted.type_document || 'facture';
-  const isCompanyPresent = !!extracted.nom_entreprise_present;
-  const ttc = extracted.total_ttc || 0;
-
-  if (typeDoc === 'ticket_caisse') return !(ttc > 150 && !isCompanyPresent);
-  if (typeDoc === 'facture') return isCompanyPresent;
-  return true;
-}
-
 /** Instruction utilisateur, identique pour les deux moteurs. */
 const USER_INSTRUCTION = 'Extrais les données de ces pages faisant partie du même document.';
+const CONTROL_INSTRUCTION = 'Relis uniquement l\'en-tête et les totaux de ce document.';
 
 /**
  * Budget de sortie. Une facture Metro peut compter plus de cent lignes : à
@@ -169,6 +256,7 @@ const USER_INSTRUCTION = 'Extrais les données de ces pages faisant partie du m�
  * base incomplète, faussant le stock et la TVA sans aucun signal.
  */
 const MAX_OUTPUT_TOKENS = 32000;
+const CONTROL_MAX_TOKENS = 600;
 
 const TRUNCATED_MESSAGE =
   'Facture trop longue pour être lue en une fois. Scanne-la en deux parties : '
@@ -200,22 +288,46 @@ export async function resolveOcrProvider(): Promise<OcrProvider> {
   return (await getSetting('gemini_api_key')) ? 'gemini' : 'anthropic';
 }
 
-/** OCR par Claude (Anthropic). */
-async function ocrWithClaude(files: OcrFile[]): Promise<string> {
+async function hasKeyFor(provider: OcrProvider): Promise<boolean> {
+  return !!(await getSetting(provider === 'gemini' ? 'gemini_api_key' : 'anthropic_api_key'));
+}
+
+/**
+ * Moteur de la lecture de contrôle : l'autre moteur si sa clé existe (deux
+ * modèles ne font pas les mêmes erreurs), sinon le même avec l'autre consigne.
+ * `OCR_CONTROL=off` désactive la seconde lecture — à réserver au cas où le
+ * coût ou le quota pose problème ; la divergence de lecture n'est alors plus
+ * détectée, et l'écran le dit.
+ */
+export async function resolveControlProvider(primary: OcrProvider): Promise<OcrProvider | null> {
+  if ((process.env.OCR_CONTROL ?? '').trim().toLowerCase() === 'off') return null;
+  const other: OcrProvider = primary === 'gemini' ? 'anthropic' : 'gemini';
+  return (await hasKeyFor(other)) ? other : primary;
+}
+
+interface Call {
+  system: string;
+  instruction: string;
+  maxTokens: number;
+  schema: Record<string, unknown>;
+}
+
+/** Un appel à Claude, texte brut en retour. */
+async function ocrWithClaude(files: OcrFile[], call: Call): Promise<string> {
   const anthropic = await createAnthropicClient();
 
   const response = await createClaudeMessage(anthropic, {
-    system: INVOICE_OCR_PROMPT,
+    system: call.system,
     messages: [{
       role: 'user',
-      content: [...files.map(toContentBlock), { type: 'text', text: USER_INSTRUCTION }],
+      content: [...files.map(toContentBlock), { type: 'text', text: call.instruction }],
     }],
-    max_tokens: MAX_OUTPUT_TOKENS,
+    max_tokens: call.maxTokens,
   });
 
   if (response.stop_reason === 'max_tokens') throw new Error(TRUNCATED_MESSAGE);
 
-  const textContent = response.content.find((c: any) => c.type === 'text');
+  const textContent = response.content.find((c) => c.type === 'text');
   if (!textContent || textContent.type !== 'text') {
     throw new Error('Réponse Claude invalide');
   }
@@ -232,8 +344,8 @@ async function ocrWithClaude(files: OcrFile[]): Promise<string> {
  */
 const GEMINI_INLINE_LIMIT = 18 * 1024 * 1024;
 
-/** OCR par Gemini (Google). */
-async function ocrWithGemini(files: OcrFile[]): Promise<string> {
+/** Un appel à Gemini, texte brut (JSON garanti par le schéma) en retour. */
+async function ocrWithGemini(files: OcrFile[], call: Call): Promise<string> {
   const totalBase64 = files.reduce((sum, f) => sum + f.fileBase64.length, 0);
   if (totalBase64 > GEMINI_INLINE_LIMIT) {
     throw new Error(
@@ -244,12 +356,11 @@ async function ocrWithGemini(files: OcrFile[]): Promise<string> {
   }
 
   const result = await callGemini({
-    system: INVOICE_OCR_PROMPT,
-    parts: [...files.map(toGeminiPart), { text: USER_INSTRUCTION }],
-    maxOutputTokens: MAX_OUTPUT_TOKENS,
-    // Sortie JSON imposée côté Google : plus de markdown parasite autour de
-    // l'objet, donc plus de réparation approximative à faire ici.
+    system: call.system,
+    parts: [...files.map(toGeminiPart), { text: call.instruction }],
+    maxOutputTokens: call.maxTokens,
     responseJson: true,
+    responseSchema: call.schema,
   });
 
   if (result.truncated) throw new Error(TRUNCATED_MESSAGE);
@@ -263,24 +374,84 @@ async function ocrWithGemini(files: OcrFile[]): Promise<string> {
   return result.text;
 }
 
+async function callProvider(provider: OcrProvider, files: OcrFile[], call: Call): Promise<string> {
+  return provider === 'gemini' ? ocrWithGemini(files, call) : ocrWithClaude(files, call);
+}
+
+const MAIN_CALL: Call = {
+  system: INVOICE_OCR_PROMPT, instruction: USER_INSTRUCTION,
+  maxTokens: MAX_OUTPUT_TOKENS, schema: INVOICE_RESPONSE_SCHEMA,
+};
+const CONTROL_CALL: Call = {
+  system: CONTROL_PROMPT, instruction: CONTROL_INSTRUCTION,
+  maxTokens: CONTROL_MAX_TOKENS, schema: CONTROL_RESPONSE_SCHEMA,
+};
+
+/**
+ * Lecture de contrôle. Ne fait jamais échouer le scan : si elle plante
+ * (quota, panne), le résultat est null et l'écran signale que la facture n'a
+ * été lue qu'une fois.
+ */
+async function runControlReading(files: OcrFile[], provider: OcrProvider): Promise<OcrControlReading | null> {
+  try {
+    const raw = extractJson<Record<string, unknown>>(await callProvider(provider, files, CONTROL_CALL));
+    return {
+      moteur: provider === 'gemini' ? `Gemini (${await getGeminiModel()})` : `Claude (${PRIMARY_MODEL})`,
+      fournisseur: toText(raw.fournisseur),
+      date: toText(raw.date),
+      numero_facture: toText(raw.numero_facture),
+      total_ht: toNumber(raw.total_ht),
+      total_tva: toNumber(raw.total_tva),
+      total_ttc: toNumber(raw.total_ttc),
+    };
+  } catch (e) {
+    console.warn(`[OCR] Lecture de contrôle impossible (${provider}) : ${e instanceof Error ? e.message : e}`);
+    return null;
+  }
+}
+
+export interface OcrOutcome {
+  extracted: ExtractedInvoiceData;
+  /** Réponse brute du moteur principal, conservée pour l'audit. */
+  raw: unknown;
+  engine: { provider: OcrProvider; model: string };
+  /** Moteur de la lecture de contrôle, ou null si elle n'a pas eu lieu. */
+  controlEngine: OcrProvider | null;
+}
+
 /**
  * Lance l'OCR sur une ou plusieurs pages du même document, avec le moteur
- * configuré. Le résultat a exactement la même forme quel que soit le moteur.
+ * configuré, puis la lecture de contrôle. Le résultat a exactement la même
+ * forme quel que soit le moteur, et il est déjà normalisé.
  */
-export async function runInvoiceOcr(files: OcrFile[]): Promise<ExtractedInvoiceData> {
+export async function runInvoiceOcr(files: OcrFile[]): Promise<OcrOutcome> {
   const provider = await resolveOcrProvider();
-  const raw = provider === 'gemini' ? await ocrWithGemini(files) : await ocrWithClaude(files);
+  const controlProvider = await resolveControlProvider(provider);
 
-  const extracted = extractJson<ExtractedInvoiceData>(raw);
+  // Les deux lectures partent en parallèle : la seconde ne coûte pas de temps.
+  const [rawText, control] = await Promise.all([
+    callProvider(provider, files, MAIN_CALL),
+    controlProvider ? runControlReading(files, controlProvider) : Promise.resolve(null),
+  ]);
+
+  const raw = extractJson<Record<string, unknown>>(rawText);
+  const extracted = normalizeExtracted({ ...raw, controle_lecture: control });
   extracted.tva_recoverable = computeTvaRecoverable(extracted);
-  return extracted;
+
+  return {
+    extracted,
+    raw,
+    engine: { provider, model: provider === 'gemini' ? await getGeminiModel() : PRIMARY_MODEL },
+    controlEngine: control ? controlProvider : null,
+  };
 }
 
 /** Moteur et modèle actifs, pour l'affichage et le diagnostic. */
-export async function describeOcrEngine(): Promise<{ provider: OcrProvider; model: string }> {
+export async function describeOcrEngine(): Promise<{ provider: OcrProvider; model: string; control: OcrProvider | null }> {
   const provider = await resolveOcrProvider();
   return {
     provider,
     model: provider === 'gemini' ? await getGeminiModel() : PRIMARY_MODEL,
+    control: await resolveControlProvider(provider),
   };
 }

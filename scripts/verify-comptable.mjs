@@ -19,13 +19,18 @@
 
 import { computeTva } from '../src/lib/tva.ts';
 import {
-  isFinancialFlow, estimatedVatRate,
+  isFinancialFlow, estimatedVatRate, invoiceVat,
   orderHtAmount, bankAmountHt, makeInvoiceMatcher, round2,
 } from '../src/lib/accounting.ts';
 import { detectInterventions, collectInterventionFacts } from '../src/lib/interventions.ts';
 import { categoryFromRules } from '../src/lib/bank-csv.ts';
 import { suggestInvoicesForTransaction, sumDebits } from '../src/lib/reconciliation.ts';
-import { checkInvoice, assertInvoiceAccepted } from '../src/lib/invoice-checks.ts';
+import { checkInvoice, assertInvoiceAccepted, normalizeInvoiceNumber } from '../src/lib/invoice-checks.ts';
+import {
+  toNumber, parsePackaging, normalizeLine, normalizeExtracted, normalizeVentilation,
+  computeTvaRecoverable, correctedFields,
+} from '../src/lib/invoice-normalize.ts';
+import { parseBankCsv, checkBalance } from '../src/lib/bank-csv.ts';
 import {
   repairMojibake, normalizeName, findSupplierMatch, matchIngredient, unmatchedDesignations,
 } from '../src/lib/referentiel.ts';
@@ -780,7 +785,7 @@ console.log('\n── Verrous facture ──');
 const AUJOURDHUI = '2026-09-03';
 const FACTURE_SAINE = {
   fournisseur: 'Métro', date: '2026-08-28', numero_facture: 'F-2026-4471',
-  total_ht: 100, total_ttc: 110, tva: 10, type_document: 'facture',
+  total_ht: 100, total_ttc: 110, tva: 10, type_document: 'facture', nom_entreprise_present: true,
   lignes: [
     { designation: 'Farine', quantite: 25, unite: 'kg', prix_unitaire_ht: 2, prix_total_ht: 50, categorie: 'alimentaire' },
     { designation: 'Mozzarella', quantite: 5, unite: 'kg', prix_unitaire_ht: 10, prix_total_ht: 50, categorie: 'alimentaire' },
@@ -823,6 +828,172 @@ verifie('sans numéro, non acquittée : refusée', tente({ numero_facture: null 
 verifie('sans numéro, acquittée : acceptée', tente({ numero_facture: null }, ['numero-manquant']), 'acceptée');
 verifie('bloquant acquitté quand même : refusée', tente({ date: null }, ['date-manquante']), 'refusée');
 verifie('acquittement d\'un autre code : refusée', tente({ numero_facture: null }, ['sans-tva']), 'refusée');
+
+// ── Contrôles ajoutés avec la refonte « chiffres fiables » ──────────────
+console.log('\n── Verrous facture : double lecture, ventilation, doublon ──');
+
+const CTRL_OK = { moteur: 'Claude', fournisseur: 'Métro', date: '2026-08-28', numero_facture: 'f 2026 4471', total_ht: 100, total_tva: 10, total_ttc: 110 };
+verifie('lecture de contrôle concordante : silence', codes({ controle_lecture: CTRL_OK }).includes('lecture-divergente'), false);
+verifie('numéro comparé sans casse ni séparateurs', normalizeInvoiceNumber('F-2026 4471') === normalizeInvoiceNumber('f20264471'), true);
+verifie('TTC divergent → à confirmer', niveau({ controle_lecture: { ...CTRL_OK, total_ttc: 101 } }, 'lecture-divergente'), 'a_confirmer');
+verifie('date divergente → à confirmer', niveau({ controle_lecture: { ...CTRL_OK, date: '2026-08-27' } }, 'lecture-divergente'), 'a_confirmer');
+verifie('contrôle partiel (TTC non lu) : pas de fausse alerte', codes({ controle_lecture: { ...CTRL_OK, total_ttc: null } }).includes('lecture-divergente'), false);
+verifie('divergence corrigée par l\'humain : l\'alerte disparaît',
+  codes({ total_ttc: 101, total_ht: 91.82, tva: 9.18, controle_lecture: { ...CTRL_OK, total_ht: 91.82, total_tva: 9.18, total_ttc: 101 } }).includes('lecture-divergente'), false);
+verifie('champs incertains → à confirmer', niveau({ champs_incertains: ['total_ttc'] }, 'champs-incertains'), 'a_confirmer');
+verifie('total non lu (mis à 0) → à confirmer', niveau({ total_ht: 0, champs_non_lus: ['total_ht'] }, 'total-non-lu'), 'a_confirmer');
+verifie('taux implicite 50 % → à confirmer', niveau({ total_ht: 100, total_ttc: 150, tva: null }, 'taux-implicite-anormal'), 'a_confirmer');
+verifie('taux implicite 20 % : normal', codes({ total_ht: 100, total_ttc: 120, tva: 20 }).includes('taux-implicite-anormal'), false);
+
+const VENT_OK = [{ taux: 5.5, base_ht: 60, montant_tva: 3.3 }, { taux: 20, base_ht: 40, montant_tva: 8 }];
+verifie('ventilation juste (HT 100, TVA 11,30) : silence', codes({ tva: 11.3, total_ttc: 111.3, tva_ventilation: VENT_OK }).includes('ventilation-tva-incoherente'), false);
+verifie('ventilation : montant ≠ base × taux → à confirmer',
+  niveau({ tva: 11.3, total_ttc: 111.3, tva_ventilation: [{ taux: 5.5, base_ht: 60, montant_tva: 6 }, VENT_OK[1]] }, 'ventilation-tva-incoherente'), 'a_confirmer');
+verifie('ventilation : Σ bases ≠ HT → à confirmer',
+  niveau({ tva: 11.3, total_ttc: 111.3, tva_ventilation: [VENT_OK[0], { taux: 20, base_ht: 30, montant_tva: 6 }] }, 'ventilation-tva-incoherente'), 'a_confirmer');
+verifie('ventilation : taux 7 % inconnu → à confirmer',
+  niveau({ tva: 7, total_ttc: 107, tva_ventilation: [{ taux: 7, base_ht: 100, montant_tva: 7 }] }, 'ventilation-tva-incoherente'), 'a_confirmer');
+verifie('arrondi de 3 centimes sur une ventilation de 1 000 € toléré',
+  codes({ total_ht: 1000, tva: 100, total_ttc: 1100, tva_ventilation: [{ taux: 10, base_ht: 1000, montant_tva: 100.03 }] }).includes('ventilation-tva-incoherente'), false);
+
+const DOUBLON_FAC = { id: 'abc12345-0000', accounting_ref: 'FAC-202608-ZZZZ', invoice_number: 'F-2026-4471', date: '2026-08-28', total_ttc: 110, supplier: 'Métro', raison: 'numero' };
+verifie('doublon probable → à confirmer', niveau({ doublon: DOUBLON_FAC }, 'doublon-probable'), 'a_confirmer');
+verifie('doublon non acquitté : refusée', tente({ doublon: DOUBLON_FAC }, []), 'refusée');
+verifie('doublon acquitté (autre facture) : acceptée', tente({ doublon: DOUBLON_FAC }, ['doublon-probable']), 'acceptée');
+
+verifie('reçu CB → information TVA non déduite', niveau({ type_document: 'recu', numero_facture: null }, 'tva-non-recuperable'), 'info');
+verifie('nom de société absent → information', niveau({ nom_entreprise_present: false }, 'tva-non-recuperable'), 'info');
+verifie('une information ne bloque pas l\'enregistrement', tente({ nom_entreprise_present: false }, []), 'acceptée');
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Normalisation OCR : l'IA recopie, le code calcule
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Normalisation OCR ──');
+
+verifie('« 1 234,56 » → 1234.56', toNumber('1 234,56'), 1234.56);
+verifie('« 1.234,56 » → 1234.56', toNumber('1.234,56'), 1234.56);
+verifie('« 12.5 » → 12.5', toNumber('12.5'), 12.5);
+verifie('« 12,5 € » → 12.5', toNumber('12,5 €'), 12.5);
+verifie('texte sans chiffre → null (jamais 0)', toNumber('illisible'), null);
+verifie('null → null', toNumber(null), null);
+
+verifie('« 25 kg » → 25 kg', parsePackaging('25 kg')?.perPack, 25);
+verifie('« 25KG » → kg', parsePackaging('25KG')?.unit, 'kg');
+verifie('« 500 g » → 0,5 kg', parsePackaging('500 g')?.perPack, 0.5);
+verifie('« 6 x 1 L » → 6 L', parsePackaging('6 x 1 L')?.perPack, 6);
+verifie('« 12x33cl » → 3,96 L', parsePackaging('12x33cl')?.perPack, 3.96);
+verifie('« 2,5 kg » → 2.5', parsePackaging('2,5 kg')?.perPack, 2.5);
+verifie('« kg » (vrac) → 1 kg', parsePackaging('kg')?.perPack, 1);
+verifie('« carton de 10 kg » → 10 kg', parsePackaging('carton de 10 kg')?.perPack, 10);
+verifie('conditionnement vide → null', parsePackaging(null), null);
+verifie('« lot » inconnu → null', parsePackaging('lot'), null);
+
+const farine = normalizeLine({ designation: 'FARINE CAPUTO', quantite_lue: 2, conditionnement: '25 kg', prix_unitaire_lu: 24.5, prix_total_ht: 49, categorie: 'alimentaire' });
+verifie('2 cartons de 25 kg → 50 kg', farine.quantite, 50);
+verifie('unité standard kg', farine.unite, 'kg');
+verifie('prix au kg = 49 ÷ 50 (calculé, pas lu)', farine.prix_unitaire_ht, 0.98);
+verifie('prix lu conservé pour l\'audit', farine.prix_unitaire_lu, 24.5);
+const biere = normalizeLine({ designation: 'PERONI', quantite_lue: 3, conditionnement: '12x33cl', prix_total_ht: 36, categorie: 'boisson' });
+verifie('3 packs de 12 × 33 cl → 11,88 L', biere.quantite, 11.88);
+const vrac = normalizeLine({ designation: 'TOMATES', quantite_lue: 4.2, conditionnement: 'kg', prix_total_ht: 8.4, categorie: 'alimentaire' });
+verifie('vrac : 4,2 kg à 2 €/kg', vrac.prix_unitaire_ht, 2);
+const ancien = normalizeLine({ designation: 'Mozzarella', quantite: 5, unite: 'kg', prix_unitaire_ht: 10, prix_total_ht: 50, categorie: 'alimentaire' });
+verifie('ancien format (déjà normalisé) respecté', ancien.quantite, 5);
+verifie('ancien format : prix recalculé identique', ancien.prix_unitaire_ht, 10);
+const sansQte = normalizeLine({ designation: 'FRAIS', quantite_lue: null, conditionnement: null, prix_total_ht: 5, categorie: 'autre' });
+verifie('quantité nulle : pas de division, prix unitaire 0', sansQte.prix_unitaire_ht, 0);
+verifie('catégorie inconnue → autre', normalizeLine({ designation: 'x', prix_total_ht: 1, categorie: 'bizarre' }).categorie, 'autre');
+
+const BRUT = {
+  fournisseur: ' METRO ', date: '28/08/2026', numero_facture: null, type_document: 'facture', nom_entreprise_present: true,
+  total_ht: '100,00', total_tva: null, total_ttc: 110, tva_ventilation: [{ taux: '10.0', base_ht: 100, montant_tva: 10 }],
+  compte_comptable: '601', lignes: [{ designation: 'Farine', quantite_lue: 4, conditionnement: '25 kg', prix_total_ht: 100, categorie: 'alimentaire' }],
+  champs_incertains: ['date', 'pas_un_champ'],
+};
+const norm = normalizeExtracted(BRUT);
+verifie('date française convertie en ISO', norm.date, '2026-08-28');
+verifie('HT « 100,00 » → 100', norm.total_ht, 100);
+verifie('TVA absente → TTC − HT, et signalée non lue', norm.tva, 10);
+verifie('… champs_non_lus contient total_tva', norm.champs_non_lus.includes('total_tva'), true);
+verifie('taux « 10.0 » → 10', norm.tva_ventilation[0].taux, 10);
+verifie('champ incertain inconnu écarté', norm.champs_incertains.length, 1);
+verifie('TVA récupérable calculée (facture au nom de la société)', norm.tva_recoverable, true);
+verifie('normalisation idempotente', JSON.stringify(normalizeExtracted(norm)), JSON.stringify(norm));
+const nul = normalizeExtracted({ fournisseur: 'X', date: '2026-08-01', total_ht: null, total_ttc: null });
+verifie('totaux null → 0 ET listés non lus', nul.champs_non_lus.includes('total_ttc') && nul.total_ttc === 0, true);
+verifie('taux 5,50 lu → 5.5', normalizeVentilation([{ taux: 5.50001, base_ht: 10, montant_tva: 0.55 }])[0].taux, 5.5);
+
+verifie('facture au nom de la société : TVA récupérable', computeTvaRecoverable({ type_document: 'facture', nom_entreprise_present: true, total_ht: 100 }), true);
+verifie('facture sans le nom : non récupérable', computeTvaRecoverable({ type_document: 'facture', nom_entreprise_present: false, total_ht: 100 }), false);
+verifie('ticket 120 € HT sans nom : récupérable (< 150 € HT)', computeTvaRecoverable({ type_document: 'ticket_caisse', nom_entreprise_present: false, total_ht: 120 }), true);
+verifie('ticket 160 € HT sans nom : non récupérable (seuil en HT)', computeTvaRecoverable({ type_document: 'ticket_caisse', nom_entreprise_present: false, total_ht: 160 }), false);
+verifie('reçu CB : jamais récupérable', computeTvaRecoverable({ type_document: 'recu', nom_entreprise_present: true, total_ht: 10 }), false);
+verifie('bon de livraison : pas encore récupérable', computeTvaRecoverable({ type_document: 'bon_livraison', nom_entreprise_present: true, total_ht: 10 }), false);
+
+const corr = correctedFields(norm, { ...norm, total_ttc: 111, fournisseur: 'Métro Rouen' });
+verifie('champs corrigés tracés : TTC et fournisseur', corr.join(','), 'fournisseur,total_ttc');
+verifie('aucune correction → liste vide', correctedFields(norm, norm).length, 0);
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TVA lue sur la facture (tva_amount) plutôt que TTC − HT
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── TVA déductible : montant lu ──');
+verifie('sans tva_amount : TTC − HT', invoiceVat({ total_ht: 100, total_ttc: 110 }), 10);
+verifie('avec tva_amount : le montant lu prime (consigne exclue)', invoiceVat({ total_ht: 100, total_ttc: 115, tva_amount: 10 }), 10);
+verifie('non récupérable : 0 même avec tva_amount', invoiceVat({ total_ht: 100, total_ttc: 110, tva_amount: 10, tva_recoverable: false }), 0);
+verifie('tva_amount à 0 (auto-entrepreneur) : 0, pas TTC − HT', invoiceVat({ total_ht: 100, total_ttc: 100.5, tva_amount: 0 }), 0);
+
+r = await tva({ invoices: [
+  { id: 'v1', date: '2026-06-01', total_ht: 100, total_ttc: 111.3, tva_amount: 11.3, tva_recoverable: true,
+    tva_breakdown: [{ taux: 5.5, base_ht: 60, montant_tva: 3.3 }, { taux: 20, base_ht: 40, montant_tva: 8 }], supplier: { name: 'Métro' } },
+  { id: 'v2', date: '2026-06-02', total_ht: 50, total_ttc: 55, tva_amount: null, tva_breakdown: null, tva_recoverable: true, supplier: { name: 'Ancienne' } },
+]});
+verifie('déductible = 11,30 + 5', r.deductibleTva, 16.3);
+verifie('ventilation déductible 5,5 %', r.deductibleTvaBreakdown['5.5%'], 3.3);
+verifie('ventilation déductible 20 %', r.deductibleTvaBreakdown['20%'], 8);
+verifie('facture sans ventilation → non ventilée', r.deductibleTvaBreakdown.nonVentile, 5);
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Relevé bancaire : contrôle de solde
+// ═══════════════════════════════════════════════════════════════════════════
+console.log('\n── Relevé bancaire : contrôle de solde ──');
+
+const CSV_OK = [
+  '01/06/2026;1768,44;Solde;;',
+  '03/06/2026;-84,30;Carte;;CB42METRO FRANCE 03/06/26;;;',
+  '05/06/2026;600,00;Virement;;;VIR SEPA SQUAREUP;;',
+  '06/06/2026;-38,24;Prélèvement;;PRLV SEPA VERISURE;;;',
+  '30/06/2026;2245,90;Solde;;',
+].join('\n');
+let csv = parseBankCsv(CSV_OK);
+verifie('3 opérations lues', csv.rows.length, 3);
+verifie('2 lignes de solde écartées', csv.skipped, 2);
+verifie('solde d\'ouverture reconnu', csv.balance?.opening, 1768.44);
+verifie('solde de clôture reconnu', csv.balance?.closing, 2245.90);
+verifie('ouverture + Σ = clôture : concordance', csv.balance?.ok, true);
+verifie('écart nul', csv.balance?.gap, 0);
+
+csv = parseBankCsv(CSV_OK.split('\n').filter(l => !l.includes('SQUAREUP')).join('\n'));
+verifie('une opération manquante : contrôle en échec', csv.balance?.ok, false);
+verifie('écart = l\'opération manquante (600 €)', csv.balance?.gap, 600);
+
+csv = parseBankCsv(CSV_OK.split('\n').reverse().join('\n'));
+verifie('fichier du plus récent au plus ancien : concordance quand même', csv.balance?.ok, true);
+verifie('… avec l\'ouverture correctement identifiée', csv.balance?.opening, 1768.44);
+
+csv = parseBankCsv(CSV_OK.split('\n').filter(l => !l.includes('Solde')).join('\n'));
+verifie('sans lignes de solde : contrôle impossible (null)', csv.balance, null);
+
+csv = parseBankCsv(CSV_OK.replace('-38,24', '38,24abc'));
+verifie('montant illisible : ligne signalée comme suspecte', csv.suspicious.length, 1);
+verifie('… et le contrôle de solde échoue', csv.balance?.ok, false);
+
+const bc = checkBalance(100, 100, [{ amount: 10 }, { amount: -10 }]);
+verifie('somme nulle, soldes égaux : concordance', bc.ok, true);
+verifie('écart au centime détecté', checkBalance(100, 110.01, [{ amount: 10 }]).gap, 0.01);
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1257,6 +1428,9 @@ const FEC_INPUT = {
       lines: [{ category: 'alimentaire', total_ht: 80 }, { category: 'materiel', total_ht: 15 }] }, // 5 € d'écart lignes/total
     { id: 'i2', date: '2026-08-10', invoice_number: null, accounting_ref: 'FAC-202608-BBBB', accounting_class: '606',
       total_ht: 50, total_ttc: 60, tva_recoverable: false, supplier: { name: 'Leroy Merlin' }, lines: [] },
+    // TVA lue 20 €, mais TTC − HT = 25 : 5 € de consigne, hors TVA
+    { id: 'i3', date: '2026-08-11', invoice_number: 'F-3', accounting_ref: 'FAC-202608-CCCC', accounting_class: '607',
+      total_ht: 200, total_ttc: 225, tva_amount: 20, tva_recoverable: true, supplier: { name: 'Vallée de Seine Boissons' }, lines: [] },
   ],
   bank: [
     { id: 'b1', date: '2026-08-04', description: 'CB METRO', amount: -110, category: 'variable_fournisseur', invoice_id: 'i1' },
@@ -1298,6 +1472,12 @@ verifie('achat : compte auxiliaire lisible', ac1.find(l => l.compte === '401000'
 const ac2 = par(l => l.journal === 'AC' && l.piece === 'FAC-202608-BBBB');
 verifie('TVA non récupérable : aucune TVA déductible', ac2.filter(l => l.compte === '445660').length, 0);
 verifie('TVA non récupérable : charge = TTC', somme(ac2.filter(l => l.compte === '606300'), 'debit'), 60);
+
+// Facture avec TVA lue : 44566 = montant lu, la consigne va en charge, l'écriture tombe juste
+const ac3 = par(l => l.journal === 'AC' && l.piece === 'FAC-202608-CCCC');
+verifie('TVA lue : 44566 = 20 (pas TTC − HT = 25)', somme(ac3.filter(l => l.compte === '445660'), 'debit'), 20);
+verifie('consigne hors TVA : 5 € en charge, nommés', somme(ac3.filter(l => l.lib.includes('hors champ TVA')), 'debit'), 5);
+verifie('fournisseur crédité du TTC', somme(ac3.filter(l => l.compte === '401000'), 'credit'), 225);
 
 // Banque : contreparties
 const bq = par(l => l.journal === 'BQ');

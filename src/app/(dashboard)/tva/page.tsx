@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { formatCurrency, getDateRange, toISODate, formatDate, CATEGORY_LABELS } from '@/lib/utils';
 import { computeTva, getVatRate } from '@/lib/tva';
-import { isFinancialFlow, round2 } from '@/lib/accounting';
+import { isFinancialFlow, round2, invoiceVat } from '@/lib/accounting';
 import { 
   Percent, 
   TrendingUp, 
@@ -31,6 +31,7 @@ export default function TvaPage() {
     collectedTva: 0,
     collectedTvaBreakdown: { '5.5%': 0, '10%': 0, '20%': 0, nonVentile: 0 },
     deductibleTva: 0,
+    deductibleTvaBreakdown: { '5.5%': 0, '10%': 0, '20%': 0, nonVentile: 0 },
     netTva: 0,
 
     // Indicateurs de pilotage, non déclarables
@@ -77,7 +78,7 @@ export default function TvaPage() {
         // 2. Fetch Invoices in period
         supabase
           .from('invoices')
-          .select('id, date, invoice_number, total_ht, total_ttc, tva_recoverable, type_document, company_name_present, supplier:suppliers(name)')
+          .select('id, date, invoice_number, total_ht, total_ttc, tva_amount, tva_recoverable, type_document, company_name_present, supplier:suppliers(name)')
           .gte('date', startStr)
           .lte('date', endStr),
         // 3. Dépenses bancaires de la période.
@@ -122,7 +123,7 @@ export default function TvaPage() {
       if (missingInvoiceIds.length > 0) {
         const { data: outerInvoices } = await supabase
           .from('invoices')
-          .select('id, date, invoice_number, total_ht, total_ttc, tva_recoverable, type_document, company_name_present, supplier:suppliers(name)')
+          .select('id, date, invoice_number, total_ht, total_ttc, tva_amount, tva_recoverable, type_document, company_name_present, supplier:suppliers(name)')
           .in('id', missingInvoiceIds);
         (outerInvoices || []).forEach((inv: any) => invoicesById.set(inv.id, inv));
       }
@@ -163,7 +164,8 @@ export default function TvaPage() {
           isTvaRec = inv.tva_recoverable !== false;
           const ttc = inv.total_ttc || amt;
           ht = isTvaRec ? (inv.total_ht ?? amt) : ttc;
-          tva = isTvaRec ? Math.max(0, round2(ttc - ht)) : 0;
+          // TVA lue en pied de facture quand elle existe (lib/accounting.ts).
+          tva = invoiceVat(inv);
           isLinked = true;
           invoiceNum = inv.invoice_number || 'Facture liée';
           statusLabel = isTvaRec ? 'Déductible (facture)' : 'Facture sans TVA récupérable';
@@ -216,7 +218,7 @@ export default function TvaPage() {
 
         if (isTvaRec) {
           ht = inv.total_ht || 0;
-          tva = Math.max(0, ttc - ht);
+          tva = invoiceVat(inv);
         } else {
           ht = ttc;
           tva = 0;
@@ -458,6 +460,16 @@ export default function TvaPage() {
                     {data.invoiceCount} facture{data.invoiceCount > 1 ? 's' : ''} avec TVA récupérable.
                     Une dépense sans facture n&apos;ouvre aucun droit à déduction.
                   </div>
+                  {data.deductibleTva > 0 && (
+                    <div>
+                      Par taux lu sur les factures : 5,5 % <strong>{formatCurrency(data.deductibleTvaBreakdown['5.5%'])}</strong>
+                      {' · '}10 % <strong>{formatCurrency(data.deductibleTvaBreakdown['10%'])}</strong>
+                      {' · '}20 % <strong>{formatCurrency(data.deductibleTvaBreakdown['20%'])}</strong>
+                      {data.deductibleTvaBreakdown.nonVentile > 0 && (
+                        <> · sans ventilation <strong>{formatCurrency(data.deductibleTvaBreakdown.nonVentile)}</strong></>
+                      )}
+                    </div>
+                  )}
                   {data.recoverableIfInvoiced > 0 && (
                     <div style={{ color: 'var(--orange)' }}>
                       + {formatCurrency(data.recoverableIfInvoiced)} récupérables si tu rattaches les
