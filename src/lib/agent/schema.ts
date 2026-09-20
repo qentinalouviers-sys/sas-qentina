@@ -13,13 +13,19 @@
  * un outil — c'est une contrainte, pas un manque.
  */
 
-export type PropType = 'string' | 'number' | 'integer' | 'boolean';
+export type PropType = 'string' | 'number' | 'integer' | 'boolean' | 'object' | 'array';
 
 export interface PropSchema {
   type: PropType;
   /** Décrit le paramètre POUR LE MODÈLE : formats attendus, valeur par défaut. */
   description: string;
   enum?: readonly string[];
+  /**
+   * Pour `array` : type des éléments (chaînes seulement — une liste de codes,
+   * d'identifiants). Pour `object` : structure libre, décrite dans
+   * `description` et validée par l'outil lui-même (une facture extraite).
+   */
+  items?: { type: 'string'; enum?: readonly string[] };
   /** Format contrôlé : mois « AAAA-MM », date « AAAA-MM-JJ », année. */
   format?: 'month' | 'date' | 'year' | 'uuid';
   minimum?: number;
@@ -118,6 +124,38 @@ export function validateArgs(
       continue;
     }
 
+    if (prop.type === 'object') {
+      // Un modèle envoie parfois l'objet sérialisé en chaîne : on le relit.
+      let obj: unknown = value;
+      if (typeof obj === 'string') {
+        try { obj = JSON.parse(obj); } catch { obj = null; }
+      }
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+        errors.push({ field: name, message: 'attendu : un objet JSON' });
+        continue;
+      }
+      out[name] = obj;
+      continue;
+    }
+
+    if (prop.type === 'array') {
+      // Une valeur seule vaut une liste d'un élément : « confirmations: "x" ».
+      let arr: unknown = value;
+      if (typeof arr === 'string') {
+        try { const parsed = JSON.parse(arr); if (Array.isArray(parsed)) arr = parsed; } catch { /* chaîne simple */ }
+      }
+      const list = Array.isArray(arr) ? arr : [arr];
+      const strings = list.map(v => (typeof v === 'string' ? v.trim() : String(v)));
+      const allowed = prop.items?.enum;
+      const bad = allowed ? strings.filter(v => !allowed.includes(v)) : [];
+      if (bad.length > 0) {
+        errors.push({ field: name, message: `valeur(s) non admise(s) : ${bad.join(', ')}. Attendu : ${allowed!.join(' | ')}` });
+        continue;
+      }
+      out[name] = strings;
+      continue;
+    }
+
     if (prop.type === 'boolean') {
       // Un modèle envoie volontiers la chaîne « true » : l'accepter évite un
       // aller-retour sans rien masquer d'ambigu.
@@ -168,6 +206,8 @@ export function toJsonSchema(schema: ToolSchema): Record<string, unknown> {
       description: prop.description,
     };
     if (prop.enum) entry.enum = [...prop.enum];
+    if (prop.type === 'array') entry.items = { type: 'string', ...(prop.items?.enum ? { enum: [...prop.items.enum] } : {}) };
+    if (prop.type === 'object') entry.additionalProperties = true;
     if (prop.minimum !== undefined) entry.minimum = prop.minimum;
     if (prop.maximum !== undefined) entry.maximum = prop.maximum;
     if (prop.default !== undefined) entry.default = prop.default;

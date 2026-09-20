@@ -27,6 +27,8 @@ const STATUS_BY_CODE: Record<string, number> = {
   month_closed: 409,
   already_linked: 409,
   cca_debtor: 409,
+  amount_mismatch: 409,
+  invoice_refused: 422,
   insufficient_scope: 403,
   database_error: 502,
   tool_failed: 500,

@@ -47,8 +47,11 @@ export async function GET(request: NextRequest) {
       mois: 'AAAA-MM',
       reponses: 'chaque résultat porte une phrase de synthèse en français, à citer telle quelle',
       ecritures: "idempotentes : rejouer un appel ne duplique rien. Utiliser dry_run pour simuler.",
+      guide: 'GET /api/agent/guide (markdown) ou ressource MCP qentina://guide',
     },
     count: tools.length,
+    scopes: { read: tools.filter(t => t.scope === 'read').map(t => t.name), write: tools.filter(t => t.scope === 'write').map(t => t.name) },
+    expensive: tools.filter(t => t.expensive).map(t => t.name),
     tools: tools.map(toMcpTool),
     functions: tools.map(toFunctionSpec),
   });

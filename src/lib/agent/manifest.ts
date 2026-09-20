@@ -7,7 +7,8 @@
  * voir en test, pas en production quand l'agent choisit l'outil à l'aveugle.
  */
 
-import { AGENT_TOOLS, type AgentTool, type ToolResult } from './tools';
+import { AGENT_TOOLS } from './tools';
+import type { AgentTool, ToolResult } from './base';
 import { toJsonSchema } from './schema';
 
 /** Les outils visibles pour une identité donnée : une clé lecture ne voit pas les écritures. */
@@ -24,8 +25,12 @@ export function toMcpTool(tool: AgentTool) {
     annotations: {
       title: tool.name,
       readOnlyHint: tool.scope === 'read',
+      // Aucun outil ne supprime : les écritures ajoutent ou corrigent, et un
+      // mois clôturé les refuse. Toutes sont rejouables sans doublon.
       destructiveHint: false,
       idempotentHint: true,
+      // Tout se passe dans la base du restaurant : pas d'accès au monde extérieur.
+      openWorldHint: false,
     },
   };
 }

@@ -32,13 +32,12 @@
  * mêmes chemins que l'écran.
  */
 
-import type { SupabaseClient } from '@supabase/supabase-js';
 import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { monthBounds, monthLabel, isMonthOver } from '@/lib/months';
 import { collectInterventionFacts, detectInterventions } from '@/lib/interventions';
 import { buildSnapshot, checkClosure } from '@/lib/closures';
 import { computeTva } from '@/lib/tva';
-import { round2 } from '@/lib/accounting';
+import { round2, invoiceVat } from '@/lib/accounting';
 import {
   checkCcaOperation, describeCcaViolation, analyseCcaReconciliation,
   mergeTransferTerms, type CcaMovementRow, type CcaBankLine, type CcaAssocie,
@@ -47,67 +46,15 @@ import {
   mergeConfig, computeTotals, buildTripCandidates, analyseCoverage, candidateNote,
   driverLabel, type InvoiceLike, type BankLineLike,
 } from '@/lib/mileage';
-import type { ToolSchema } from './schema';
+import { normalizeInvoiceNumber } from '@/lib/invoice-checks';
+import {
+  eur, resolveMonth, relationName, MONTH_PROP, LIMIT_PROP, DRY_RUN_PROP, ToolError,
+  type AgentTool, type ToolContext,
+} from './base';
+import { GESTION_TOOLS } from './tools-gestion';
+import { ECRITURE_TOOLS } from './tools-ecritures';
 
-export interface ToolContext {
-  supabase: SupabaseClient;
-  /** Date du jour en ISO — paramétrable, ce qui rend les outils testables. */
-  today: string;
-}
-
-export interface ToolResult {
-  /** Réponse déjà rédigée, en français. L'agent peut la citer telle quelle. */
-  summary: string;
-  data: Record<string, unknown>;
-  /** Vrai quand une liste a été coupée par `limit`. */
-  truncated?: boolean;
-  /** Suites possibles, nommées par leur outil : de quoi enchaîner sans deviner. */
-  next?: string[];
-}
-
-export interface AgentTool {
-  name: string;
-  description: string;
-  schema: ToolSchema;
-  /** 'read' ne modifie rien. 'write' exige une clé portant la portée write. */
-  scope: 'read' | 'write';
-  handler: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
-}
-
-/** Erreur destinée au modèle : le message dit quoi faire, pas ce qui a planté. */
-export class ToolError extends Error {
-  constructor(message: string, readonly code = 'invalid_request') {
-    super(message);
-    this.name = 'ToolError';
-  }
-}
-
-const eur = (n: number) => `${(Math.round(n * 100) / 100).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`;
-
-/** Le mois demandé, ou le mois en cours. Refuse un mois futur, qui n'a rien à dire. */
-function resolveMonth(args: Record<string, unknown>, ctx: ToolContext): string {
-  const month = (args.month as string) || ctx.today.slice(0, 7);
-  if (month > ctx.today.slice(0, 7)) {
-    throw new ToolError(
-      `Le mois ${month} n'a pas encore commencé. Demande un mois écoulé ou le mois en cours (${ctx.today.slice(0, 7)}).`,
-      'out_of_range',
-    );
-  }
-  return month;
-}
-
-const MONTH_PROP = {
-  type: 'string' as const,
-  format: 'month' as const,
-  description: 'Mois au format AAAA-MM. Par défaut : le mois en cours.',
-};
-const LIMIT_PROP = (def: number, max: number) => ({
-  type: 'integer' as const,
-  description: `Nombre maximum de lignes renvoyées (défaut ${def}, plafond ${max}).`,
-  minimum: 1,
-  maximum: max,
-  default: def,
-});
+export { ToolError, type AgentTool, type ToolContext, type ToolResult } from './base';
 
 // ════════════════════════════════════════════════════════════════════════════
 //  Lecture
@@ -235,9 +182,14 @@ const listInvoices: AgentTool = {
       from: { type: 'string', format: 'date', description: 'Date de début incluse (AAAA-MM-JJ).' },
       to: { type: 'string', format: 'date', description: 'Date de fin incluse (AAAA-MM-JJ).' },
       supplier: { type: 'string', description: "Fragment du nom du fournisseur (insensible à la casse)." },
+      invoice_number: { type: 'string', description: 'Numéro de facture exact (casse, espaces et tirets ignorés).' },
       payment_method: {
         type: 'string', enum: ['bank', 'cash', 'card_perso'],
         description: "Mode de règlement : bank (compte société), cash (espèces), card_perso (carte d'un associé).",
+      },
+      bank_link: {
+        type: 'string', enum: ['linked', 'unlinked'],
+        description: 'linked = lettrées avec un mouvement bancaire, unlinked = sans paiement bancaire rattaché (à lettrer).',
       },
       limit: LIMIT_PROP(50, 200),
     },
@@ -245,11 +197,14 @@ const listInvoices: AgentTool = {
   },
   async handler(args, ctx) {
     const limit = Number(args.limit ?? 50);
+    // Les filtres qui portent sur une relation (fournisseur, lettrage) se font
+    // en mémoire : on lit plus large, borné, puis on filtre.
+    const wide = (args.supplier || args.invoice_number || args.bank_link) ? Math.min(limit * 10, 1000) : limit + 1;
     let q = ctx.supabase
       .from('invoices')
-      .select('id, date, invoice_number, total_ht, total_ttc, payment_method, accounting_ref, supplier:suppliers(name)')
+      .select('id, date, invoice_number, total_ht, total_ttc, tva_amount, tva_recoverable, payment_method, accounting_ref, accounting_class, type_document, supplier:suppliers(name)')
       .order('date', { ascending: false })
-      .limit(limit + 1);
+      .limit(wide);
 
     if (args.from) q = q.gte('date', args.from as string);
     if (args.to) q = q.lte('date', args.to as string);
@@ -262,37 +217,59 @@ const listInvoices: AgentTool = {
       id: r.id,
       date: r.date,
       invoice_number: r.invoice_number,
-      supplier: (Array.isArray(r.supplier) ? r.supplier[0]?.name : (r.supplier as { name?: string } | null)?.name) ?? null,
+      supplier: relationName(r.supplier),
       total_ht: r.total_ht,
       total_ttc: r.total_ttc,
+      tva_deductible: invoiceVat(r),
       payment_method: r.payment_method,
       accounting_ref: r.accounting_ref,
+      accounting_class: r.accounting_class,
+      type_document: r.type_document,
+      bank_transaction_id: null as string | null,
     }));
 
-    // Le filtre par fournisseur porte sur une relation : Supabase ne sait pas
-    // le faire dans la même requête sans jointure explicite, on filtre ici.
     if (args.supplier) {
       const needle = String(args.supplier).toLowerCase();
       rows = rows.filter(r => (r.supplier ?? '').toLowerCase().includes(needle));
+    }
+    if (args.invoice_number) {
+      const wanted = normalizeInvoiceNumber(String(args.invoice_number));
+      rows = rows.filter(r => normalizeInvoiceNumber(r.invoice_number) === wanted);
+    }
+
+    // Lettrage : une requête groupée sur les factures retenues.
+    if (rows.length > 0) {
+      const { data: links } = await ctx.supabase.from('bank_transactions').select('id, invoice_id')
+        .in('invoice_id', rows.map(r => r.id));
+      const byInvoice = new Map((links ?? []).map(l => [l.invoice_id as string, l.id as string]));
+      for (const r of rows) r.bank_transaction_id = byInvoice.get(r.id) ?? null;
+      if (args.bank_link === 'linked') rows = rows.filter(r => r.bank_transaction_id);
+      if (args.bank_link === 'unlinked') rows = rows.filter(r => !r.bank_transaction_id);
     }
 
     const truncated = rows.length > limit;
     rows = rows.slice(0, limit);
     const total = round2(rows.reduce((s, r) => s + (Number(r.total_ttc) || 0), 0));
+    const tva = round2(rows.reduce((s, r) => s + r.tva_deductible, 0));
 
     return {
       summary: rows.length === 0
         ? 'Aucune facture ne correspond à ces critères.'
-        : `${rows.length} facture(s)${truncated ? ' (liste tronquée)' : ''}, ${eur(total)} TTC au total.`,
-      data: { invoices: rows, count: rows.length, total_ttc: total },
+        : `${rows.length} facture(s)${truncated ? ' (liste tronquée)' : ''}, ${eur(total)} TTC au total, ${eur(tva)} de TVA déductible`
+          + (args.bank_link === 'unlinked' ? ', toutes sans paiement bancaire rattaché.' : '.'),
+      data: { invoices: rows, count: rows.length, total_ttc: total, tva_deductible: tva },
       truncated,
+      next: args.bank_link === 'unlinked' ? ['link_invoice_to_bank_transaction'] : ['get_invoice'],
     };
   },
 };
 
 const getInvoice: AgentTool = {
   name: 'get_invoice',
-  description: "Une facture et le détail de ses lignes (désignation, quantité, prix, catégorie).",
+  description:
+    "Une facture et le détail de ses lignes (désignation, quantité, prix, catégorie), sa TVA lue en "
+    + "pied de page et sa ventilation par taux, la pièce jointe, le mouvement bancaire lettré, et la "
+    + "trace OCR (moteur, champs corrigés par l'humain).",
   scope: 'read',
   schema: {
     type: 'object',
@@ -304,22 +281,29 @@ const getInvoice: AgentTool = {
   },
   async handler(args, ctx) {
     const id = args.invoice_id as string;
-    const [{ data: inv, error }, { data: lines }] = await Promise.all([
+    const [{ data: inv, error }, { data: lines }, { data: tx }] = await Promise.all([
       ctx.supabase.from('invoices')
-        .select('id, date, invoice_number, total_ht, total_ttc, payment_method, accounting_ref, accounting_class, type_document, tva_recoverable, supplier:suppliers(name)')
+        .select('id, date, invoice_number, total_ht, total_ttc, tva_amount, tva_breakdown, ocr_meta, pdf_url, payment_method, accounting_ref, accounting_class, type_document, tva_recoverable, company_name_present, supplier:suppliers(name)')
         .eq('id', id).maybeSingle(),
       ctx.supabase.from('invoice_lines')
         .select('designation, quantity, unit, unit_price_ht, total_ht, category')
         .eq('invoice_id', id),
+      ctx.supabase.from('bank_transactions').select('id, date, description, amount, status').eq('invoice_id', id).limit(1).maybeSingle(),
     ]);
 
     if (error) throw new ToolError(`Lecture impossible : ${error.message}`, 'database_error');
     if (!inv) throw new ToolError(`Aucune facture avec l'identifiant ${id}. Utilise list_invoices pour trouver le bon.`, 'not_found');
 
-    const supplier = (Array.isArray(inv.supplier) ? inv.supplier[0]?.name : (inv.supplier as { name?: string } | null)?.name) ?? 'fournisseur inconnu';
+    const supplier = relationName(inv.supplier) ?? 'fournisseur inconnu';
+    const meta = (inv.ocr_meta ?? null) as { corrected_fields?: string[]; engine?: { provider?: string } } | null;
+    const tva = invoiceVat(inv);
     return {
-      summary: `Facture ${inv.invoice_number || 'sans numéro'} — ${supplier}, ${inv.date}, ${eur(Number(inv.total_ttc) || 0)} TTC, ${(lines ?? []).length} ligne(s).`,
-      data: { invoice: { ...inv, supplier }, lines: lines ?? [] },
+      summary: `Facture ${inv.invoice_number || 'sans numéro'} — ${supplier}, ${inv.date}, ${eur(Number(inv.total_ht) || 0)} HT, `
+        + `${eur(Number(inv.total_ttc) || 0)} TTC, TVA ${inv.tva_recoverable === false ? 'non déductible' : `déductible ${eur(tva)}`}, ${(lines ?? []).length} ligne(s)`
+        + (tx ? `, lettrée avec « ${tx.description ?? ''} » du ${tx.date}` : ', pas de paiement bancaire rattaché')
+        + (meta?.corrected_fields?.length ? `. Champs corrigés à la main : ${meta.corrected_fields.join(', ')}` : '') + '.',
+      data: { invoice: { ...inv, ocr_meta: undefined, supplier, tva_deductible: tva }, lines: lines ?? [], bank_transaction: tx ?? null, ocr: meta },
+      next: tx ? undefined : ['link_invoice_to_bank_transaction'],
     };
   },
 };
@@ -616,7 +600,7 @@ const recordMissingMileageTrips: AgentTool = {
     properties: {
       year: { type: 'integer', format: 'year', description: "Année civile. Par défaut : l'année en cours." },
       driver: { type: 'string', enum: ['justine', 'yohan'], description: 'Conducteur au nom duquel enregistrer.' },
-      dry_run: { type: 'boolean', description: 'true = simuler sans écrire. Défaut : false.', default: false },
+      dry_run: DRY_RUN_PROP,
     },
     additionalProperties: false,
   },
@@ -694,7 +678,7 @@ const linkBankTransfer: AgentTool = {
     properties: {
       bank_transaction_id: { type: 'string', format: 'uuid', description: "Identifiant de l'écriture bancaire (get_partner_accounts)." },
       associe: { type: 'string', enum: ['justine', 'yohan'], description: "Associé remboursé." },
-      dry_run: { type: 'boolean', description: 'true = vérifier sans écrire. Défaut : false.', default: false },
+      dry_run: DRY_RUN_PROP,
     },
     required: ['bank_transaction_id', 'associe'],
     additionalProperties: false,
@@ -772,9 +756,12 @@ const linkBankTransfer: AgentTool = {
 // ════════════════════════════════════════════════════════════════════════════
 
 export const AGENT_TOOLS: readonly AgentTool[] = [
+  // Santé et chiffres
   getBusinessHealth,
   getMonthlySummary,
   getVatReport,
+  ...GESTION_TOOLS,
+  // Pièces et flux
   listInvoices,
   getInvoice,
   listBankTransactions,
@@ -782,6 +769,8 @@ export const AGENT_TOOLS: readonly AgentTool[] = [
   getMileageReport,
   getClosureStatus,
   searchSuppliers,
+  // Écritures
+  ...ECRITURE_TOOLS,
   recordMissingMileageTrips,
   linkBankTransfer,
 ];

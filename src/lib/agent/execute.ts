@@ -57,7 +57,16 @@ export async function executeTool(
   const scopeError = checkScope(identity, tool.scope);
   if (scopeError) return fail(scopeError.code, scopeError.message);
 
-  const parsed = validateArgs(tool.schema, rawArgs);
+  // Certains clients sérialisent les arguments en chaîne JSON : on la relit
+  // plutôt que de refuser un appel par ailleurs correct.
+  let args = rawArgs;
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch {
+      return fail('invalid_arguments', `Appel refusé pour l'outil « ${tool.name} » : les arguments doivent être un objet JSON, pas une chaîne.`);
+    }
+  }
+
+  const parsed = validateArgs(tool.schema, args);
   if (!parsed.ok) return fail('invalid_arguments', describeErrors(tool.name, parsed.errors));
 
   try {

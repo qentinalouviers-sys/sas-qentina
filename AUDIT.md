@@ -1067,6 +1067,40 @@ soit la plus fiable possible. Un chiffre faux qui entre contamine tout ce qui su
   conditionnements, idempotence), double lecture, ventilation, doublon, TVA lue, FEC avec
   consigne, contrôle de solde dans les deux sens et avec une ligne manquante.
 
+## 7 quater. Révision du 20 septembre 2026 — l'outil piloté par un agent IA
+
+*Objectif fixé : que tout le SaaS puisse être lu, écrit et piloté par Hermes Agent
+(sur Claude Sonnet en API) avec la même sûreté qu'à l'écran.*
+
+### Ce qui manquait, et ce qui a été fait
+
+| Constat | Correction |
+|---|---|
+| Douze outils, dont dix de lecture, sans ventes détaillées, sans P&L par poste, sans mercuriale ni recettes : un agent ne pouvait pas répondre « quel a été le meilleur service » ni « où part l'argent ». | `get_sales_report`, `get_pnl_breakdown`, `list_partner_movements`, `get_ingredient_prices`, `get_recipe_costs`, `get_business_rules`. Les agrégations sont pures (`lib/agent/reports.ts`) et testées : un agent et l'écran qui lisent les mêmes lignes rendent le même chiffre. |
+| Aucun geste de pré-comptabilité : impossible de lire une facture, de l'enregistrer, de lettrer, de recatégoriser, de compter le stock. | `analyze_invoice_document` (lecture, coûteux, annoncé), `register_invoice`, `link_invoice_to_bank_transaction`, `update_bank_transaction`, `record_inventory_count`. Toutes empruntent `lib/scanner.ts`, extrait des routes du Scanner : mêmes contrôles, mêmes acquittements code par code, mêmes verrous en base. `dry_run` partout. |
+| Le validateur d'arguments ne connaissait ni objet ni liste : une facture extraite ou une liste de codes ne pouvaient pas être passées. | Types `object` et `array` (chaînes), avec relecture d'un JSON sérialisé en chaîne — ce que les modèles font souvent. |
+| Serveur MCP minimal : pas de ressources ni de prompts, lots JSON-RPC refusés, GET renvoyant du JSON à un client qui ouvre un flux SSE. | `lib/agent/mcp.ts` : protocole extrait de la route, testé sans réseau. Ressources `qentina://guide` et `qentina://tools`, prompts `bilan_du_mois`, `preparer_tva`, `traiter_facture`, `lettrage_banque`, lots, 405 sur SSE et DELETE, arguments en chaîne relus, code d'erreur lisible en tête du texte d'erreur. |
+| La méthode n'existait que dans le skill Hermes : un agent branché sans lui (Claude Desktop, Cursor) ne la connaissait pas. | `lib/agent/guide.ts`, un seul texte servi trois fois (instructions à l'initialisation, ressource, outil, et `GET /api/agent/guide`). |
+| `list_invoices` ne savait pas filtrer par numéro ni par lettrage ; `get_invoice` ignorait la TVA lue et la pièce. | Filtres `invoice_number`, `bank_link`, TVA déductible par facture, mouvement lettré, trace OCR (champs corrigés). |
+
+### Ce qu'il faut savoir
+
+- **Rien à migrer.** Les nouvelles écritures utilisent les tables existantes.
+- **Une clé « write » est nécessaire** pour les six outils d'écriture ; une clé de
+  lecture ne les voit pas. Dans Hermes, `trust: untrusted` soumet chaque écriture à
+  approbation : c'est le réglage recommandé.
+- **`analyze_invoice_document` coûte deux appels IA** par document (lecture +
+  contrôle). L'outil est marqué `expensive` dans le catalogue et le guide dit de ne
+  jamais l'appeler en boucle.
+- **La clôture reste humaine.** Un test vérifie qu'aucun outil d'écriture ne la
+  porte.
+- **Pas de limitation de débit** par clé : les fonctions Vercel n'ont pas de mémoire
+  partagée. Le journal `agent_calls` permet de voir un emballement après coup ; une
+  limite par clé demanderait une table de compteurs — à faire si un agent s'emballe.
+- **`verify:compta` passe de 487 à 549 contrôles** : catalogue (nouveaux outils,
+  coûteux annoncés, clôture non exposée), validation objet/liste, rapports de
+  ventes et de P&L, lettrage, et le protocole MCP de bout en bout.
+
 ## 8. Pistes pour la suite (non faites, à discuter)
 
 **Chantiers de fond :**

@@ -48,6 +48,8 @@ import {
 import { validateArgs, describeErrors, toJsonSchema } from '../src/lib/agent/schema.ts';
 import { AGENT_TOOLS, findTool, suggestTools } from '../src/lib/agent/tools.ts';
 import { visibleTools, toMcpTool, toFunctionSpec, renderResultText } from '../src/lib/agent/manifest.ts';
+import { aggregateSales, aggregatePnl, checkInvoiceLink } from '../src/lib/agent/reports.ts';
+import { handleBody, RESOURCES, PROMPTS } from '../src/lib/agent/mcp.ts';
 
 /**
  * Faux client Supabase, qui applique réellement les filtres utilisés.
@@ -1206,6 +1208,132 @@ verifie('MCP : écriture annoncée comme telle',
 verifie('function-calling : enveloppe attendue', toFunctionSpec(MCP && findTool('get_invoice')).type, 'function');
 verifie('schéma fermé aux paramètres inventés',
   toJsonSchema(findTool('get_invoice').schema).additionalProperties, false);
+verifie('les outils coûteux (IA) sont annoncés', findTool('analyze_invoice_document')?.expensive, true);
+verifie('register_invoice : extracted est un objet, confirmations une liste',
+  toJsonSchema(findTool('register_invoice').schema).properties.extracted.type === 'object'
+  && toJsonSchema(findTool('register_invoice').schema).properties.confirmations.items.type === 'string', true);
+verifie('pilotage : ventes, P&L, recettes, mercuriale exposés',
+  ['get_sales_report', 'get_pnl_breakdown', 'get_recipe_costs', 'get_ingredient_prices', 'list_partner_movements', 'get_business_rules'].every(n => findTool(n)), true);
+verifie('pré-compta : facture, lettrage, banque, inventaire exposés',
+  ['analyze_invoice_document', 'register_invoice', 'link_invoice_to_bank_transaction', 'update_bank_transaction', 'record_inventory_count'].every(n => findTool(n)), true);
+verifie('la clôture n\'est toujours pas exposée', AGENT_TOOLS.some(t => /clos|clotur/.test(t.name) && t.scope === 'write'), false);
+
+// Validation : objets et listes, tels que les modèles les envoient.
+const REG = findTool('register_invoice').schema;
+verifie('objet sérialisé en chaîne relu', validateArgs(REG, { extracted: '{"total_ttc": 10}' }).ok, true);
+verifie('objet attendu, chaîne quelconque refusée', validateArgs(REG, { extracted: 'blabla' }).ok, false);
+verifie('liste : une chaîne seule devient une liste', validateArgs(REG, { extracted: {}, confirmations: 'numero-manquant' }).value?.confirmations?.[0], 'numero-manquant');
+verifie('liste sérialisée relue', validateArgs(REG, { extracted: {}, confirmations: '["a","b"]' }).value?.confirmations?.length, 2);
+const UPD = findTool('update_bank_transaction').schema;
+verifie('catégorie hors liste refusée', validateArgs(UPD, { bank_transaction_id: '11111111-1111-1111-1111-111111111111', category: 'loyer' }).ok, false);
+
+// ── Rapports de pilotage (agrégations pures) ──────────────────────────────
+console.log('\n── Agents IA : rapports ──');
+const VENTES = [
+  { id: 'o1', service: '2026-06-05', net_amount: 33, raw_data: { total_tax_money: { amount: 300 } } },   // vendredi
+  { id: 'o2', service: '2026-06-05', net_amount: 22, raw_data: { total_tax_money: { amount: 200 } } },
+  { id: 'o3', service: '2026-06-06', net_amount: 11, raw_data: { total_tax_money: { amount: 100 } } },   // samedi
+];
+const ARTICLES = [
+  { order_id: 'o1', name: 'Margherita', quantity: 2, total_price: 24, category_name: 'Pizzas' },
+  { order_id: 'o1', name: 'Coca', quantity: 3, total_price: 9, category_name: 'Boissons' },
+  { order_id: 'o2', name: 'Margherita', quantity: 1, total_price: 12, category_name: 'Pizzas' },
+  { order_id: 'o2', name: 'Tiramisu', quantity: 2, total_price: 10, category_name: 'Desserts' },
+  { order_id: 'o3', name: 'Margherita', quantity: 1, total_price: 11, category_name: 'Pizzas' },
+];
+const SR = aggregateSales(VENTES, ARTICLES, 2);
+verifie('ventes : CA TTC', SR.ca_ttc, 66);
+verifie('ventes : CA HT depuis la taxe lue', SR.ca_ht, 60);
+verifie('ventes : ticket moyen', SR.ticket_moyen_ttc, 22);
+verifie('ventes : meilleur jour', SR.best_day?.date, '2026-06-05');
+verifie('ventes : jour de semaine en français', SR.by_weekday[0].weekday, 'vendredi');
+verifie('ventes : top borné à 2', SR.top_items.length, 2);
+verifie('ventes : article n°1 cumulé (4 margherita)', SR.top_items[0].quantity, 4);
+verifie('ventes : catégorie n°1', SR.by_category[0].category, 'Pizzas');
+verifie('ventes : période vide', aggregateSales([], [], 5).orders, 0);
+
+const PNL = aggregatePnl({
+  orders: [{ net_amount: 1100, raw_data: { total_tax_money: { amount: 10000 } } }],
+  invoiceLines: [{ category: 'alimentaire', total_ht: 200 }, { category: 'boisson', total_ht: 50 }, { category: 'inconnue', total_ht: 5 }],
+  invoices: [{ id: 'i1', total_ttc: 84.30 }],
+  bank: [
+    { id: 'b1', date: '2026-06-03', description: 'CB METRO', amount: -84.30, category: 'variable_fournisseur', invoice_id: null }, // = facture i1 : écarté
+    { id: 'b2', date: '2026-06-04', description: 'CB MOZZALAT', amount: -110, category: 'variable_fournisseur', invoice_id: null }, // sans facture : 100 HT
+    { id: 'b3', date: '2026-06-05', description: 'PRLV LOYER', amount: -1200, category: 'fixe_loyer', invoice_id: null }, // 1000 HT
+    { id: 'b4', date: '2026-06-06', description: 'VIR SALAIRE', amount: -900, category: 'variable_salaire', invoice_id: null },
+    { id: 'b5', date: '2026-06-07', description: 'LEROY MERLIN FOUR', amount: -1400, category: 'investissement', invoice_id: null },
+    { id: 'b6', date: '2026-06-08', description: 'VIR SEPA DE FARIA HOLDING Pret', amount: -500, category: 'autre', invoice_id: null }, // flux
+    { id: 'b7', date: '2026-06-09', description: 'VIR SQUAREUP', amount: 3000, category: 'recette', invoice_id: null },
+    { id: 'b8', date: '2026-06-10', description: 'CB METRO', amount: -60, category: 'variable_fournisseur', invoice_id: 'i9' }, // lettré : déjà compté
+  ],
+});
+verifie('P&L : CA HT', PNL.ca_ht, 1000);
+verifie('P&L : achats alimentaire', PNL.achats.alimentaire, 200);
+verifie('P&L : ligne de catégorie inconnue → autre', PNL.achats.autre, 5);
+verifie('P&L : paiement égal à une facture écarté', PNL.paiements_apparies_factures, 1);
+verifie('P&L : paiement sans facture en HT indicatif (10 %)', PNL.achats.banque_sans_facture, 100);
+verifie('P&L : mouvement lettré non recompté', PNL.achats.total, 355);
+verifie('P&L : loyer en HT (20 %)', PNL.charges.find(c => c.category === 'fixe_loyer')?.ht, 1000);
+verifie('P&L : salaires', PNL.salaires, 900);
+verifie('P&L : investissement hors résultat', PNL.investissements, 1400);
+verifie('P&L : prêt écarté', PNL.flux_financiers.total, 500);
+verifie('P&L : encaissement Square indicatif', PNL.encaissements_banque, 3000);
+verifie('P&L : résultat = 1000 − 355 − 1000 − 900', PNL.resultat_exploitation_indicatif, -1255);
+
+const TX = { amount: -84.30, date: '2026-06-03', invoice_id: null };
+const INV = { total_ttc: 84.30, date: '2026-06-01' };
+verifie('lettrage : montant égal → possible', checkInvoiceLink(TX, INV, null).ok, true);
+verifie('lettrage : 3 centimes tolérés', checkInvoiceLink({ ...TX, amount: -84.33 }, INV, null).ok, true);
+verifie('lettrage : écart de 10 € refusé', checkInvoiceLink({ ...TX, amount: -94.30 }, INV, null).code, 'amount_mismatch');
+verifie('lettrage : écart forcé accepté, avec avertissement', checkInvoiceLink({ ...TX, amount: -94.30 }, INV, null, true).warnings.length, 1);
+verifie('lettrage : encaissement refusé', checkInvoiceLink({ ...TX, amount: 84.30 }, INV, null).code, 'not_debit');
+verifie('lettrage : mouvement déjà lettré refusé', checkInvoiceLink({ ...TX, invoice_id: 'x' }, INV, null).code, 'tx_already_linked');
+verifie('lettrage : facture déjà payée refusée', checkInvoiceLink(TX, INV, { id: 'b0' }).code, 'invoice_already_linked');
+verifie('lettrage : 90 jours d\'écart → avertissement', checkInvoiceLink({ ...TX, date: '2026-09-01' }, INV, null).warnings.length, 1);
+
+// ── Serveur MCP (protocole, sans réseau) ──────────────────────────────────
+console.log('\n── Agents IA : serveur MCP ──');
+const IDENT = { kind: 'key', keyId: 'k', name: 'test', scopes: ['read'] };
+const DEPS = {
+  authenticate: async () => ({ identity: IDENT, error: null }),
+  tools: (identity) => visibleTools(identity),
+  execute: async (name, args) => name === 'get_business_rules'
+    ? { ok: true, result: { summary: 'Guide.', data: { args } } }
+    : { ok: false, error: { code: 'unknown_tool', message: `Outil inconnu : ${name}` } },
+};
+const DEPS_REFUSED = { ...DEPS, authenticate: async () => ({ identity: null, error: { status: 401, code: 'invalid_key', message: 'Clé inconnue.' } }) };
+const rpc = (method, params, id = 1) => ({ jsonrpc: '2.0', id, method, params });
+
+let init = await handleBody(rpc('initialize', { protocolVersion: '2025-03-26' }), DEPS_REFUSED);
+verifie('initialize sans clé : autorisé (découverte)', init.result?.serverInfo?.name, 'qentina');
+verifie('initialize : version demandée reprise', init.result?.protocolVersion, '2025-03-26');
+verifie('initialize : version inconnue → la plus récente', (await handleBody(rpc('initialize', { protocolVersion: '1999-01-01' }), DEPS)).result?.protocolVersion, '2025-06-18');
+verifie('initialize : ressources et prompts annoncés', !!init.result?.capabilities?.resources && !!init.result?.capabilities?.prompts, true);
+verifie('notification : aucune réponse', await handleBody({ jsonrpc: '2.0', method: 'notifications/initialized' }, DEPS), null);
+verifie('ping', (await handleBody(rpc('ping', {}), DEPS)).result !== undefined, true);
+verifie('tools/list sans clé : refusé avec le code', (await handleBody(rpc('tools/list', {}), DEPS_REFUSED)).error?.data?.status, 401);
+const TL = await handleBody(rpc('tools/list', {}), DEPS);
+verifie('tools/list : clé lecture, aucune écriture', TL.result.tools.some(t => t.annotations.readOnlyHint === false), false);
+verifie('tools/list : openWorldHint faux', TL.result.tools.every(t => t.annotations.openWorldHint === false), true);
+const TC = await handleBody(rpc('tools/call', { name: 'get_business_rules', arguments: {} }), DEPS);
+verifie('tools/call : synthèse en texte + structuredContent', TC.result.content[0].text.startsWith('Guide.') && !!TC.result.structuredContent, true);
+const TE = await handleBody(rpc('tools/call', { name: 'nope' }), DEPS);
+verifie('tools/call : erreur d\'outil = isError, pas erreur JSON-RPC', TE.result?.isError === true && TE.error === undefined, true);
+verifie('tools/call : le code d\'erreur est lisible dans le texte', TE.result.content[0].text.startsWith('[unknown_tool]'), true);
+verifie('resources/list : guide et catalogue', (await handleBody(rpc('resources/list', {}), DEPS)).result.resources.length, RESOURCES.length);
+const RR = await handleBody(rpc('resources/read', { uri: 'qentina://guide' }), DEPS);
+verifie('resources/read : le guide en markdown', RR.result.contents[0].text.includes('compte courant'), true);
+verifie('resources/read : catalogue en JSON pour cette clé', JSON.parse((await handleBody(rpc('resources/read', { uri: 'qentina://tools' }), DEPS)).result.contents[0].text).tools.every(t => t.scope === 'read'), true);
+verifie('resources/read : inconnue → erreur', (await handleBody(rpc('resources/read', { uri: 'qentina://x' }), DEPS)).error?.code, -32002);
+verifie('prompts/list', (await handleBody(rpc('prompts/list', {}), DEPS)).result.prompts.length, PROMPTS.length);
+const PG = await handleBody(rpc('prompts/get', { name: 'bilan_du_mois', arguments: { month: '2026-06' } }), DEPS);
+verifie('prompts/get : message utilisateur avec le mois', PG.result.messages[0].content.text.includes('2026-06'), true);
+verifie('prompts/get : inconnu → -32602', (await handleBody(rpc('prompts/get', { name: 'x' }), DEPS)).error?.code, -32602);
+verifie('méthode inconnue → -32601', (await handleBody(rpc('tools/delete', {}), DEPS)).error?.code, -32601);
+const BATCH = await handleBody([rpc('ping', {}, 'a'), { jsonrpc: '2.0', method: 'notifications/x' }, rpc('tools/list', {}, 'b')], DEPS);
+verifie('lot : une réponse par requête, notifications ignorées', Array.isArray(BATCH) && BATCH.length === 2 && BATCH[1].id === 'b', true);
+verifie('lot de notifications seules → rien', await handleBody([{ jsonrpc: '2.0', method: 'notifications/x' }], DEPS), null);
+verifie('corps non objet → -32600', (await handleBody('x', DEPS)).error?.code, -32600);
 
 // La synthèse passe AVANT le JSON : un modèle qui s'arrête à la première ligne
 // a déjà la réponse.

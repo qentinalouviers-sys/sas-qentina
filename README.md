@@ -174,14 +174,33 @@ arguments, journalisation) sont partagés :
 |---|---|
 | `POST /api/agent/mcp` | Clients MCP (Hermes, Claude Desktop, Cursor…) |
 | `POST /api/agent/call` | `curl`, script, plugin Python — `{"tool": "...", "arguments": {...}}` |
-| `GET /api/agent/tools` | Découverte : schémas MCP **et** function-calling (`?format=functions`) |
+| `GET /api/agent/tools` | Découverte : schémas MCP **et** function-calling (`?format=functions`), portées, outils coûteux |
+| `GET /api/agent/guide` | Le guide de l'agent en markdown (règles, méthode), sans authentification |
 
-**Ce qu'un agent peut faire** : dix outils de lecture (santé du restaurant, chiffres
-du mois, TVA, factures, banque, comptes d'associés, frais kilométriques, état de
-clôture) et **deux** outils d'écriture, tous deux idempotents et simulables
-(`dry_run`) : enregistrer les trajets détectés, rattacher un virement au compte
-courant. La clôture d'un mois, la validation d'une facture et la suppression d'une
-écriture restent des gestes humains.
+Le serveur MCP sert aussi deux **ressources** (`qentina://guide`, `qentina://tools`)
+et quatre **prompts** prêts à l'emploi (`bilan_du_mois`, `preparer_tva`,
+`traiter_facture`, `lettrage_banque`). Il accepte les lots JSON-RPC, répond 405 à
+l'ouverture d'un flux SSE (mode JSON pur, sans session) et relit des arguments
+envoyés sous forme de chaîne JSON.
+
+**Ce qu'un agent peut faire** — dix-sept outils de lecture : santé du restaurant,
+chiffres du mois, **ventes** (par jour, top articles, catégories), **compte de
+résultat par poste**, TVA, factures (avec TVA lue, pièce, lettrage, trace OCR),
+banque, comptes d'associés (soldes et détail chronologique), frais kilométriques,
+état de clôture, fournisseurs, **mercuriale**, **coût des recettes**, règles
+métier, et **lecture d'une facture par l'OCR** (double lecture, anomalies, doublon,
+candidats bancaires — coûteux, annoncé comme tel). Six outils d'écriture, tous
+idempotents et simulables (`dry_run`) : **enregistrer une facture** (mêmes contrôles
+et mêmes acquittements que le Scanner, code par code), **lettrer** une facture
+avec son paiement (montant au centime, `force` assumé pour un partiel),
+**recatégoriser** un mouvement bancaire, **compter un ingrédient** (inventaire),
+enregistrer les trajets détectés, rattacher un virement au compte courant. La
+clôture d'un mois et la suppression d'une écriture restent des gestes humains.
+
+Toute écriture d'agent passe par `lib/scanner.ts` et les mêmes fonctions que
+l'écran : un agent ne bénéficie d'aucun raccourci. Le skill Hermes
+(`agent/skills/qentina-gestion/SKILL.md`) décrit la procédure « traiter une
+facture » pas à pas : analyser, relire, acquitter, simuler, enregistrer.
 
 **Ce qui le protège de lui-même** : les verrous sont en base, pas dans l'écran. Un
 agent emprunte exactement les mêmes chemins qu'un humain — compte courant jamais
@@ -275,7 +294,7 @@ base et consomme l'API Square.
 npm run verify:compta
 ```
 
-487 contrôles de non-régression sur les calculs de TVA, la classification des
+549 contrôles de non-régression sur les calculs de TVA, la classification des
 écritures, le lettrage, la détection des anomalies, les verrous à
 l'enregistrement d'une facture, la normalisation de ce que l'OCR renvoie, le
 contrôle de solde d'un relevé bancaire, le référentiel, la règle du compte
