@@ -225,6 +225,11 @@ appel est journalisé (`agent_calls`) et visible dans Réglages → Agents IA.
     (`tva_amount`, `tva_breakdown`, `ocr_meta`). **Obligatoire** : sans elle, l'enregistrement
     d'une facture échoue.
 
+**Un doute sur ce qui a été joué ?** `db/verification.sql` (lecture seule) compare la base
+à ce que le code attend et rend la liste des migrations à exécuter, dans l'ordre. Dans
+l'éditeur Supabase, seul le résultat de la dernière requête s'affiche : c'est le résumé.
+Pour le détail objet par objet, exécuter uniquement la première requête du fichier.
+
 > ⚠️ La migration consolidée est à **ré-exécuter** après une mise à jour qui
 > ajoute une catégorie bancaire : la contrainte `CHECK` de `bank_transactions`
 > refuse sinon la nouvelle valeur, et la dépense retombe en « non classé » sans
